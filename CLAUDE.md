@@ -6,7 +6,7 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 2 — Project 2 (RAG with citations). P1 done — see LEARNING.md wrap-up.
+CURRENT STAGE: Day 3 — Project 3 (tools + approval). P1, P2 done — see LEARNING.md wrap-ups.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 real email/LinkedIn, MCP, Temporal, cloud deploy, multi-tenancy.
 
@@ -41,9 +41,13 @@ src/research_assistant/
   ingest.py     data/ pages → chunks (chunk_id, source_url, fetched_at)
   retrieval.py  keyword search, vector search, hybrid merge
   db.py         Postgres connection + schema
-tests/                  mock the client/DB, never hit the real API
-evals/questions.jsonl   data/ (saved company pages)   runs/ (one JSONL record per request)
+  evaluate.py   pure eval scoring (retrieval_scores, grade_answer)
+tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
+evals/questions.jsonl   evals/run.py   data/ (saved company pages)   runs/ (one JSONL record per request)
 ```
+
+Commands: `uv run python -m research_assistant.db` (load + embed data/),
+`uv run ask "question"`, `uv run python evals/run.py --stage retrieval|answers [--only ids] [--repeat N]`.
 
 ## Rules for every model call
 
@@ -61,19 +65,15 @@ evals/questions.jsonl   data/ (saved company pages)   runs/ (one JSONL record pe
 - Every chunk carries chunk_id, source_url, fetched_at. No chunk without a source.
 - Retrieved text goes in the user message inside <untrusted_data> tags (data, not instructions;
   also keeps the system prompt static/cacheable).
-- Factual claims must cite chunk_ids. Missing or conflicting evidence → say so, needs_sources=true.
+- Strict grounding: factual claims must cite chunk_ids (checked in code). Missing or conflicting
+  evidence → say so, needs_sources=true.
 - Evaluate retrieval and answers SEPARATELY. Bump PROMPT_VERSION when prompt/schema changes.
 
-## Day 2 milestones (Project 2)
+## Day 3 milestones (Project 3)
 
-M0 Save pages into data/ that answer evals q06–q10 (funding, headcount, CEO, pricing, launch),
-   each with a url + fetched date header. Include one outdated + one conflicting page on purpose.
-M1 Ingest + chunking with overlap; inspect chunk sizes
-M2 Keyword search (Postgres full-text): try exact names/numbers
-M3 pgvector: embed chunks via llm.embed, vector search: try paraphrased questions
-M4 Hybrid search (Reciprocal Rank Fusion) + top-k   ✍️ I WRITE the RRF merge myself, no code given
-M5 Grounded answer: ResearchAnswer gains citations [{chunk_id, source_url}]; abstain on thin evidence
-M6 Evals: retrieval hit rate@k on q06–q10, then answer + citation checks; fake-DB/client tests
+To be planned at the start of Day 3 (tools + approval). Open items from P2 are in LEARNING.md.
 
 ## Done
 P1 (Day 1): reliable `ask` CLI — config, run logs, retries, structured output, 31 tests. See LEARNING.md.
+P2 (Day 2): RAG w/ citations — chunking, Postgres FTS + pgvector, RRF hybrid, grounded answers
+   (prompt v4), evals (retrieval hit@k + answer checks, --repeat), 98 tests. See LEARNING.md.
