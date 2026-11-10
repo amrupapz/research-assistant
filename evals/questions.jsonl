@@ -1,10 +1,16 @@
-{"id": "q01", "question": "What does Stripe sell, and to whom?", "kind": "stable", "expect_needs_sources": false}
-{"id": "q02", "question": "What is Shopify's business model?", "kind": "stable", "expect_needs_sources": false}
-{"id": "q03", "question": "Who are Notion's main competitors?", "kind": "stable", "expect_needs_sources": false}
-{"id": "q04", "question": "What kind of customers buy Datadog, and what problem does it solve for them?", "kind": "stable", "expect_needs_sources": false}
-{"id": "q05", "question": "Is Atlassian mainly a B2B or B2C company, and why?", "kind": "stable", "expect_needs_sources": false}
-{"id": "q06", "question": "How much did Anthropic raise in its latest funding round?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["anthropic-funding.md"]}
-{"id": "q07", "question": "What is Figma's current headcount?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["figma-about.md", "figma-company-profile.md"]}
-{"id": "q08", "question": "Who is the current CEO of Intel?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["intel-leadership.md"]}
-{"id": "q09", "question": "What does Linear charge per seat on its Business plan today?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["linear-pricing.md"]}
-{"id": "q10", "question": "What product did Vercel launch most recently?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["vercel-changelog.md"]}
+{"id": "q01", "question": "What does Stripe sell, and to whom?", "kind": "stable", "expect_needs_sources": false, "expect": "abstain", "gold_sources": [], "gold_facts": []}
+{"id": "q02", "question": "What is Shopify's business model?", "kind": "stable", "expect_needs_sources": false, "expect": "abstain", "gold_sources": [], "gold_facts": []}
+{"id": "q03", "question": "Who are Notion's main competitors?", "kind": "stable", "expect_needs_sources": false, "expect": "abstain", "gold_sources": [], "gold_facts": []}
+{"id": "q04", "question": "What kind of customers buy Datadog, and what problem does it solve for them?", "kind": "stable", "expect_needs_sources": false, "expect": "abstain", "gold_sources": [], "gold_facts": []}
+{"id": "q05", "question": "Is Atlassian mainly a B2B or B2C company, and why?", "kind": "stable", "expect_needs_sources": false, "expect": "abstain", "gold_sources": [], "gold_facts": []}
+{"id": "q06", "question": "How much did Anthropic raise in its latest funding round?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["anthropic-funding.md"], "expect": "answer", "gold_facts": ["22.5"]}
+{"id": "q06b", "question": "What was Anthropic's most recent fundraise?", "kind": "paraphrase", "expect_needs_sources": true, "gold_sources": ["anthropic-funding.md"], "expect": "answer", "gold_facts": ["22.5"]}
+{"id": "q07", "question": "What is Figma's current headcount?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["figma-about.md", "figma-company-profile.md"], "expect": "conflict", "gold_facts": ["2,140", "1,870"]}
+{"id": "q07b", "question": "How many people work at Figma?", "kind": "paraphrase", "expect_needs_sources": true, "gold_sources": ["figma-about.md", "figma-company-profile.md"], "expect": "conflict", "gold_facts": ["2,140", "1,870"]}
+{"id": "q08", "question": "Who is the current CEO of Intel?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["intel-leadership.md"], "expect": "answer", "gold_facts": ["Lip-Bu Tan"]}
+{"id": "q08b", "question": "Who runs Intel right now?", "kind": "paraphrase", "expect_needs_sources": true, "gold_sources": ["intel-leadership.md"], "expect": "answer", "gold_facts": ["Lip-Bu Tan"]}
+{"id": "q09", "question": "What does Linear charge per seat on its Business plan today?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["linear-pricing.md"], "expect": "answer", "gold_facts": ["$18"]}
+{"id": "q09b", "question": "How much is Linear's Business tier per user?", "kind": "paraphrase", "expect_needs_sources": true, "gold_sources": ["linear-pricing.md"], "expect": "answer", "gold_facts": ["$18"]}
+{"id": "q10", "question": "What product did Vercel launch most recently?", "kind": "unknowable", "expect_needs_sources": true, "gold_sources": ["vercel-changelog.md"], "expect": "answer", "gold_facts": ["Agent Runtime"]}
+{"id": "q10b", "question": "What's the newest thing Vercel shipped?", "kind": "paraphrase", "expect_needs_sources": true, "gold_sources": ["vercel-changelog.md"], "expect": "answer", "gold_facts": ["Agent Runtime"]}
+{"id": "q11", "question": "Where is the best pizza in Naples?", "kind": "off_topic", "expect_needs_sources": true, "expect": "abstain", "gold_sources": [], "gold_facts": []}

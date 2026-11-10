@@ -267,3 +267,51 @@
 - Caching (corrected): an exact repeat of the Intel question got `cached=2159`. The cache matches the prefix of the whole input (system + user message), not just the system prompt. Different questions share only system prompt + "Today/Question", which is <1024 tokens → 0. Putting the chunk block before the question would let follow-ups on the same chunks hit the cache.
 - Paraphrase flips behavior: "How many people work at Figma?" retrieved the conflicting profile chunk (#3) but cited only figma-about, high / needs_sources=false. q07's wording reported the conflict. This is a generation failure that check_grounding can't catch (the citations are valid). → M6 needs paraphrase variants + a conflict check.
 - `evals/variance.py` (Day 1) now abstains: `ask` requires chunks.
+
+## D2 M6 — evals (retrieval and answers scored separately)
+
+**Concept:** A fixed eval set with known answers, scored automatically, so a prompt or retrieval change is *measured* rather than eyeballed. Retrieval ("was the evidence in the top k?") is nearly free and deterministic. Answers are graded on structured fields + required facts, not exact wording (Day 1: text varies, fields don't).
+
+**Built:** `evals/questions.jsonl`: 16 cases (q01–q05 abstain under strict mode, q06–q10 + paraphrases q06b–q10b, q11 off-topic), each with `expect` (answer | conflict | abstain), `gold_sources`, `gold_facts`. `evaluate.py` (pure): `retrieval_scores` (file_recall + **fact_recall**, which fixes the M1 "right file, wrong chunk" gap) and `grade_answer` (named checks). `evals/run.py --stage retrieval|answers [--only ids] [--repeat N]` → table + `runs/evals.jsonl`. 12 tests (98 total), including a test that every gold fact really is in its gold file (otherwise the eval is broken, not the system). Note: `expect_needs_sources` is a Day 1 field, now stale; it's ignored by the grader.
+
+**Retrieval (10 cases with gold):**
+| mode | @1 | @3 | @5 |
+|---|---|---|---|
+| keyword (AND) | 0% | 0% | 0% |
+| any (OR) | 50% | 100% | 100% |
+| vector | 50% | 100% | 100% |
+| hybrid | **60%** | 100% | 100% |
+- @1 can never pass q07 (it needs 2 files) or q08 (the 2024 page ranks #1). q10b vector@1 = right file, wrong chunk (f1.0/x0.0), so fact_recall earned its keep. k=5 is enough, and retrieval is not the bottleneck.
+
+**Answers:**
+- v3, 1 run: 16/16. **Misleading.** With `--repeat 5`: q07 5/5, **q07b 1/5** (the paraphrase drops the third-party figure; 2/8 overall incl. CLI). Retrieval passed every time → a pure generation failure.
+- v4 (conflict check is now an explicit step for every question, wording-independent): q07 5/5, **q07b 5/5**; full set **16/16**.
+- Side effect: q08 on v4 now mentions the 2024 page and sets needs_sources=true (v3: false). The answer is more transparent, but a superseded snapshot isn't really an unresolved conflict. The grader doesn't check needs_sources for "answer" cases, so it didn't flag this.
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- One run of a flaky case is a coin flip. Use `--repeat` for anything that matters, and report pass *rates*.
+- A paraphrase can flip behavior on identical evidence. Always include paraphrases in the eval set.
+- Evals only catch what they check: q08's needs_sources change slipped through. Day 6: add a `needs_sources` expectation per case and decide on the "superseded snapshot" policy.
+- Each fix should be re-checked on the whole set, not just the failing case (q08 shifted while fixing q07b).
+
+---
+
+## Project 2 wrap-up (Day 2)
+
+`ask "question"` now does hybrid retrieval → grounded, cited answer:
+- `data/` → chunks (200 words / 40 overlap; stable ids; no chunk without url + fetched_at)
+- Postgres 17: full-text `tsvector` + GIN, and pgvector `vector(1536)` (text-embedding-3-small, embed title+text, only new/changed chunks)
+- keyword (exact tokens) + vector (paraphrase) fused with RRF; top-5
+- prompt v4: answer only from `<untrusted_data>`, cite `[chunk_id]`, prefer newest/first-party, surface conflicts, abstain otherwise; `check_grounding` rejects citations to unretrieved chunks
+- run log: retrieved_ids vs cited_ids, so a failure can be pinned on retrieval or generation
+- evals: retrieval hit@k (100% @3 for hybrid) and answer checks (16/16 on v4, flaky case measured 5×)
+
+**Functions:** `rrf_merge` (Claude wrote it at my request; I should be able to explain each of the 10 lines).
+
+**Open questions to carry forward (Day 6):**
+- q08: is a superseded snapshot a "conflict"? Add needs_sources expectations to the eval set.
+- Abstaining costs a full LLM call; a cheap retrieval-side gate (vector similarity floor) could skip it.
+- Cache: put the chunk block before the question so follow-ups on the same chunks reuse the prefix?
+- Hub chunk (figma-company-profile#001) shows up everywhere; heading-aware chunking if evals ever show it hurting.
