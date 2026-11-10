@@ -18,7 +18,7 @@ from research_assistant.schemas import ResearchAnswer
 from research_assistant.tools import ToolContext
 
 TASK = "Research Figma and draft an intro to L1."
-SEARCH = {"question": "What does Figma do?"}
+SEARCH = {"company": "Figma", "question": "What does Figma do?"}
 DRAFT = {"lead_id": "L1", "subject": "Hi", "body": "Hello Dana"}
 
 

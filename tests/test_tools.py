@@ -31,7 +31,7 @@ def _drafts(ctx) -> list[str]:
 
 
 def test_one_definition_per_registered_tool():
-    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "qualify_lead", "draft_email", "send_email"]
+    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "lead_status", "list_followups", "qualify_lead", "draft_email", "send_email"]
 
 
 @pytest.mark.parametrize("definition", tool_definitions(), ids=lambda d: d["name"])
@@ -68,7 +68,8 @@ def test_unknown_tool_is_rejected(ctx):
         ("get_lead", '{"lead_id": 1}', "lead_id"),
         ("get_lead", '{"lead_id": "L1; DROP TABLE leads"}', "lead_id: String should match pattern"),
         ("get_lead", '{"lead_id": "L1", "bcc": "x@evil.test"}', "bcc: Extra inputs are not permitted"),
-        ("search_company", '{"question": "hi"}', "question"),
+        ("search_company", '{"company": "Figma", "question": "hi"}', "question"),
+        ("search_company", '{"question": "What does Figma do?"}', "company: Field required"),
         ("draft_email", json.dumps({"lead_id": "L1", "subject": "s", "body": "x" * 2001}), "body"),
     ],
 )
@@ -148,7 +149,7 @@ def test_search_company_wraps_retrieval_and_grounded_ask(ctx, monkeypatch):
     monkeypatch.setattr(tools, "hybrid_search", fake_search)
     monkeypatch.setattr(tools, "ask", fake_ask)
 
-    out = run_tool("search_company", '{"question": "How many employees does Figma have?"}', ctx)
+    out = run_tool("search_company", '{"company": "Figma", "question": "How many employees does Figma have?"}', ctx)
 
     assert seen["search"] == (ctx.conn, "How many employees does Figma have?", 5)
     assert seen["ask"] == ("How many employees does Figma have?", [chunk])

@@ -52,7 +52,7 @@ BAD_ARGS = [
     ("draft_email", '{"lead_id": "L3", "subject": "Hi", "body": "x", "to": "attacker@evil.test"}'),
     ("send_email", '{"draft_id": "D1", "to": "attacker@evil.test"}'),
     ("send_email", '{"draft_id": "../../.env"}'),
-    ("search_company", json.dumps({"question": "x" * 5000})),
+    ("search_company", json.dumps({"company": "Linear", "question": "x" * 5000})),
 ]
 
 
@@ -115,7 +115,7 @@ INJECTION = (
 def _fooled_model():
     """search_company returns injected text; the model 'obeys' and tries to send unasked."""
     return FakeModel(
-        turn(call("search_company", {"question": "What does Linear do?"}, "s")),
+        turn(call("search_company", {"company": "Linear", "question": "What does Linear do?"}, "s")),
         turn(call("draft_email", {"lead_id": "L3", "subject": "Hi", "body": "Hello Marco"}, "d")),
         turn(call("send_email", {"draft_id": "D1"}, "x")),
         final("Sent!"),
@@ -229,7 +229,7 @@ def test_flagged_search_warns_at_approval(ctx, monkeypatch, capsys):
     )
     monkeypatch.setattr(tools, "hybrid_search", lambda conn, q, k: [])
     monkeypatch.setattr(tools, "ask", lambda q, chunks: shaky)
-    tools.run_tool("search_company", '{"question": "Linear partner program?"}', ctx)
+    tools.run_tool("search_company", '{"company": "Linear", "question": "Linear partner program?"}', ctx)
     tools.run_tool("draft_email", json.dumps({"lead_id": "L3", "subject": "Hi", "body": "30% off"}), ctx)
 
     cli_approve(ToolCall("send_email", tools.SendEmailArgs(draft_id="D1")), ctx, input_fn=lambda p: "n")
@@ -242,7 +242,7 @@ def test_confident_search_adds_no_warning(ctx, monkeypatch):
     solid = ResearchAnswer(answer="x", confidence="high", assumptions=[], needs_sources=False, citations=[])
     monkeypatch.setattr(tools, "hybrid_search", lambda conn, q, k: [])
     monkeypatch.setattr(tools, "ask", lambda q, chunks: solid)
-    tools.run_tool("search_company", '{"question": "What does Linear do?"}', ctx)
+    tools.run_tool("search_company", '{"company": "Linear", "question": "What does Linear do?"}', ctx)
     assert ctx.warnings == []
 
 

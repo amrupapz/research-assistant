@@ -4,7 +4,7 @@ from research_assistant.permissions import ToolCall, authorize
 from research_assistant.tools import GetLeadArgs
 
 
-@pytest.mark.parametrize("name", ["search_company", "get_lead", "qualify_lead", "draft_email"])
+@pytest.mark.parametrize("name", ["search_company", "get_lead", "lead_status", "list_followups", "qualify_lead", "draft_email"])
 def test_read_and_draft_tools_are_allowed(name):
     assert authorize(ToolCall(name)) == "allow"
 

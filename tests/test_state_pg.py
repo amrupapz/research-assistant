@@ -40,7 +40,7 @@ def test_run_and_steps_are_recorded_in_order(ctx, settings):
     result = _run("Draft to L1", ctx, settings, turn(call("draft_email", DRAFT, "d")), final("Drafted D1."))
 
     run = ctx.conn.execute("SELECT task, status, answer, agent_prompt_version FROM runs").fetchone()
-    assert run == ("Draft to L1", "done", "Drafted D1.", "agent-v4")
+    assert run == ("Draft to L1", "done", "Drafted D1.", "agent-v5")
     steps = state.get_steps(ctx.conn, result.run_id)
     assert [(s["seq"], s["turn"], s["kind"], s["tool"], s["status"]) for s in steps] == [
         (1, 1, "model_turn", None, None),

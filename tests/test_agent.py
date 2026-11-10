@@ -162,7 +162,7 @@ def test_tool_crash_is_reported_without_details(ctx, settings, monkeypatch):
         raise RuntimeError("password=hunter2 at db host")
 
     monkeypatch.setattr(tools, "hybrid_search", boom)
-    model = FakeModel(turn(call("search_company", {"question": "What does Figma do?"})), final("sorry"))
+    model = FakeModel(turn(call("search_company", {"company": "Figma", "question": "What does Figma do?"})), final("sorry"))
     result = run_agent("t", ctx, respond_fn=model, authorize_fn=allow_all, settings=settings)
 
     assert json.loads(model.outputs(1)[0]["output"]) == {"error": "search_company failed (RuntimeError)"}

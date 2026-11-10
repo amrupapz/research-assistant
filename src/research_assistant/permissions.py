@@ -8,7 +8,9 @@ from pydantic import BaseModel
 Decision = Literal["allow", "deny", "needs_approval"]
 
 # Default-deny: only names listed here can ever run. A new tool is denied until someone adds it.
-ALLOWED = frozenset({"search_company", "get_lead", "qualify_lead", "draft_email"})  # read/draft: no outside effect
+ALLOWED = frozenset(
+    {"search_company", "get_lead", "lead_status", "list_followups", "qualify_lead", "draft_email"}
+)  # read/draft: no outside effect
 NEEDS_APPROVAL = frozenset({"send_email"})  # leaves the building: a human says y/n (M3)
 
 

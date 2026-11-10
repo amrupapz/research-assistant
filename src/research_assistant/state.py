@@ -207,3 +207,134 @@ def mark_sent(conn: psycopg.Connection, draft_id: str, provider_message_id: str)
         "UPDATE sends SET status = 'sent', sent_at = now(), provider_message_id = %s WHERE draft_id = %s",
         [provider_message_id, _draft_number(draft_id)],
     )
+
+
+# --- memory across days (D4 M6) -------------------------------------------------------------
+# All "is it fresh / did they reply / who's waiting" decisions are SQL over exact facts.
+
+REUSE_DAYS = 7  # research and qualifications younger than this are reused, not re-run
+
+
+def save_finding(
+    conn: psycopg.Connection,
+    company: str,
+    question: str,
+    answer: dict,
+    fetched_at_by_chunk: dict[str, Any],
+    prompt_version: str,
+    run_id: UUID | None,
+) -> int:
+    """Store a search_company answer + its citations (snapshots: chunk_id, source_url, fetched_at)."""
+    finding_id = conn.execute(
+        "INSERT INTO research_findings (company, question, answer, confidence, needs_sources, assumptions, "
+        "prompt_version, run_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING finding_id",
+        [company, question, answer["answer"], answer["confidence"], answer["needs_sources"],
+         _jsonb(answer["assumptions"]), prompt_version, run_id],
+    ).fetchone()[0]
+    for c in answer["citations"]:
+        conn.execute(
+            "INSERT INTO finding_citations VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            [finding_id, c["chunk_id"], c["source_url"], fetched_at_by_chunk[c["chunk_id"]]],
+        )
+    return finding_id
+
+
+def reusable_finding(conn: psycopg.Connection, company: str, question: str, prompt_version: str) -> dict | None:
+    """The newest SOLID answer to the same question about the same company, < REUSE_DAYS old.
+
+    Same question = equal after lowercasing + trimming. Shaky answers (needs_sources) and answers
+    from another prompt version are never reused: those deserve a fresh look.
+    """
+    row = conn.execute(
+        """
+        SELECT finding_id, answer, confidence, needs_sources, assumptions, created_at FROM research_findings
+        WHERE lower(company) = lower(%s) AND lower(btrim(question)) = lower(btrim(%s))
+          AND prompt_version = %s AND NOT needs_sources
+          AND created_at > now() - make_interval(days => %s)
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        [company, question, prompt_version, REUSE_DAYS],
+    ).fetchone()
+    if row is None:
+        return None
+    finding_id, answer, confidence, needs_sources, assumptions, created_at = row
+    citations = conn.execute(
+        "SELECT chunk_id, source_url FROM finding_citations WHERE finding_id = %s ORDER BY chunk_id", [finding_id]
+    ).fetchall()
+    return {
+        "answer": answer,
+        "confidence": confidence,
+        "assumptions": assumptions,
+        "needs_sources": needs_sources,
+        "citations": [{"chunk_id": c, "source_url": u} for c, u in citations],
+        "reused_from": created_at,
+    }
+
+
+def recent_findings(conn: psycopg.Connection, company: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT question, confidence, needs_sources, created_at FROM research_findings "
+        "WHERE lower(company) = lower(%s) AND created_at > now() - make_interval(days => %s) ORDER BY created_at DESC",
+        [company, REUSE_DAYS],
+    ).fetchall()
+    return [dict(zip(["question", "confidence", "needs_sources", "created_at"], r, strict=True)) for r in rows]
+
+
+def reusable_qualification(conn: psycopg.Connection, lead_id: str, icp_version: str) -> dict | None:
+    """Latest qualification for this lead under the SAME ICP version, < REUSE_DAYS old."""
+    row = conn.execute(
+        "SELECT fit, criteria, created_at FROM qualifications WHERE lead_id = %s AND icp_version = %s "
+        "AND created_at > now() - make_interval(days => %s) ORDER BY created_at DESC, qualification_id DESC LIMIT 1",
+        [lead_id, icp_version, REUSE_DAYS],
+    ).fetchone()
+    return dict(zip(["fit", "criteria", "created_at"], row, strict=True)) if row else None
+
+
+def record_reply(conn: psycopg.Connection, lead_id: str, note: str = "") -> int:
+    return conn.execute(
+        "INSERT INTO replies (lead_id, note) VALUES (%s, %s) RETURNING reply_id", [lead_id, note]
+    ).fetchone()[0]
+
+
+def outreach(conn: psycopg.Connection, lead_id: str) -> dict:
+    """What we've done with this lead: drafts, what was sent and when, and whether they replied since."""
+    drafts = conn.execute(
+        """
+        SELECT d.draft_id, d.subject, d.created_at, s.sent_at FROM drafts d
+        LEFT JOIN sends s ON s.draft_id = d.draft_id AND s.status = 'sent'
+        WHERE d.lead_id = %s ORDER BY d.draft_id
+        """,
+        [lead_id],
+    ).fetchall()
+    sent = [(f"D{n}", subject, sent_at) for n, subject, _, sent_at in drafts if sent_at is not None]
+    last_sent = max((t for *_, t in sent), default=None)
+    last_reply = conn.execute("SELECT max(received_at) FROM replies WHERE lead_id = %s", [lead_id]).fetchone()[0]
+    return {
+        "drafts_unsent": [f"D{n}" for n, _, _, sent_at in drafts if sent_at is None],
+        "sent": [{"draft_id": d, "subject": s, "sent_at": t} for d, s, t in sent],
+        "last_contacted_at": last_sent,
+        "last_reply_at": last_reply,
+        "replied_since_last_contact": bool(last_sent and last_reply and last_reply > last_sent),
+    }
+
+
+def followups_due(conn: psycopg.Connection, days: int) -> list[dict]:
+    """Leads we emailed more than `days` days ago with no reply since. A follow-up is itself a send,
+    so it resets the clock: no one is chased twice in the same window."""
+    rows = conn.execute(
+        """
+        WITH last_send AS (
+            SELECT d.lead_id, max(s.sent_at) AS last_sent, count(*) AS emails_sent
+            FROM sends s JOIN drafts d ON d.draft_id = s.draft_id
+            WHERE s.status = 'sent' GROUP BY d.lead_id
+        )
+        SELECT l.lead_id, l.name, l.company, ls.last_sent, ls.emails_sent
+        FROM last_send ls JOIN leads l ON l.lead_id = ls.lead_id
+        WHERE ls.last_sent < now() - make_interval(days => %s)
+          AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.lead_id = ls.lead_id AND r.received_at > ls.last_sent)
+        ORDER BY ls.last_sent
+        """,
+        [days],
+    ).fetchall()
+    cols = ["lead_id", "name", "company", "last_contacted_at", "emails_sent"]
+    return [dict(zip(cols, r, strict=True)) for r in rows]

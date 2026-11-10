@@ -13,6 +13,7 @@ from research_assistant.db import alembic_config, connect, migrate
 
 BASELINE = {"chunks", "leads"}
 AGENT_STATE = {"runs", "run_steps", "research_findings", "finding_citations", "qualifications", "drafts", "approvals", "sends"}
+MEMORY = {"replies"}
 
 
 def _tables(url: str) -> set[str]:
@@ -35,6 +36,10 @@ def at_head_afterwards(test_db_url):
 
 def test_up_and_down_step_by_step(at_head_afterwards):
     url, cfg = at_head_afterwards, alembic_config(at_head_afterwards, TEST_DIMS)
+    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
+    assert _revision(url) == "0003"
+
+    command.downgrade(cfg, "-1")
     assert _tables(url) == BASELINE | AGENT_STATE
     assert _revision(url) == "0002"
 
@@ -47,13 +52,13 @@ def test_up_and_down_step_by_step(at_head_afterwards):
     assert _revision(url) is None
 
     command.upgrade(cfg, "head")
-    assert _tables(url) == BASELINE | AGENT_STATE
+    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
 
 
 def test_upgrade_is_a_no_op_at_head(at_head_afterwards):
     migrate(at_head_afterwards, dims=TEST_DIMS)
     migrate(at_head_afterwards, dims=TEST_DIMS)
-    assert _revision(at_head_afterwards) == "0002"
+    assert _revision(at_head_afterwards) == "0003"
 
 
 def test_baseline_uses_the_configured_dims(at_head_afterwards):

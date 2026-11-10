@@ -890,4 +890,83 @@ can't tell (real email) → REFUSE and let a human check, because sending twice 
 - **Lesson:** the model only knows what tools TELL it. A message that's true for one attempt can
   turn into a false statement about the world. Put the relevant state in the tool output.
 
+**Check answers (given by Claude):**
+1. *Why commit the "about to send" row BEFORE the email goes out?* Because the email can't be
+   rolled back but the transaction can. If claim + send + record were ONE transaction and we crash
+   after the email left, the transaction rolls back: no sends row at all. The retry finds nothing
+   in the ledger, so to it the email "never happened", and it sends again. The UNIQUE constraint
+   can't help: it only blocks rows that exist, and the row was rolled back. Committing the claim
+   first means a crash at ANY later point leaves a `pending` row behind, a durable "I may have sent this".
+2. *Why refuse a `pending` retry for real email?* We can't ask SMTP "did key draft-7 go out?". A
+   pending row means maybe sent, maybe not. Retrying guesses "not sent"; if wrong, Dana gets two
+   emails (embarrassing, can't be undone, looks like spam). Refusing guesses nothing: a human checks
+   Sent mail, so the cost is a short delay. Asymmetric costs → pick the reversible failure.
+   *How Gmail drafts (M8) help:* the agent only CREATES a draft in my Gmail; I press Send. A
+   duplicate draft is harmless (delete one), and the real "send exactly once" is done by a human
+   looking at it. Also Gmail returns a draft id (provider_message_id) we can store and later
+   look up, so "did it happen?" becomes answerable.
+
+## D4 M6 — memory across days
+
+**Concept:** persisting is not remembering. M3 saved everything, yet 3 runs wrote 3 intros to Dana
+because nothing READ the state before acting. M6 makes the agent consult its records first, through
+tools that query exact facts. The decisions (is this research fresh? who is due a follow-up?) are
+SQL/code, not model judgment.
+
+**What was built**
+- Migration **0003**: `replies` table (lead_id, received_at, note); `research_findings.assumptions`.
+  "Contacted" is NOT a column: it's derived from `sends` (latest sent_at), so it can't drift.
+- `search_company(company, question)`: `company` is a new required arg. Saves each answer as a
+  research_finding + citation snapshots. Reuses the newest SOLID answer to the same question
+  (case/space-insensitive) about the same company, < 7 days, same answer-prompt version → no
+  retrieval, no model call, marked `reused_from`.
+- `qualify_lead`: reuses a qualification < 7 days old with the same ICP version.
+- New read tools (allow): `lead_status(lead_id)` (sent emails + dates, unsent drafts, replied since
+  last contact?, latest qualification, recent research), `list_followups(days)` (1..30).
+- **agent-v5** (tool behavior changed → bump, the M4 lesson): pass the company to search; call
+  lead_status before drafting; already emailed → follow-up, not a new intro; replied → don't draft;
+  who's due = list_followups only.
+- `python -m research_assistant.outreach status | replied L1 --note ...` (replies by hand: we don't read the inbox).
+- 25 tests in test_memory_pg.py ("days ago" = backdated rows).
+
+**Rules encoded in SQL (followups_due)**
+- due = last SENT email older than N days AND no reply received after it.
+- A follow-up is itself a send → resets the clock. A reply BEFORE our latest email doesn't count.
+- Unsent drafts are not contact.
+
+**Gotchas**
+- **Don't reuse shaky answers:** needs_sources=true or a different PROMPT_VERSION → research again.
+  Reusing would freeze a bad answer for a week.
+- **Exact-question reuse is narrow:** "What does Figma do?" vs "What does Figma make?" is a miss.
+  That's a deliberate choice: a semantic match (embeddings) could return an answer to a DIFFERENT
+  question, the M0 lesson about similar ≠ same. A miss only costs one model call.
+- **No cap on follow-ups:** someone who never replies gets chased every 3 days forever. Open item
+  (e.g. stop after N emails_sent).
+- A bug I made and fixed: `{**d, "x": d.pop("k")}` copies k BEFORE the pop runs → the key appears
+  twice. Test now checks the reused result has the same shape as a fresh one.
+- Ran `alembic upgrade head` on the dev DB (0002 → 0003).
+
+**Live runs**
+- Backdated D4's send 4 days → `outreach status` shows "follow-up due". Agent: list_followups →
+  lead_status + search_company (parallel) → draft D5 "Re: Quick introduction" ("following up on my
+  earlier quick introduction"). A follow-up, not a new intro, built from the memory.
+- `outreach replied L1` → status REPLIED → same task: one list_followups call, "No leads are due", no draft.
+- Same question again → search_company 5 ms (was 4236 ms), no model call: reused from research_findings.
+
+**Open items for M7 (found in M6)**
+- **Concurrent sends (I spotted this):** two processes (two `--resume`s, or later server retries)
+  can both see `pending` and both send. Worse than I first thought: even two FIRST-time sends race,
+  because the loser sees the winner's in-flight `pending` row and the email isn't delivered yet.
+  Root cause: `pending` means both "someone is working on it" and "someone died". Fix: decide
+  under `SELECT ... FOR UPDATE NOWAIT` held through re-read → deliver → mark sent. Postgres
+  releases the lock when a process dies, so "locked" = "a live owner". (Alternative: a
+  pending→sending swap, but it needs a lease/timeout or a crashed winner leaves it stuck forever.)
+  Also make deliver's create atomic (`open(path, "x")`), since exists-then-write is check-then-act.
+  Test with forced interleaving (threading.Event pauses A inside deliver; B runs; resume A),
+  on 2 connections with committed data, not sleeps.
+- **Private-use characters leak:** the final answer contained `\ue200cite\ue202figma-about#000\ue201`,
+  the model's internal citation markup (invisible in the terminal, shows as "cite..."). It could
+  reach a draft body → an email. Fix: DraftEmailArgs rejects private-use (U+E000–U+F8FF) and
+  control characters, like the link check (the model gets an error and rewrites).
+
 **My answer:** _(fill in after check questions)_

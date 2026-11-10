@@ -14,8 +14,10 @@ from uuid import UUID
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from research_assistant import state
 from research_assistant.db import fetch_lead
 from research_assistant.llm import ask, judge_icp
+from research_assistant.prompts import PROMPT_VERSION
 from research_assistant.qualify import load_icp, qualify
 from research_assistant.retrieval import hybrid_search
 from research_assistant.schemas import Lead
@@ -35,9 +37,20 @@ EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 class SearchCompanyArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")  # -> "additionalProperties": false
+    company: str = Field(min_length=1, max_length=100, description="The company's name, e.g. 'Intel'.")
     question: str = Field(
-        min_length=3, max_length=300, description="A research question about a company, e.g. 'Who is Intel's CEO?'"
+        min_length=3, max_length=300, description="A research question about that company, e.g. 'Who is Intel's CEO?'"
     )
+
+
+class LeadStatusArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    lead_id: str = Field(pattern=LEAD_ID, description="Lead id, e.g. 'L1'.")
+
+
+class ListFollowupsArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    days: int = Field(ge=1, le=30, description="Only leads last emailed more than this many days ago, e.g. 3.")
 
 
 class GetLeadArgs(BaseModel):
@@ -113,9 +126,19 @@ def search_warning(question: str, result: dict) -> str | None:
 
 
 def search_company(args: SearchCompanyArgs, ctx: ToolContext) -> dict:
-    """Hybrid retrieval + the grounded P2 answer (a model call inside a tool call; both are logged)."""
+    """Hybrid retrieval + the grounded P2 answer (a model call inside a tool call; both are logged).
+
+    M6: a solid answer to the same question about the same company from the last 7 days is
+    returned from the DB instead (no retrieval, no model call), marked with `reused_from`.
+    New answers are saved as research_findings + citations.
+    """
+    reused = state.reusable_finding(ctx.conn, args.company, args.question, PROMPT_VERSION)
+    if reused is not None:
+        return reused
     chunks = [chunk for chunk, _ in hybrid_search(ctx.conn, args.question, k=5)]
     output = ask(args.question, chunks).model_dump()
+    fetched_at = {c.chunk_id: c.fetched_at for c in chunks}
+    state.save_finding(ctx.conn, args.company, args.question, output, fetched_at, PROMPT_VERSION, ctx.run_id)
     if warning := search_warning(args.question, output):
         ctx.warnings.append(warning)
     return output
@@ -129,6 +152,16 @@ def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
     """Score a lead against icp.toml: title checked in code, evidence judged by the model, fit by code."""
     lead = _lead_or_error(ctx, args.lead_id)
     icp = load_icp(ctx.icp_path)
+    reused = state.reusable_qualification(ctx.conn, lead.lead_id, icp.version)  # M6: < 7 days, same ICP
+    if reused is not None:
+        return {
+            "lead_id": lead.lead_id,
+            "company": lead.company,
+            "fit": reused["fit"],
+            "criteria": reused["criteria"],
+            "icp_version": icp.version,
+            "reused_from": reused["created_at"],
+        }
     criteria = icp.evidence_criteria()
     chunks = {}  # one search per criterion, deduped, in first-seen order
     for c in criteria:
@@ -138,6 +171,23 @@ def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
     result = qualify(lead, icp, judgment.results, set(chunks))
     save_qualification(ctx.conn, result, ctx.run_id)
     return result.model_dump()
+
+
+def lead_status(args: LeadStatusArgs, ctx: ToolContext) -> dict:
+    """Everything we remember about a lead: who they are, what we sent and when, whether they
+    replied, and our latest qualification and research. Read before drafting (M6)."""
+    lead = _lead_or_error(ctx, args.lead_id)
+    return {
+        "lead": lead.model_dump(),
+        "outreach": state.outreach(ctx.conn, lead.lead_id),
+        "latest_qualification": state.latest_qualification(ctx.conn, lead.lead_id),
+        "recent_research": state.recent_findings(ctx.conn, lead.company),
+    }
+
+
+def list_followups(args: ListFollowupsArgs, ctx: ToolContext) -> dict:
+    """Leads emailed more than `days` days ago who haven't replied since. Decided by SQL, not by the model."""
+    return {"days": args.days, "leads": state.followups_due(ctx.conn, args.days)}
 
 
 def draft_email(args: DraftEmailArgs, ctx: ToolContext) -> dict:
@@ -198,11 +248,24 @@ REGISTRY: dict[str, Tool] = {
     for t in [
         Tool(
             "search_company",
-            "Research a company from our saved sources. Returns a cited answer and whether sources are missing.",
+            "Research a company from our saved sources. Returns a cited answer and whether sources are missing. "
+            "Recent answers (< 7 days) are reused.",
             SearchCompanyArgs,
             search_company,
         ),
         Tool("get_lead", "Look up a sales lead by id: name, title, company, email.", GetLeadArgs, get_lead),
+        Tool(
+            "lead_status",
+            "What we remember about a lead: emails sent and when, replies, latest qualification, recent research.",
+            LeadStatusArgs,
+            lead_status,
+        ),
+        Tool(
+            "list_followups",
+            "Leads we emailed more than N days ago who have not replied since.",
+            ListFollowupsArgs,
+            list_followups,
+        ),
         Tool(
             "qualify_lead",
             "Score a lead against our ideal customer profile using saved sources. Returns fit "
