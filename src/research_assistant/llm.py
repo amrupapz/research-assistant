@@ -6,10 +6,12 @@ import time
 from collections.abc import Callable
 
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
+from pydantic import ValidationError
 
 from research_assistant.config import Settings, get_settings
 from research_assistant.log import log_run
 from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT
+from research_assistant.schemas import ResearchAnswer
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -77,13 +79,16 @@ def with_retries[T](
 
 
 
-def ask(question: str, client: OpenAI | None = None, settings: Settings | None = None) -> str:
-    """Ask one question; return the answer text or raise. Always logs exactly one run record."""
+def ask(
+    question: str, client: OpenAI | None = None, settings: Settings | None = None
+) -> ResearchAnswer:
+    """Ask one question; return a validated ResearchAnswer or raise. Always logs one run record."""
     settings = settings or get_settings()
     client = client or make_client(settings)
 
     record: dict = {"model": settings.model, "prompt_version": PROMPT_VERSION, "retries": 0}
     start = time.perf_counter()
+
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
         print(
@@ -93,8 +98,9 @@ def ask(question: str, client: OpenAI | None = None, settings: Settings | None =
 
     try:
         response = with_retries(
-            lambda: client.responses.create(
+            lambda: client.responses.parse(
                 model=settings.model,
+                text_format=ResearchAnswer,  # API forces JSON matching this schema
                 instructions=SYSTEM_PROMPT,  # static -> cacheable
                 input=question,  # per-request data goes here
                 max_output_tokens=settings.max_output_tokens,
@@ -109,8 +115,14 @@ def ask(question: str, client: OpenAI | None = None, settings: Settings | None =
         record["response_id"] = body.get("id")  # resp_...
         record["status"] = body.get("status")
         record.update(_usage(body))
-        return extract_output_text(body)  # raises on incomplete/empty
+        text = extract_output_text(body)  # raises on incomplete/empty
+        result = ResearchAnswer.model_validate_json(text)  # raises ValidationError if off-schema
+        record["confidence"] = result.confidence
+        record["needs_sources"] = result.needs_sources
+        return result
     except Exception as e:
+        if isinstance(e, ValidationError):
+            record["status"] = "invalid_output"  # API said completed, but JSON is off-schema
         record.setdefault("status", "error")  # keep "incomplete" if the API told us that
         record.setdefault("request_id", getattr(e, "request_id", None))  # API errors carry it
         record["error"] = f"{type(e).__name__}: {e}"

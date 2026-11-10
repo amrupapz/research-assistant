@@ -70,3 +70,18 @@
 1. `max_attempts=3` → up to 3 API calls: 1 original + 2 retries. My real log showed `retries: 2` after 3 timeouts.
 2. Both are HTTP 429, but `rate_limit_exceeded` = "too fast, slow down" (temporary, so waiting fixes it) and `insufficient_quota` = "out of credit" (permanent until someone adds billing, so retrying just wastes time). Decide on the error `code`, not only the status number.
 
+## D1 M4 — structured output (responses.parse + Pydantic)
+
+**Concept:** Send a Pydantic schema as `text_format`, and the API forces the model to reply with JSON matching it. Code can then branch on fields (`needs_sources`, `confidence`) instead of searching text for words like "verify".
+
+**Gotchas:**
+- Input tokens rose from ~130 to ~350: the schema (field names and descriptions) is sent with every request. Field descriptions act as extra prompt instructions.
+- Still check `status` first (`extract_output_text`). Cut-off JSON is broken JSON.
+- Validate it myself with `ResearchAnswer.model_validate_json`. If it's off-schema → status `invalid_output`, and it's NOT retried.
+- `Literal["low","medium","high"]` rejects anything else ("very sure").
+- Changing the prompt or schema means bumping PROMPT_VERSION (v1 → v2), so log lines show which version produced each answer.
+- Real results: Stripe → high / no sources; Anthropic funding → medium / needs sources; Figma headcount → low / needs sources. A salesperson only sees the answer text, but the code can now see these fields.
+- zsh: don't use `=====` as an echo separator (`=word` is expanded). Use '---'.
+
+**My answer:** _(fill in after check questions)_
+
