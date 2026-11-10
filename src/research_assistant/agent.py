@@ -87,30 +87,43 @@ def handle_call(
     }
     start = time.perf_counter()
     try:
-        try:
-            args = validate_call(name, call.get("arguments", ""))
-        except ToolError as e:
-            record["status"] = "invalid"
-            record["error"] = str(e)
-            return {"error": str(e)}, record
-
-        tool_call = ToolCall(name, args)
-        decision = authorize_fn(tool_call)
-        record["decision"] = decision
-        if decision == "allow":
-            return _execute(name, args, ctx, record), record
-        if decision == "needs_approval":
-            approved = approve_fn(tool_call, ctx) is True  # only a literal True counts
-            record["approved"] = approved
-            if approved:
-                return _execute(name, args, ctx, record), record
-            record["status"] = "rejected"
-            return {"error": f"the user did not approve {name}; do not retry it unless they ask"}, record
-        record["status"] = "denied"  # "deny" -- or any unexpected value: fail closed
-        return {"error": f"{name} is not permitted"}, record
+        output = _gate(name, call.get("arguments", ""), ctx, authorize_fn, approve_fn, record)
+        record["output_preview"] = json.dumps(output, default=str)[:500]  # what the MODEL saw back
+        return output, record
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         log_run(record, settings.runs_dir)
+
+
+def _gate(
+    name: str, raw_args: str, ctx: ToolContext, authorize_fn: AuthorizeFn, approve_fn: ApproveFn, record: dict
+) -> dict:
+    """validate -> authorize -> (approve) -> execute. Fills in record; returns what the model sees."""
+    try:
+        args = validate_call(name, raw_args)
+    except ToolError as e:
+        record["status"] = "invalid"
+        record["error"] = str(e)
+        return {"error": str(e)}
+
+    record["validated_args"] = args.model_dump()  # what actually runs (raw text can mislead, e.g. duplicate keys)
+    tool_call = ToolCall(name, args)
+    decision = authorize_fn(tool_call)
+    record["decision"] = decision
+    if decision == "allow":
+        return _execute(name, args, ctx, record)
+    if decision == "needs_approval":
+        approved = approve_fn(tool_call, ctx) is True  # only a literal True counts
+        record["approved"] = approved
+        if approved:
+            return _execute(name, args, ctx, record)
+        record["status"] = "rejected"
+        return {
+            "error": f"DECLINED: the user said no to {name}. It was NOT done. "
+            "Tell the user plainly that they declined it. Do not retry unless they ask."
+        }
+    record["status"] = "denied"  # "deny" -- or any unexpected value: fail closed
+    return {"error": f"{name} is not permitted"}
 
 
 def run_agent(
@@ -148,6 +161,8 @@ def run_agent(
 def cli_approve(call: ToolCall, ctx: ToolContext, input_fn: Callable[[str], str] = input) -> bool:
     """Show what will REALLY happen (from our own store, not the model's words) and ask y/N."""
     print(f"\n=== APPROVAL NEEDED: {call.name} ===", file=sys.stderr)
+    for w in ctx.warnings:
+        print(f"⚠ {w}", file=sys.stderr)
     draft = ctx.drafts.get(call.args.draft_id) if call.name == "send_email" and call.args else None
     if draft is not None:
         print(f"To: {draft.to}\nSubject: {draft.subject}\n\n{draft.body}\n", file=sys.stderr)

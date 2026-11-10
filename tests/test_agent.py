@@ -92,8 +92,10 @@ def test_every_call_is_logged(ctx, settings):
         "call_id": "c1",
         "tool": "get_lead",
         "arguments": '{"lead_id": "L1"}',
+        "validated_args": {"lead_id": "L1"},
         "decision": "allow",
         "status": "ok",
+        "output_preview": json.dumps(DANA.model_dump()),
         "latency_ms": 0,
     }
 
@@ -114,7 +116,7 @@ def test_parallel_calls_each_get_an_output(ctx, settings):
     ("decision", "status", "message"),
     [
         ("deny", "denied", "draft_email is not permitted"),
-        ("needs_approval", "rejected", "the user did not approve draft_email"),  # no approver = no
+        ("needs_approval", "rejected", "DECLINED: the user said no to draft_email"),  # no approver = no
         ("yes", "denied", "draft_email is not permitted"),  # unexpected value -> fail closed
     ],
 )
@@ -222,7 +224,7 @@ def test_anything_but_true_is_a_no(ctx, settings, answer):
     assert not ctx.outbox_dir.exists()
     send = result.tool_calls[-1]
     assert (send["approved"], send["status"]) == (False, "rejected")
-    assert "did not approve send_email" in json.loads(model.outputs(2)[-1]["output"])["error"]
+    assert "DECLINED: the user said no to send_email" in json.loads(model.outputs(2)[-1]["output"])["error"]
 
 
 def test_default_is_no_approver(ctx, settings):

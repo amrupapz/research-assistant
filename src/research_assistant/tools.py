@@ -4,6 +4,7 @@ Each tool = a Pydantic args model (the full rules, enforced here) + a strict sch
 from it (the shape the model sees) + a function. REGISTRY is the whitelist: nothing else runs.
 """
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from research_assistant.db import fetch_lead
 from research_assistant.llm import ask
@@ -21,6 +22,12 @@ from research_assistant.schemas import Draft, Lead
 LEAD_ID = r"^L[0-9]{1,6}$"
 DRAFT_ID = r"^D[0-9]{1,6}$"
 ONE_LINE = r"^[^\r\n]*$"  # header values: a newline would let the model inject "Bcc: ..."
+
+# Drafts are cold intros: they never need links or extra addresses, so ban both outright.
+# Catches http(s)://, www., and bare domain+path ("evil.example/claim"); not obfuscations like
+# "evil[.]example" -- those still face the human approval step.
+LINK = re.compile(r"https?://|www\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+/", re.IGNORECASE)
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 
 class SearchCompanyArgs(BaseModel):
@@ -42,8 +49,18 @@ class DraftEmailArgs(BaseModel):
     body: str = Field(
         min_length=1,
         max_length=2000,
-        description="Plain-text email body. Use only facts returned by search_company.",
+        description="Plain-text email body. Use only facts returned by search_company. No links or email addresses.",
     )
+
+    @field_validator("subject", "body")
+    @classmethod
+    def no_links_or_addresses(cls, value: str) -> str:
+        """Error names the rule, never the matched text (it may be attacker-written)."""
+        if LINK.search(value):
+            raise ValueError("drafts may not contain links")
+        if EMAIL.search(value):
+            raise ValueError("drafts may not contain email addresses")
+        return value
 
 
 class SendEmailArgs(BaseModel):
@@ -62,6 +79,7 @@ class ToolContext:
     conn: psycopg.Connection | Any
     drafts: dict[str, Draft] = field(default_factory=dict)  # in memory for now; Postgres in P4
     outbox_dir: Path = Path("outbox")  # "sending" = writing a .eml file here; never real email
+    warnings: list[str] = field(default_factory=list)  # shown to the human at approval time
 
 
 def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
@@ -74,7 +92,13 @@ def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
 def search_company(args: SearchCompanyArgs, ctx: ToolContext) -> dict:
     """Hybrid retrieval + the grounded P2 answer (a model call inside a tool call; both are logged)."""
     chunks = [chunk for chunk, _ in hybrid_search(ctx.conn, args.question, k=5)]
-    return ask(args.question, chunks).model_dump()
+    result = ask(args.question, chunks)
+    if result.needs_sources:  # missing / conflicting / outdated: the human should know before approving
+        ctx.warnings.append(
+            f"search_company({args.question!r}) flagged its sources as missing, conflicting, or unverified "
+            f"(confidence={result.confidence}). Check any claims from it before sending."
+        )
+    return result.model_dump()
 
 
 def get_lead(args: GetLeadArgs, ctx: ToolContext) -> dict:
