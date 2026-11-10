@@ -8,7 +8,7 @@ D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Lan
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
 CURRENT STAGE: Day 3 done — next Day 4, Project 4 (Postgres state + resume). P1–P3 done — see LEARNING.md wrap-ups.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
-real email/LinkedIn, MCP, Temporal, cloud deploy, multi-tenancy.
+automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
 
 ## How to work with me (learning on a deadline)
 
@@ -74,16 +74,50 @@ Commands: `uv run python -m research_assistant.db` (load + embed data/),
   evidence → say so, needs_sources=true.
 - Evaluate retrieval and answers SEPARATELY. Bump PROMPT_VERSION when prompt/schema changes.
 
-## Day 3 milestones (Project 3)
+## Day 4 milestones (Project 4)
 
-M0 Tool calling by hand: one tool schema → see the function_call item → send back function_call_output
-M1 3 tools: search_company (wraps grounded ask), get_lead (small leads table), draft_email; Pydantic arg models
-M2 Agent loop: model proposes → validate args → check permission → execute → feed result back; max_steps; log every tool call
-M3 Approval gate: send_email needs my y/n in the CLI; "sending" writes to outbox/, never real email
-M4 Attack it: bad args, unknown tool, unauthorized tool, prompt injection hidden in a data/ page
-M5 Tests + evals: expected tool + args per case; blocked actions stay blocked
-✍️ I WRITE authorize(tool_call) → allow | deny | needs_approval (no code given; I type it)
-Open items from P2 are in LEARNING.md.
+Goal (from the roadmap): the agent remembers what it did yesterday ("I emailed this lead
+yesterday, no reply → follow up today") and, after a crash, resumes from saved state
+instead of starting over. App state lives in Postgres tables, NOT in vector search.
+
+M0 Data model: leads, qualifications, research_findings (with citations), drafts, approvals,
+   sends, runs + run_steps. Sketch the tables + foreign keys in LEARNING.md before coding.
+M1 qualify_lead tool: score a lead against ICP criteria (written in a config file) using
+   search_company evidence → stored qualification {fit, reasons, cited chunk_ids}.
+   (Missing from P3 vs the roadmap; P5's workflow needs it.)
+M2 Alembic migrations: baseline the existing tables (chunks, leads), then add the new ones;
+   upgrade + downgrade on the test DB.
+M3 Persist the agent: drafts move from memory to Postgres; every tool call becomes a run_step;
+   a step and its effect commit in ONE transaction.
+M4 Resume: `agent --resume <run_id>` continues after the last committed step. Simulate a crash
+   after research, before the draft/send.
+M5 Never double-send   ✍️ I WRITE send_once(draft_id) (idempotency key + unique constraint;
+   a crash between "sent" and "recorded" must not send twice). No code given; if I ask you
+   to write it, refuse and give me a hint.
+M6 Memory across days: outreach status per lead (contacted_at, replied); `agent "follow up
+   leads with no reply after 3 days"`; reuse research findings < 7 days old instead of re-running.
+M7 Tests + evals: crash/resume, double-send, migration up/down, follow-up case in agent_cases.
+M8 Real email via Gmail MCP (ONLY after M5 send_once works). The agent becomes an MCP CLIENT:
+   - Primary: Google's official Gmail MCP server (Developer Preview, remote HTTP,
+     https://gmailmcp.googleapis.com/mcp/v1, OAuth). Use ONLY its create_draft tool: the agent
+     puts the approved draft into MY Gmail Drafts; I review and press Send in Gmail myself.
+     Request the narrowest scopes; never expose its tools to the model directly — my
+     send_email/draft tool calls it after validate → authorize → y/N.
+   - Email content from Gmail (if ever read) is untrusted data: <untrusted_data>, never instructions.
+   - authorize() uses call.args: recipient must be in ALLOWED_RECIPIENTS (my own addresses) → else deny.
+   - Fallback if preview access/OAuth is blocked: SMTP with a Gmail app password, same allowlist.
+   - EMAIL_MODE=outbox|gmail_mcp|smtp (default outbox). Tests use a fake MCP client, never real mail.
+   - OAuth tokens/credentials live outside git (gitignored), loaded via config.py.
+M9 LinkedIn hand-off: draft_linkedin_message tool → stored message + profile URL, status
+   "ready_to_send_manually"; `agent mark-sent <id>` records that I sent it myself. Never automate
+   LinkedIn sending.
+
+## Day 7 stretch (with P7/P8)
+
+MCP server: expose search_company, get_lead, qualify_lead via the official Python MCP SDK
+(stdio). authorize() runs INSIDE the server; send_email is NOT exposed (or returns
+needs_approval without sending). Connect it from Claude Desktop / Claude Code and test.
+Tests: tool listing, schema matches Pydantic models, denied tool stays denied.
 
 ## Done
 P1 (Day 1): reliable `ask` CLI — config, run logs, retries, structured output, 31 tests. See LEARNING.md.

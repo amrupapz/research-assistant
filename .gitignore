@@ -5,3 +5,6 @@ __pycache__/
 scratch/
 .DS_Store
 outbox/
+secrets/
+credentials*.json
+token*.json
