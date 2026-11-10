@@ -6,7 +6,7 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 3 done — next Day 4, Project 4 (Postgres state + resume). P1–P3 done — see LEARNING.md wrap-ups.
+CURRENT STAGE: Day 4 — Project 4 (Postgres state + resume). P1–P3 done — see LEARNING.md wrap-ups.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
 
