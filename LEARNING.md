@@ -66,3 +66,7 @@
 
 **My answer:** _(fill in after check questions)_
 
+**M3 check answers (given by Claude):**
+1. `max_attempts=3` → up to 3 API calls: 1 original + 2 retries. My real log showed `retries: 2` after 3 timeouts.
+2. Both are HTTP 429, but `rate_limit_exceeded` = "too fast, slow down" (temporary, so waiting fixes it) and `insufficient_quota` = "out of credit" (permanent until someone adds billing, so retrying just wastes time). Decide on the error `code`, not only the status number.
+
