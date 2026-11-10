@@ -71,7 +71,14 @@ Commands: `uv run python -m research_assistant.db` (load + embed data/),
 
 ## Day 3 milestones (Project 3)
 
-To be planned at the start of Day 3 (tools + approval). Open items from P2 are in LEARNING.md.
+M0 Tool calling by hand: one tool schema → see the function_call item → send back function_call_output
+M1 3 tools: search_company (wraps grounded ask), get_lead (small leads table), draft_email; Pydantic arg models
+M2 Agent loop: model proposes → validate args → check permission → execute → feed result back; max_steps; log every tool call
+M3 Approval gate: send_email needs my y/n in the CLI; "sending" writes to outbox/, never real email
+M4 Attack it: bad args, unknown tool, unauthorized tool, prompt injection hidden in a data/ page
+M5 Tests + evals: expected tool + args per case; blocked actions stay blocked
+✍️ I WRITE authorize(tool_call) → allow | deny | needs_approval (no code given; I type it)
+Open items from P2 are in LEARNING.md.
 
 ## Done
 P1 (Day 1): reliable `ask` CLI — config, run logs, retries, structured output, 31 tests. See LEARNING.md.
