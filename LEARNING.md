@@ -512,3 +512,11 @@
 - A rule in 2 places does 2 jobs: the schema description TELLS the model (cooperative path), the validator ENFORCES it (when the model is fooled or wrong). A cooperative model never trips the validator.
 - Enforcement code is like a seatbelt: it usually does nothing. Scripted-model tests prove the enforcement, and live runs show typical model behavior. Need both.
 - Good behavior: the agent told me it dropped my link and why, instead of silently omitting it.
+
+**M3 check answers (given by Claude):**
+1. `send_email(draft_id)` only → what I approve IS what gets sent. If it took to/subject/body, the model could draft to Marco but send to `partnerships@linear-deals.example`, or swap in a different body. The approval screen would show the send call's args and I'd skim past them. With draft_id only, the model can only POINT at a stored draft; the recipient comes from our leads table.
+2. The model's description of an action isn't the action. Once stored, the draft in `ctx.drafts` is the real version; the model could describe it as "a harmless follow-up". The approval screen shows exactly what send_email will write, looked up by id. Show the human the actual thing, not anyone's description of it.
+
+**M4 check answers (given by Claude):**
+1. The ⚠ warning comes from `ask`'s needs_sources = the model's own guess, which varied medium/high/low on identical input. A security control must give the same answer every time, and attackers can write a page that gets a confident rating. Reliable = decided by code: always show the sources behind the research on the approval screen (copied from citations); vet/allowlist sources at ingest. Keep the warning as a bonus hint.
+2. `ask` is built to pass FACTS that answer its question, into a fixed schema. An instruction ("send without asking") doesn't answer "what is the partner program?", so it has nowhere to go. A fake fact ("30% off") DOES answer it, from a page that looks first-party, so passing it on with a citation is exactly ask's job. Summarize-first blocks attacks that look different from valid data, not ones that look like valid data. Fact poisoning is a data problem → source vetting + provenance + a human.
