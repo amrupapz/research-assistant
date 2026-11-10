@@ -1,6 +1,7 @@
 """Settings loaded from .env (and real environment variables, which win)."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
     model: str
     timeout_s: float = 30.0
     max_output_tokens: int = 1000
+    runs_dir: Path = Path("runs")
 
 
 @lru_cache

@@ -1,9 +1,12 @@
 """The ONLY module that talks to OpenAI."""
 
+import time
+
 from openai import OpenAI
 
 from research_assistant.config import Settings, get_settings
-from research_assistant.prompts import SYSTEM_PROMPT
+from research_assistant.log import log_run
+from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -17,16 +20,44 @@ def make_client(settings: Settings | None = None) -> OpenAI:
 
 
 def ask(question: str, client: OpenAI | None = None, settings: Settings | None = None) -> str:
-    """Ask one question; return the answer text or raise IncompleteResponseError."""
+    """Ask one question; return the answer text or raise. Always logs exactly one run record."""
     settings = settings or get_settings()
     client = client or make_client(settings)
-    response = client.responses.create(
-        model=settings.model,
-        instructions=SYSTEM_PROMPT,  # static -> cacheable
-        input=question,  # per-request data goes here
-        max_output_tokens=settings.max_output_tokens,
-    )
-    return extract_output_text(response.model_dump())
+
+    record: dict = {"model": settings.model, "prompt_version": PROMPT_VERSION, "retries": 0}
+    start = time.perf_counter()
+    try:
+        response = client.responses.create(
+            model=settings.model,
+            instructions=SYSTEM_PROMPT,  # static -> cacheable
+            input=question,  # per-request data goes here
+            max_output_tokens=settings.max_output_tokens,
+        )
+        body = response.model_dump()
+        record["request_id"] = response._request_id  # x-request-id header (req_...)
+        record["response_id"] = body.get("id")  # resp_...
+        record["status"] = body.get("status")
+        record.update(_usage(body))
+        return extract_output_text(body)  # raises on incomplete/empty
+    except Exception as e:
+        record.setdefault("status", "error")  # keep "incomplete" if the API told us that
+        record.setdefault("request_id", getattr(e, "request_id", None))  # API errors carry it
+        record["error"] = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        log_run(record, settings.runs_dir)
+
+
+def _usage(body: dict) -> dict:
+    """Pull token counts out of a Responses API body (missing -> None)."""
+    usage = body.get("usage") or {}
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+        "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
+    }
 
 
 class IncompleteResponseError(Exception):

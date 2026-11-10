@@ -1,0 +1,26 @@
+"""Structured run logs: one JSON line per model call in runs/YYYY-MM-DD.jsonl."""
+
+import json
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+def log_run(record: dict, runs_dir: Path) -> Path:
+    """Append one record (plus a UTC timestamp) as a JSON line; return the file written."""
+    now = datetime.now(UTC)
+    record = {"ts": now.isoformat(timespec="milliseconds"), **record}
+
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    path = runs_dir / f"{now:%Y-%m-%d}.jsonl"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+    # Human-readable one-liner on stderr (stdout stays just the answer).
+    print(
+        f"[run] {record.get('status')} {record.get('latency_ms')}ms "
+        f"in={record.get('input_tokens')} out={record.get('output_tokens')} "
+        f"cached={record.get('cached_tokens')} {record.get('request_id')}",
+        file=sys.stderr,
+    )
+    return path

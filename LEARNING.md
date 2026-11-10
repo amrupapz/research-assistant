@@ -27,3 +27,18 @@
 
 **My answer:** _(fill in after check questions)_
 
+## D1 M2 — structured logs + runs/*.jsonl
+
+**Concept:** Every model call writes one JSON line (who, what, how long, how many tokens, whether it worked) to `runs/YYYY-MM-DD.jsonl`. Code can search and add up these lines, which answers questions about cost, speed and failures.
+
+**Gotchas:**
+- Log in `finally`, so failed calls get a line too. A failure missing from the log is the worst kind to debug.
+- Re-raise after logging. Logging must not swallow the error.
+- `record.setdefault("status", "error")` keeps `"incomplete"` when the API said so: "truncated" and "crashed" are different problems.
+- Two IDs: `request_id` (`req_…`, from the `x-request-id` header, the one support asks for) and `response_id` (`resp_…`, the response object's ID).
+- Log lines go to stderr and the answer to stdout, so `ask "q" > answer.txt` saves just the answer.
+- `cached_tokens=0` even on repeated calls: OpenAI only caches prompts of about 1024+ tokens, and ours is about 130.
+- Tests write logs to pytest's `tmp_path`, never to the real `runs/`.
+
+**My answer:** _(fill in after check questions)_
+
