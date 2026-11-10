@@ -16,6 +16,8 @@ def _settings(runs_dir: Path) -> Settings:
         model="test-model",
         max_output_tokens=123,
         runs_dir=runs_dir,
+        base_delay_s=0.001,  # keep retry sleeps tiny in tests
+        max_delay_s=0.002,
     )
 
 
@@ -101,3 +103,20 @@ def test_api_exception_is_logged_then_reraised(tmp_path):
     assert run["status"] == "error"
     assert run["error"] == "TimeoutError: boom"
     assert "latency_ms" in run  # timing logged even on failure
+
+
+def test_ask_retries_timeout_and_logs_retry_count(tmp_path):
+    import httpx2
+    import openai
+
+    client = _client(COMPLETED)
+    good = client.responses.create.return_value
+    req = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+    client.responses.create.side_effect = [openai.APITimeoutError(request=req), good]
+
+    answer = ask("q", client=client, settings=_settings(tmp_path))
+
+    assert answer == "Payments."
+    [run] = _read_runs(tmp_path)
+    assert run["retries"] == 1
+    assert run["status"] == "completed"

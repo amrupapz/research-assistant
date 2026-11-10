@@ -1,8 +1,11 @@
 """The ONLY module that talks to OpenAI."""
 
+import random
+import sys
 import time
+from collections.abc import Callable
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 
 from research_assistant.config import Settings, get_settings
 from research_assistant.log import log_run
@@ -19,6 +22,61 @@ def make_client(settings: Settings | None = None) -> OpenAI:
     )
 
 
+def is_retryable(exc: BaseException) -> bool:
+    """True only for failures that might succeed if we try again later."""
+    if isinstance(exc, RateLimitError):
+        return exc.code != "insufficient_quota"  # out of credit: waiting won't help
+    if isinstance(exc, APIConnectionError):  # includes APITimeoutError
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code >= 500  # server's fault; 4xx is ours -> never retry
+    return False  # anything else (incl. IncompleteResponseError) is not transient
+
+
+def with_retries[T](
+    fn: Callable[[], T],
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 0.5,
+    max_delay: float = 8.0,
+    on_retry: Callable[[int, BaseException, float], None] = lambda attempt, exc, delay: None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Call fn(); on a retryable error, back off and try again, up to max_attempts total.
+
+    ✍️ YOU WRITE THIS (Project 1 core function #2).
+
+    Contract:
+      - attempt counts from 1. Call fn(); if it returns, return its value.
+      - If it raises:
+          * not is_retryable(exc)        -> re-raise immediately (bare `raise`)
+          * attempt == max_attempts      -> re-raise (out of tries)
+          * otherwise: delay = backoff with jitter (below),
+                       on_retry(attempt + 1, exc, delay)   # the attempt we're ABOUT to make
+                       sleep(delay), then loop.
+      - Backoff with jitter for the retry after attempt n:
+            cap   = min(max_delay, base_delay * 2 ** (n - 1))   # 0.5, 1, 2, 4, 8, 8...
+            delay = random.uniform(cap / 2, cap)                # "equal jitter"
+
+    Hints:
+      - `for attempt in range(1, max_attempts + 1):` with try/except inside.
+      - Use the `sleep` argument, never time.sleep directly — tests pass a fake.
+      - ~12 lines. Run: uv run pytest tests/test_retries.py -v
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not is_retryable(exc) or attempt == max_attempts:
+                raise
+            cap = min(max_delay, base_delay * 2 ** (attempt - 1))
+            delay = random.uniform(cap / 2, cap)
+            on_retry(attempt + 1, exc, delay)
+            sleep(delay)
+    raise ValueError("max_attempts must be >= 1")
+
+
+
 def ask(question: str, client: OpenAI | None = None, settings: Settings | None = None) -> str:
     """Ask one question; return the answer text or raise. Always logs exactly one run record."""
     settings = settings or get_settings()
@@ -26,12 +84,25 @@ def ask(question: str, client: OpenAI | None = None, settings: Settings | None =
 
     record: dict = {"model": settings.model, "prompt_version": PROMPT_VERSION, "retries": 0}
     start = time.perf_counter()
+    def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+        record["retries"] += 1
+        print(
+            f"[retry] attempt {attempt} after {type(exc).__name__}, sleeping {delay:.2f}s",
+            file=sys.stderr,
+        )
+
     try:
-        response = client.responses.create(
-            model=settings.model,
-            instructions=SYSTEM_PROMPT,  # static -> cacheable
-            input=question,  # per-request data goes here
-            max_output_tokens=settings.max_output_tokens,
+        response = with_retries(
+            lambda: client.responses.create(
+                model=settings.model,
+                instructions=SYSTEM_PROMPT,  # static -> cacheable
+                input=question,  # per-request data goes here
+                max_output_tokens=settings.max_output_tokens,
+            ),
+            max_attempts=settings.max_attempts,
+            base_delay=settings.base_delay_s,
+            max_delay=settings.max_delay_s,
+            on_retry=on_retry,
         )
         body = response.model_dump()
         record["request_id"] = response._request_id  # x-request-id header (req_...)

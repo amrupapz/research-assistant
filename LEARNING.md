@@ -42,3 +42,27 @@
 
 **My answer:** _(fill in after check questions)_
 
+## D1 — SDK in plain terms + M1/M2 check answers (given by Claude, not mine yet)
+
+**SDK = a library that makes the raw HTTP call for you.** M0 built the URL, headers, JSON and parsing by hand with httpx. `client.responses.create(...)` sends the same POST and turns the JSON into Python objects and exceptions (e.g. 429 → `RateLimitError`).
+
+1. **Optional `client`:** tests pass a fake client, so no real API calls, no cost and no key needed. Without it, tests would need to patch code or would hit the API.
+2. **SDK `max_retries=2` + my loop:** retries multiply. 3 SDK attempts × my 3 attempts = up to 9 requests for one timeout. The SDK's retries are also invisible to my logs, so `retries` would be wrong.
+3. **Logging in `finally`:** `finally` runs on success AND on exceptions. Logging after `return` would never run on failures, and failures are the calls I most need to see.
+4. **Reasoning fraction:** sum(reasoning_tokens) / sum(output_tokens) over today's `runs/YYYY-MM-DD.jsonl` (count missing values as 0).
+
+## D1 M3 — timeouts, retries, rate limits
+
+**Concept:** Retry only transient failures (timeout, connection, 429 rate limit, 5xx). Never retry permanent ones (400/401/404, 429 insufficient_quota, truncation). Wait longer each time (exponential backoff) plus randomness (jitter), so many clients don't retry at the same moment.
+
+**Gotchas:**
+- `max_attempts` counts total tries, not retries: 3 attempts = 1 call + 2 retries.
+- Don't sleep after the final failed attempt; just raise.
+- Inject `sleep` so tests run instantly and can check the delays.
+- `APITimeoutError` is a subclass of `APIConnectionError`.
+- 429 has two meanings: `rate_limit_exceeded` (wait and retry) vs `insufficient_quota` (out of credit, stop).
+
+**After the week:** honor the `Retry-After` header on 429/503 instead of only our own backoff.
+
+**My answer:** _(fill in after check questions)_
+

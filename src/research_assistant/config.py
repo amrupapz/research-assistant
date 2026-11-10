@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     timeout_s: float = 30.0
     max_output_tokens: int = 1000
     runs_dir: Path = Path("runs")
+    max_attempts: int = 3  # total tries, including the first
+    base_delay_s: float = 0.5
+    max_delay_s: float = 8.0
 
 
 @lru_cache
