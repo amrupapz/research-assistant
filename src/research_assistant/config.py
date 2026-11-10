@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr  # SecretStr: prints as '**********', never the real key
     model: str
     timeout_s: float = 30.0
-    max_output_tokens: int = 1000
+    max_output_tokens: int = 2000  # includes REASONING tokens; 1000 truncated ask (D3 M5)
     runs_dir: Path = Path("runs")
     max_attempts: int = 3  # total tries, including the first
     base_delay_s: float = 0.5

@@ -9,7 +9,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from research_assistant.config import Settings
-from research_assistant.llm import IncompleteResponseError, ask
+from research_assistant.llm import RESEARCH_ANSWER_FORMAT, IncompleteResponseError, ask
 from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT
 from research_assistant.schemas import Chunk, Citation, ResearchAnswer
 
@@ -28,7 +28,7 @@ def _settings(runs_dir: Path) -> Settings:
 def _client(body: dict) -> MagicMock:
     """Fake OpenAI client whose responses.create returns a response with this body."""
     client = MagicMock()
-    response = client.responses.parse.return_value
+    response = client.responses.create.return_value
     response.model_dump.return_value = body
     response._request_id = "req_test"
     return client
@@ -95,13 +95,15 @@ def test_ask_returns_text_and_sends_system_prompt(tmp_path):
         needs_sources=False,
         citations=[Citation(chunk_id="stripe#000", source_url="https://stripe.example/about")],
     )
-    kwargs = client.responses.parse.call_args.kwargs
+    kwargs = client.responses.create.call_args.kwargs
     assert kwargs["instructions"] == SYSTEM_PROMPT  # static system prompt
     assert "Question: What does Stripe sell?" in kwargs["input"]  # question + chunks in the user message
     assert '<chunk id="stripe#000"' in kwargs["input"]
     assert kwargs["model"] == "test-model"
     assert kwargs["max_output_tokens"] == 123
-    assert kwargs["text_format"] is ResearchAnswer  # schema sent to the API
+    assert kwargs["text"] == {"format": RESEARCH_ANSWER_FORMAT}  # schema sent to the API
+    assert kwargs["text"]["format"]["strict"] is True
+    assert kwargs["text"]["format"]["name"] == "ResearchAnswer"
 
 
 def test_success_logs_one_record_with_required_fields(tmp_path):
@@ -129,7 +131,7 @@ def test_truncated_response_is_logged_as_incomplete(tmp_path):
     with pytest.raises(IncompleteResponseError):
         ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
-    assert client.responses.parse.call_count == 1  # same request would truncate again
+    assert client.responses.create.call_count == 1  # same request would truncate again
     [run] = _read_runs(tmp_path)
     assert run["status"] == "incomplete"
     assert "max_output_tokens" in run["error"]
@@ -137,7 +139,7 @@ def test_truncated_response_is_logged_as_incomplete(tmp_path):
 
 def test_api_exception_is_logged_then_reraised(tmp_path):
     client = MagicMock()
-    client.responses.parse.side_effect = TimeoutError("boom")
+    client.responses.create.side_effect = TimeoutError("boom")
 
     with pytest.raises(TimeoutError):
         ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
@@ -150,9 +152,9 @@ def test_api_exception_is_logged_then_reraised(tmp_path):
 
 def test_ask_retries_timeout_and_logs_retry_count(tmp_path):
     client = _client(COMPLETED)
-    good = client.responses.parse.return_value
+    good = client.responses.create.return_value
     req = httpx2.Request("POST", "https://api.openai.com/v1/responses")
-    client.responses.parse.side_effect = [openai.APITimeoutError(request=req), good]
+    client.responses.create.side_effect = [openai.APITimeoutError(request=req), good]
 
     answer = ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
@@ -171,7 +173,7 @@ def test_off_schema_json_raises_logs_invalid_output_and_is_not_retried(tmp_path)
     with pytest.raises(ValidationError):
         ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
-    assert client.responses.parse.call_count == 1  # retrying won't fix our schema mismatch
+    assert client.responses.create.call_count == 1  # retrying won't fix our schema mismatch
     [run] = _read_runs(tmp_path)
     assert run["status"] == "invalid_output"
     assert run["retries"] == 0
@@ -180,10 +182,10 @@ def test_off_schema_json_raises_logs_invalid_output_and_is_not_retried(tmp_path)
 def test_temperature_sent_only_when_set(tmp_path):
     client = _client(COMPLETED)
     ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
-    assert "temperature" not in client.responses.parse.call_args.kwargs
+    assert "temperature" not in client.responses.create.call_args.kwargs
 
     ask("q", CHUNKS, client=client, settings=_settings(tmp_path), temperature=0.2)
-    assert client.responses.parse.call_args.kwargs["temperature"] == 0.2
+    assert client.responses.create.call_args.kwargs["temperature"] == 0.2
     assert _read_runs(tmp_path)[-1]["temperature"] == 0.2
 
 
@@ -200,8 +202,8 @@ def _status_error(cls, status: int, code: str, request_id: str | None = None):
 
 def test_rate_limit_is_retried_then_succeeds(tmp_path):
     client = _client(COMPLETED)
-    good = client.responses.parse.return_value
-    client.responses.parse.side_effect = [
+    good = client.responses.create.return_value
+    client.responses.create.side_effect = [
         _status_error(openai.RateLimitError, 429, "rate_limit_exceeded"),
         good,
     ]
@@ -209,21 +211,21 @@ def test_rate_limit_is_retried_then_succeeds(tmp_path):
     answer = ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     assert answer.answer == "Payments. [stripe#000]"
-    assert client.responses.parse.call_count == 2
+    assert client.responses.create.call_count == 2
     [run] = _read_runs(tmp_path)
     assert (run["status"], run["retries"]) == ("completed", 1)
 
 
 def test_bad_key_401_not_retried_and_request_id_logged(tmp_path):
     client = MagicMock()
-    client.responses.parse.side_effect = _status_error(
+    client.responses.create.side_effect = _status_error(
         openai.AuthenticationError, 401, "invalid_api_key", request_id="req_401"
     )
 
     with pytest.raises(openai.AuthenticationError):
         ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
-    assert client.responses.parse.call_count == 1
+    assert client.responses.create.call_count == 1
     [run] = _read_runs(tmp_path)
     assert run["status"] == "error"
     assert run["retries"] == 0
@@ -240,3 +242,22 @@ def test_refusal_raises_instead_of_returning_empty_answer(tmp_path):
     [run] = _read_runs(tmp_path)
     assert run["status"] == "completed"  # API finished fine...
     assert "no output_text" in run["error"]  # ...but there was no answer to use
+
+
+def test_cut_off_json_is_incomplete_not_invalid_output(tmp_path):
+    """D3 M5 eval bug: with responses.parse the SDK raised ValidationError on half-written JSON
+    before our status check, so truncation was logged as invalid_output with no tokens/request_id."""
+    body = _with_text(
+        {**COMPLETED, "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+        '{\n  "answer": "Intel builds chips for PCs, data center, and AI. Its product priorities, not',
+    )
+    client = _client(body)
+
+    with pytest.raises(IncompleteResponseError, match="max_output_tokens"):
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
+
+    assert not client.responses.parse.called  # the SDK never gets a chance to parse first
+    [run] = _read_runs(tmp_path)
+    assert run["status"] == "incomplete"
+    assert run["request_id"] == "req_test"
+    assert run["output_tokens"] == 88  # usage is logged, so we can SEE the budget ran out

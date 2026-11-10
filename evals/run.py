@@ -3,30 +3,43 @@
   uv run python evals/run.py --stage retrieval      # cheap: one embedding per question
   uv run python evals/run.py --stage answers        # ~1 model call per question
   uv run python evals/run.py --stage answers --only q07b --repeat 5   # measure a flaky case
+  uv run python evals/run.py --stage agent --repeat 3   # agent trajectories, ~4-6 model calls per run
 
 Each case appends one JSON line to runs/evals.jsonl (tagged with stage + PROMPT_VERSION).
 """
 
 import argparse
 import json
+import tempfile
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from research_assistant.agent import MaxStepsError, run_agent
 from research_assistant.db import connect
-from research_assistant.evaluate import grade_answer, load_cases, retrieval_scores
+from research_assistant.evaluate import (
+    grade_agent_run,
+    grade_answer,
+    load_agent_cases,
+    load_cases,
+    observations,
+    retrieval_scores,
+)
 from research_assistant.llm import (
     IncompleteResponseError,
     UngroundedAnswerError,
     ask,
     embed,
 )
-from research_assistant.prompts import PROMPT_VERSION
+from research_assistant.prompts import AGENT_PROMPT_VERSION, PROMPT_VERSION
 from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
+from research_assistant.tools import ToolContext
 
 ROOT = Path(__file__).parent.parent
 CASES = ROOT / "evals" / "questions.jsonl"
+AGENT_CASES = ROOT / "evals" / "agent_cases.jsonl"
 OUT = ROOT / "runs" / "evals.jsonl"
 KS = (1, 3, 5)
 
@@ -100,15 +113,73 @@ def run_answers(conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
     print(f"\n{passed}/{len(cases)} passed (prompt {PROMPT_VERSION})")
 
 
+def run_agent_case(conn, case) -> dict:
+    """One real agent run with a TEMP outbox and a scripted approver. Returns plain data for grading."""
+    asked = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = ToolContext(conn=conn, outbox_dir=Path(tmp) / "outbox")
+
+        def approver(call, _ctx):
+            asked.append(call.name)
+            return case.approve == "yes"
+
+        answer, error, tool_calls = None, None, []
+        try:
+            result = run_agent(case.task, ctx, approve_fn=approver)
+            answer, tool_calls = result.answer, result.tool_calls
+        except (MaxStepsError, IncompleteResponseError) as e:
+            error = f"{type(e).__name__}: {e}"
+        sent = sorted(f.name for f in ctx.outbox_dir.glob("*.eml")) if ctx.outbox_dir.exists() else []
+    return {
+        "tool_calls": tool_calls,
+        "drafts": [d.model_dump() for d in ctx.drafts.values()],
+        "sent": sent,
+        "answer": answer,
+        "error": error,
+        "asked": len(asked),
+    }
+
+
+def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> None:
+    cases = [c for c in load_agent_cases(AGENT_CASES) if not only or c.id in only]
+    tally: dict[str, list[bool]] = defaultdict(list)
+    seen: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for _ in range(repeat):
+        for case in cases:
+            run = run_agent_case(conn, case)
+            checks = grade_agent_run(case.expect, run)
+            obs = observations(case, run)
+            tally[case.id].append(checks["pass"])
+            for o in obs:
+                seen[case.id][o] += 1
+            failed = [n for n, ok in checks.items() if not ok and n != "pass"]
+            trail = " → ".join(f"{c['tool']}[{c['status']}]" for c in run["tool_calls"])
+            print(f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id}  {trail}  {', '.join(failed)}", flush=True)
+            if run["error"]:
+                print(f"      ↳ {run['error'][:160]}")
+            _write({"stage": "agent", "prompt_version": AGENT_PROMPT_VERSION, "case": case.id, **checks,
+                    "observed": obs, "trail": trail, "error": run["error"], "answer": run["answer"],
+                    "drafts": run["drafts"], "sent": run["sent"], "asked": run["asked"]})
+    print(f"\n{'case':<6}{'pass':>8}   observed in drafts (not graded)")
+    for case in cases:
+        runs = tally[case.id]
+        obs = ", ".join(f"{k} {v}/{len(runs)}" for k, v in seen[case.id].items()) or "-"
+        print(f"{case.id:<6}{sum(runs):>4}/{len(runs):<3}   {obs}")
+    total = [ok for runs in tally.values() for ok in runs]
+    print(f"\n{sum(total)}/{len(total)} runs passed (prompt {AGENT_PROMPT_VERSION})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["retrieval", "answers"], required=True)
+    parser.add_argument("--stage", choices=["retrieval", "answers", "agent"], required=True)
     parser.add_argument("--only", nargs="*", help="case ids to run, e.g. --only q07 q07b")
-    parser.add_argument("--repeat", type=int, default=1, help="run each answer case N times (flakiness)")
+    parser.add_argument("--repeat", type=int, default=1, help="run each case N times (flakiness)")
     args = parser.parse_args()
     with connect() as conn:
         if args.stage == "retrieval":
             run_retrieval(conn)
+        elif args.stage == "agent":
+            run_agent_evals(conn, only=args.only, repeat=args.repeat)
         else:
             run_answers(conn, only=args.only, repeat=args.repeat)
 

@@ -104,8 +104,8 @@ def _client(answer: dict) -> MagicMock:
         "usage": {"input_tokens": 10, "output_tokens": 5},
     }
     client = MagicMock()
-    client.responses.parse.return_value.model_dump.return_value = body
-    client.responses.parse.return_value._request_id = "req_1"
+    client.responses.create.return_value.model_dump.return_value = body
+    client.responses.create.return_value._request_id = "req_1"
     return client
 
 
@@ -131,7 +131,7 @@ def test_ask_ungrounded_is_logged_and_not_retried(tmp_path):
     client = _client(bad)
     with pytest.raises(UngroundedAnswerError):
         ask("q", [INTEL], client=client, settings=_settings(tmp_path), today=TODAY)
-    assert client.responses.parse.call_count == 1  # a retry won't make the model cite real chunks
+    assert client.responses.create.call_count == 1  # a retry won't make the model cite real chunks
     [run] = _runs(tmp_path)
     assert run["status"] == "ungrounded"
     assert run["cited_ids"] == ["ghost#000"]

@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import date
 
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
+from openai.lib._parsing._responses import type_to_text_format_param
 from pydantic import ValidationError
 
 from research_assistant.config import Settings, get_settings
@@ -20,6 +21,13 @@ from research_assistant.prompts import (
     build_user_message,
 )
 from research_assistant.schemas import Chunk, ResearchAnswer
+
+# The exact strict schema `responses.parse(text_format=ResearchAnswer)` used to send, built by the
+# SDK's own helper. We call `responses.create` instead because `.parse` validates the JSON inside
+# the SDK call -- a truncated answer then raises ValidationError before our status check runs,
+# and gets logged as invalid_output with no tokens or request_id (found by D3 M5 evals).
+# Private SDK path: if an upgrade moves it, the import fails loudly at startup.
+RESEARCH_ANSWER_FORMAT = type_to_text_format_param(ResearchAnswer)
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -121,9 +129,9 @@ def ask(
 
     try:
         response = with_retries(
-            lambda: client.responses.parse(
+            lambda: client.responses.create(  # NOT .parse: it parses JSON before anyone checks status
                 model=settings.model,
-                text_format=ResearchAnswer,  # API forces JSON matching this schema
+                text={"format": RESEARCH_ANSWER_FORMAT},  # API forces JSON matching this schema
                 instructions=SYSTEM_PROMPT,  # static -> cacheable
                 input=build_user_message(question, chunks, today or date.today()),  # per-request data
                 max_output_tokens=settings.max_output_tokens,

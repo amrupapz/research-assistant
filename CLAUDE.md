@@ -6,7 +6,7 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 3 — Project 3 (tools + approval). P1, P2 done — see LEARNING.md wrap-ups.
+CURRENT STAGE: Day 3 done — next Day 4, Project 4 (Postgres state + resume). P1–P3 done — see LEARNING.md wrap-ups.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 real email/LinkedIn, MCP, Temporal, cloud deploy, multi-tenancy.
 
@@ -41,13 +41,18 @@ src/research_assistant/
   ingest.py     data/ pages → chunks (chunk_id, source_url, fetched_at)
   retrieval.py  keyword search, vector search, hybrid merge
   db.py         Postgres connection + schema
-  evaluate.py   pure eval scoring (retrieval_scores, grade_answer)
+  evaluate.py   pure eval scoring (retrieval_scores, grade_answer, grade_agent_run)
+  tools.py      tool registry: Pydantic args -> strict schemas; validate_call / execute
+  permissions.py authorize(ToolCall) -> allow | deny | needs_approval (default-deny)
+  agent.py      `agent "task"`: loop, gate (validate -> authorize -> approve -> execute), cli_approve
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
-evals/questions.jsonl   evals/run.py   data/ (saved company pages)   runs/ (one JSONL record per request)
+evals/questions.jsonl  evals/agent_cases.jsonl  evals/run.py   data/ (saved company pages; linear-customers.md = injection test page)
+runs/ (one JSONL record per request)   outbox/ ("sent" .eml files, gitignored)
 ```
 
 Commands: `uv run python -m research_assistant.db` (load + embed data/),
-`uv run ask "question"`, `uv run python evals/run.py --stage retrieval|answers [--only ids] [--repeat N]`.
+`uv run ask "question"`, `uv run agent "task"`,
+`uv run python evals/run.py --stage retrieval|answers|agent [--only ids] [--repeat N]`.
 
 ## Rules for every model call
 
@@ -84,3 +89,6 @@ Open items from P2 are in LEARNING.md.
 P1 (Day 1): reliable `ask` CLI — config, run logs, retries, structured output, 31 tests. See LEARNING.md.
 P2 (Day 2): RAG w/ citations — chunking, Postgres FTS + pgvector, RRF hybrid, grounded answers
    (prompt v4), evals (retrieval hit@k + answer checks, --repeat), 98 tests. See LEARNING.md.
+P3 (Day 3): tools + approval — hand-rolled tool loop, 4 tools, default-deny authorize, y/N gate
+   for send_email (outbox/ only), attack tests + poisoned page, agent trajectory evals (agent-v3,
+   33/33), ask switched to responses.create (truncation fix), 221 tests. See LEARNING.md.

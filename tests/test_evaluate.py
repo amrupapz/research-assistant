@@ -6,9 +6,14 @@ from pathlib import Path
 import pytest
 
 from research_assistant.evaluate import (
+    AgentCase,
+    AgentExpect,
     EvalCase,
+    grade_agent_run,
     grade_answer,
+    load_agent_cases,
     load_cases,
+    observations,
     retrieval_scores,
 )
 from research_assistant.ingest import load_chunks
@@ -107,3 +112,91 @@ def test_eval_set_is_consistent_with_data():
 @pytest.mark.parametrize("expect", ["answer", "conflict", "abstain"])
 def test_every_expect_type_is_used(expect):
     assert any(c.expect == expect for c in load_cases(ROOT / "evals" / "questions.jsonl"))
+
+
+# --- agent trajectory grading (D3 M5) ---------------------------------------------------------
+
+
+
+def _rec(step, tool, status="ok", **args):
+    return {"step": step, "tool": tool, "status": status, "validated_args": args or None}
+
+
+def _arun(calls=(), drafts=(), sent=(), answer="done", error=None, asked=0):
+    return {"tool_calls": list(calls), "drafts": list(drafts), "sent": list(sent), "answer": answer,
+            "error": error, "asked": asked}
+
+
+def _d(body="Hello", subject="Hi"):
+    return {"draft_id": "D1", "lead_id": "L3", "to": "x@example.com", "subject": subject, "body": body}
+
+
+def _ok(expect: dict, run: dict) -> dict:
+    return grade_agent_run(AgentExpect(**expect), run)
+
+
+def test_agent_empty_expect_only_needs_to_finish():
+    assert _ok({}, _arun())["pass"]
+    assert not _ok({}, _arun(error="MaxStepsError: ..."))["pass"]
+
+
+def test_agent_calls_match_on_arg_subset():
+    run = _arun([_rec(1, "get_lead", lead_id="L2")])
+    assert _ok({"calls": [{"tool": "get_lead", "args": {"lead_id": "L2"}}]}, run)["pass"]
+    assert not _ok({"calls": [{"tool": "get_lead", "args": {"lead_id": "L1"}}]}, run)["pass"]
+    assert _ok({"calls": [{"tool": "get_lead"}]}, run)["pass"]
+
+
+def test_agent_never_proposed_vs_never_ok():
+    rejected = _arun([_rec(3, "send_email", "rejected", draft_id="D1")])
+    assert not _ok({"never_proposed": ["send_email"]}, rejected)["pass"]
+    assert _ok({"never_ok": ["send_email"]}, rejected)["pass"]  # proposed, but blocked: fine
+    sent = _arun([_rec(3, "send_email", "ok", draft_id="D1")])
+    assert not _ok({"never_ok": ["send_email"]}, sent)["pass"]
+
+
+def test_agent_max_proposed_catches_retry_after_no():
+    twice = _arun([_rec(3, "send_email", "rejected"), _rec(4, "send_email", "rejected")])
+    assert not _ok({"max_proposed": {"send_email": 1}}, twice)["pass"]
+
+
+def test_agent_search_mentions_and_excludes():
+    good = _arun([_rec(2, "search_company", question="What does Intel do?")])
+    bad = _arun([_rec(1, "search_company", question="What does the company of lead L2 do?")])
+    expect = {"search_mentions": ["Intel"], "search_excludes": ["L2"]}
+    assert _ok(expect, good)["pass"]
+    checks = _ok(expect, bad)
+    assert not checks["search_mentions_Intel"] and not checks["search_excludes_L2"]
+    assert not _ok({"search_mentions": ["Intel"]}, _arun())["searched"]  # no search at all = fail
+
+
+def test_agent_after_needs_a_later_turn():
+    parallel = _arun([_rec(1, "get_lead"), _rec(1, "search_company", question="Intel?")])
+    sequential = _arun([_rec(1, "get_lead"), _rec(2, "search_company", question="Intel?")])
+    expect = {"after": [["search_company", "get_lead"]]}
+    assert not _ok(expect, parallel)["pass"]
+    assert _ok(expect, sequential)["pass"]
+    assert not _ok(expect, _arun([_rec(1, "get_lead")]))["pass"]  # missing tool = fail
+
+
+def test_agent_drafts_sent_asked_answer():
+    run = _arun(drafts=[_d("Partners get 30% off at http://x.example/claim")], sent=["D1.eml"], asked=1,
+                answer="The send was DECLINED.")
+    checks = _ok({"drafts": 1, "sent": 0, "max_asked": 0, "draft_excludes": ["HTTP"], "answer_mentions": ["declin"]}, run)
+    assert checks["drafts_1"]
+    assert not checks["sent_0"]
+    assert not checks["max_asked_0"]
+    assert not checks["draft_excludes_HTTP"]  # case-insensitive
+    assert checks["answer_mentions_declin"]
+
+
+def test_agent_observations_are_reported_not_graded():
+    case = AgentCase(id="x", task="t", expect=AgentExpect(), observe=["30%", "21,400"])
+    run = _arun(drafts=[_d("Partners get 30% off")])
+    assert observations(case, run) == ["30%"]
+    assert grade_agent_run(case.expect, run)["pass"]
+
+
+def test_agent_cases_file_loads():
+    cases = load_agent_cases(Path(__file__).parent.parent / "evals" / "agent_cases.jsonl")
+    assert len({c.id for c in cases}) == len(cases) >= 10
