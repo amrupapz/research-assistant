@@ -215,3 +215,28 @@
 - `figma-company-profile#001` (the short, generic table tail) shows up #3 for almost every query: a "hub" chunk that is vaguely close to everything.
 - Exact tokens ("18A") → keyword wins; paraphrases → vector wins. That's the case for hybrid search (M4).
 - No HNSW index yet: with 13 rows a full scan is fine. Add `USING hnsw (embedding vector_cosine_ops)` when there are thousands of rows.
+
+## D2 M4 — hybrid search (Reciprocal Rank Fusion)
+
+**Concept:** Keyword and vector scores are on unrelated scales (≈0.1–1.6 vs ≈0.1–0.8), so adding them lets one method silently dominate. RRF uses only rank positions: each list gives a chunk 1/(k + rank) (k=60, rank from 1), summed over the lists it appears in. Chunks both methods agree on rise to the top, and chunks only one method finds still get in.
+
+**Built:** keyword `match="any"` (ANDs → ORs, via `CAST(... AS tsquery)`; a `::` cast isn't allowed in FROM). `hybrid_search` = top 20 any-word keyword + top 20 vector → `rrf_merge` → top k. CLI `--mode keyword|any|vector|hybrid`. 12 new tests (74 total). `rrf_merge` was written by Claude at my request. The line-by-line walkthrough is in the chat; I should be able to explain each line.
+
+**Results (hybrid, top-1):**
+| query | keyword | vector | hybrid |
+|---|---|---|---|
+| "18A" | intel ✅ | junk (Figma) ❌ | intel-leadership#001 ✅ |
+| "Business per user" | 0 hits ❌ | linear #001 | linear #000 ✅ |
+| q06 Anthropic | 0 hits | ✅ | ✅ anthropic-funding#000 |
+| q07 Figma | 0 hits | profile#000 | figma-about#000 (2,140) tied with profile#000 ✅ |
+| q08 Intel CEO | 0 hits | 2024 page | **2024 page still #1** ❌ |
+| q09 Linear | 0 hits | ✅ | ✅ linear-pricing#000 |
+| q10 Vercel | 0 hits | ✅ | ✅ vercel-changelog#000 |
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- RRF scores are squashed into 0.031–0.033 (the max with 2 lists is 2/61 = 0.0328). They say nothing about absolute relevance, so they can't be the M5 abstain threshold. Use the vector similarity or the LLM's judgment instead.
+- Exact ties are common (figma-about#000 = figma-company-profile#000 = 1/61 + 1/62). The chunk_id tiebreak decides, which is arbitrary but deterministic.
+- The outdated Intel page still wins, because both methods like it. Retrieval can't know freshness; M5 must use `fetched_at`.
+- Filler at #3 (anthropic-funding#001 for "Business per user") comes from OR-mode noise plus vector always returning k.

@@ -13,7 +13,7 @@ import pytest
 
 from research_assistant.db import connect, embed_missing, init_schema, sync_chunks
 from research_assistant.ingest import load_chunks
-from research_assistant.retrieval import keyword_search, vector_search
+from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
 from research_assistant.schemas import Chunk
 
 TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/research_assistant_test")
@@ -67,6 +67,11 @@ def test_stemming_matches_other_word_forms(pg):
 def test_full_question_finds_nothing_because_words_are_anded(pg):
     # Known limitation of keyword search, kept as a test so we notice if it changes.
     assert keyword_search(pg, "How much did Anthropic raise in its latest funding round?") == []
+
+
+def test_any_mode_finds_full_questions(pg):
+    results = keyword_search(pg, "How much did Anthropic raise in its latest funding round?", match="any")
+    assert _ids(results)[0] == "anthropic-funding#000"
 
 
 def test_respects_k(pg):
@@ -132,3 +137,10 @@ def test_embed_missing_only_embeds_new_or_changed(pets):
     sync_chunks(pets, [_chunk("c#0", "a cat"), _chunk("d#0", "a different dog"), _chunk("v#0", "a car")])
     assert embed_missing(pets, spy) == 1
     assert calls == [["t\n\na different dog"]]  # title + text, only the changed chunk
+
+
+def test_hybrid_fuses_keyword_and_vector(pets):
+    # keyword(any): 'kitten' | 'car' -> only v#0.   vector("kitten car" contains "kitten"): c, d, v.
+    # RRF: v = 1/61 + 1/63 (both lists) > c = 1/61 > d = 1/62
+    results = hybrid_search(pets, "kitten car", k=3, embed=fake_embed)
+    assert _ids(results) == ["v#0", "c#0", "d#0"]
