@@ -128,3 +128,37 @@
 - `cached_tokens` is always 0: prompt + schema (~350 tokens) is below the ~1024-token caching minimum.
 - After the week: honor `Retry-After`; a `refused` status.
 
+
+---
+
+# Day 2 — Project 2: RAG with citations
+
+## D2 M0 — saved pages (synthetic fixtures)
+
+**Concept:** RAG = retrieve relevant chunks from our own sources, put them in the prompt as untrusted data, answer only from them with citations. Evaluate retrieval (was the right chunk in top-k?) separately from answers (correct + cited?) so a failure points at the right fix.
+
+**Built:** 7 pages in `data/`, each with a `url / fetched_at / title / synthetic: true` header. The numbers are made up on purpose: if an answer contains $22.5B or 2,140, the model read our source and didn't answer from memory.
+- Traps: `intel-leadership-2024.md` (outdated: same URL, old fetched_at, previous CEO); `figma-company-profile.md` (conflict: third-party estimate of 1,870 vs. 2,140 on Figma's own page).
+- Distractors: Anthropic page also mentions the earlier Series G; Linear FAQ also mentions the old $16 price; Vercel changelog has 6 dated launches.
+- `gold_sources` added to q06–q10 in evals/questions.jsonl, used for retrieval hit rate@k in M6.
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- Synthetic ≠ real. These pages test the pipeline, not facts about the companies.
+- Same URL, different fetched_at → the answer has to prefer the newest, so fetched_at matters at answer time and not only for provenance.
+
+## D2 M1 — ingest + chunking with overlap
+
+**Concept:** Chunks are the unit we search and cite. They have to be small enough to be about one thing and big enough to carry their context. Overlap (the next chunk repeats the last N words of the previous one) keeps a fact that lands on a boundary whole in at least one chunk.
+
+**Built:** `ingest.py`: `parse_page` (header required, else IngestError), `chunk_text` (200-word window, 40-word overlap, slices the original text so newlines/tables survive), `chunk_page`, `load_chunks`. Stable ids `<file stem>#NNN`. `Page`/`Chunk` in schemas.py. 12 new tests, 43 total.
+
+**Inspection (200/40):** 7 pages → 13 chunks; median 198 words, min 51. Every gold fact sits whole inside one chunk.
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- `figma-company-profile#001` is a 51-word tail that starts mid-table ("| 9% |") and never says "Figma". A chunk loses its context. Fix in M3: embed `title + text`, not text alone.
+- The overlap repeats a fact in two chunks (`$18 per user` is in linear-pricing#000 and #001). Top-k can return near-duplicates. Worth watching in M4.
+- Word windows ignore structure (headings, tables). Splitting on headings is a possible upgrade, but only if the evals show it's needed.
