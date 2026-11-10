@@ -142,7 +142,9 @@
 - Distractors: Anthropic page also mentions the earlier Series G; Linear FAQ also mentions the old $16 price; Vercel changelog has 6 dated launches.
 - `gold_sources` added to q06–q10 in evals/questions.jsonl, used for retrieval hit rate@k in M6.
 
-**My answer:** _(fill in after check questions)_
+**Answers (worked through with Claude):**
+- Two Intel pages: same URL, so prefer the newer `fetched_at` (and the page's "Last updated"). If only the 2024 page is retrieved, don't state it as current: say "as of May 2024 the CEO was Pat Gelsinger; this may be out of date", with low confidence and needs_sources=true.
+- Wrong Linear price: look at the retrieved chunk_ids for that request. If linear-pricing#000 wasn't in top-k, retrieval failed. If it was there but the answer says $16 (the old price in the FAQ), generation failed. → The run log must record retrieved chunk_ids (M5).
 
 **Gotchas:**
 - Synthetic ≠ real. These pages test the pipeline, not facts about the companies.
@@ -156,7 +158,9 @@
 
 **Inspection (200/40):** 7 pages → 13 chunks; median 198 words, min 51. Every gold fact sits whole inside one chunk.
 
-**My answer:** _(fill in after check questions)_
+**Answers (worked through with Claude):**
+- With overlap=0, the real boundaries split facts: Figma's competitor list breaks after "Sketch, Miro," | "Framer, Penpot, Webflow", so "Who competes with Figma?" gets half a list. Linear breaks at "Guests on the Business and Enterprise" | "plans are free", so neither half answers "Are guests free on Business?".
+- A search returning figma-company-profile#001 (no headcount) is a retrieval failure. The model then has nothing to cite and should abstain (needs_sources=true). File-level gold_sources would wrongly score it a hit, because it's the right file but the wrong chunk. Fix for M6: check that the gold fact (e.g. "2,140") appears in the retrieved text, or label gold at chunk level.
 
 **Gotchas:**
 - `figma-company-profile#001` is a 51-word tail that starts mid-table ("| 9% |") and never says "Figma". A chunk loses its context. Fix in M3: embed `title + text`, not text alone.
