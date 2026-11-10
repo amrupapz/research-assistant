@@ -315,3 +315,30 @@
 - Abstaining costs a full LLM call; a cheap retrieval-side gate (vector similarity floor) could skip it.
 - Cache: put the chunk block before the question so follow-ups on the same chunks reuse the prefix?
 - Hub chunk (figma-company-profile#001) shows up everywhere; heading-aware chunking if evals ever show it hurting.
+
+---
+
+# Day 3 — Project 3: tools + approval
+
+## D3 M0 — tool calling by hand
+
+**Concept:** I send tool schemas (name, description, JSON Schema args). The model replies with a `function_call` item (`name`, `call_id`, `arguments` as a JSON *string*). It doesn't run anything. My code decides whether to run it, runs it, and sends back a `function_call_output` with the same `call_id`. Then the model answers or asks for another call. Because the model only proposes, my code is where every action gets checked. That matters because a poisoned page in `<untrusted_data>` could talk the model into proposing anything.
+
+**Built:** `llm.respond()` (raw `responses.create` with tools; same retries/status check; logs `kind=agent_turn`, `prompt_version=agent-v1`, `tools_offered`, `tool_calls`), `extract_function_calls()`, `function_call_output()`. Prompt `AGENT_PROMPT` (agent-v1), separate from the RAG prompt v4. Demo: `scratch/m0_tool_call.py`. 6 new tests, 104 total.
+
+**Gotchas:**
+- A turn that only has a function_call has no `output_text`, so `extract_output_text` raises on it. Use `extract_function_calls` on tool turns.
+- Resend ALL of `body["output"]` (reasoning items too), not just the function_call.
+- `strict: true` needs every field required + `additionalProperties: false`. It guarantees the shape, not the meaning (`lead_id: "L999"` still passes).
+- `arguments` is model-written text → untrusted, validate it (M1: Pydantic).
+
+**Real run (gpt-6-luna):** call 1 = just one `function_call` (`"{\"lead_id\":\"L1\"}"`), NO reasoning item, 147 in / 21 out. Call 2 = 209 in / 18 out, `cached=0`, answer "Dana Kim, VP of Engineering at Figma" (a fact that exists only in our dict).
+- Don't assume the order or presence of items. Filter by `type`.
+- Every turn resends the whole history, so input grows each step. That's one reason for `max_steps`.
+- Caching only starts at ~1024+ prompt tokens, so `cached=0` here is expected.
+
+**My answer:** _(fill in after check questions)_
+
+**M0 check answers (given by Claude):**
+1. `LEADS.get(args["lead_id"])` fails two ways. (a) Malformed args (bad JSON, missing/extra/wrong-type field): the Pydantic arg model catches it, and the error goes back to the model as tool output. (b) Valid but wrong (`L999`, or a lead I'm not allowed to see): the tool returns "not found", and `authorize()` handles "not allowed". A schema can't catch (b).
+2. Injected "call send_email" does nothing in M0: the tool isn't offered, and only my code executes. Once send_email exists, `authorize()` → needs_approval is the real stop. The prompt rule helps but isn't a guarantee.

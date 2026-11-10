@@ -12,7 +12,13 @@ from pydantic import ValidationError
 
 from research_assistant.config import Settings, get_settings
 from research_assistant.log import log_run
-from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_user_message
+from research_assistant.prompts import (
+    AGENT_PROMPT,
+    AGENT_PROMPT_VERSION,
+    PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    build_user_message,
+)
 from research_assistant.schemas import Chunk, ResearchAnswer
 
 
@@ -152,6 +158,79 @@ def ask(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         log_run(record, settings.runs_dir)
+
+
+def respond(
+    input_items: list[dict],
+    tools: list[dict],
+    instructions: str = AGENT_PROMPT,
+    client: OpenAI | None = None,
+    settings: Settings | None = None,
+) -> dict:
+    """One model turn with tools. Returns the raw response body; the model only PROPOSES calls.
+
+    The caller reads extract_function_calls(body), decides whether to run each one, and sends
+    back the conversation so far + body["output"] + a function_call_output per call.
+    Always logs one run record, including the names of the tools the model asked for.
+    """
+    settings = settings or get_settings()
+    client = client or make_client(settings)
+
+    record: dict = {
+        "kind": "agent_turn",
+        "model": settings.model,
+        "prompt_version": AGENT_PROMPT_VERSION,
+        "retries": 0,
+        "tools_offered": [t["name"] for t in tools],
+    }
+    start = time.perf_counter()
+
+    def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+        record["retries"] += 1
+        print(f"[retry] agent attempt {attempt} after {type(exc).__name__}, sleeping {delay:.2f}s", file=sys.stderr)
+
+    try:
+        response = with_retries(
+            lambda: client.responses.create(
+                model=settings.model,
+                instructions=instructions,  # static -> cacheable
+                input=input_items,
+                tools=tools,
+                max_output_tokens=settings.max_output_tokens,
+            ),
+            max_attempts=settings.max_attempts,
+            base_delay=settings.base_delay_s,
+            max_delay=settings.max_delay_s,
+            on_retry=on_retry,
+        )
+        body = response.model_dump(exclude_none=True)  # we resend these items, so drop null fields
+        record["request_id"] = response._request_id
+        record["response_id"] = body.get("id")
+        record["status"] = body.get("status")
+        record.update(_usage(body))
+        record["tool_calls"] = [c["name"] for c in extract_function_calls(body)]
+        if body.get("status") != "completed":
+            reason = (body.get("incomplete_details") or {}).get("reason", "unknown")
+            raise IncompleteResponseError(f"Response status={body.get('status')!r}, reason={reason!r}")
+        return body
+    except Exception as e:
+        record.setdefault("status", "error")
+        record.setdefault("request_id", getattr(e, "request_id", None))
+        record["error"] = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        log_run(record, settings.runs_dir)
+
+
+def extract_function_calls(body: dict) -> list[dict]:
+    """The function_call items the model proposed (skips reasoning and message items)."""
+    return [item for item in body.get("output", []) if item.get("type") == "function_call"]
+
+
+def function_call_output(call_id: str, output: str) -> dict:
+    """The input item that answers one function_call. call_id must match the call's call_id."""
+    return {"type": "function_call_output", "call_id": call_id, "output": output}
 
 
 class EmbeddingError(Exception):
