@@ -1,35 +1,18 @@
-"""Postgres connection + schema. Functions don't commit; the caller owns the transaction."""
+"""Postgres connection + migrations. Functions don't commit; the caller owns the transaction.
+
+The schema lives in migrations/ (Alembic), not here: `migrate()` or `uv run alembic upgrade head`.
+"""
 
 from collections.abc import Callable
+from pathlib import Path
 
 import psycopg
+from alembic import command
+from alembic.config import Config
 
 from research_assistant.schemas import Chunk, Lead
 
 EmbedFn = Callable[[list[str]], list[list[float]]]
-
-# tsv is computed by Postgres from title + text on every insert/update (stemmed, stopwords dropped).
-# embedding is filled later by embed_missing(); NULL means "needs embedding".
-SCHEMA = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id    text PRIMARY KEY,
-    source_url  text NOT NULL,
-    fetched_at  date NOT NULL,
-    title       text NOT NULL,
-    text        text NOT NULL,
-    tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || text)) STORED
-);
-CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
-ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector({dims});
-CREATE TABLE IF NOT EXISTS leads (
-    lead_id  text PRIMARY KEY,
-    name     text NOT NULL,
-    title    text NOT NULL,
-    company  text NOT NULL,
-    email    text NOT NULL
-);
-"""
 
 # Fictional contacts, one per company in data/. example.com is reserved: mail there goes nowhere.
 SEED_LEADS = [
@@ -64,8 +47,28 @@ def connect(url: str | None = None) -> psycopg.Connection:
     return psycopg.connect(url)
 
 
-def init_schema(conn: psycopg.Connection, dims: int) -> None:
-    conn.execute(SCHEMA.format(dims=int(dims)))
+ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
+
+
+def sqlalchemy_url(url: str) -> str:
+    """Alembic connects through SQLAlchemy; tell it to use psycopg 3 (our driver), not psycopg2."""
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix) :]
+    return url
+
+
+def alembic_config(url: str, dims: int | None = None) -> Config:
+    cfg = Config(str(ALEMBIC_INI))
+    cfg.attributes.update(url=url, from_code=True)
+    if dims is not None:
+        cfg.attributes["embedding_dims"] = dims
+    return cfg
+
+
+def migrate(url: str, revision: str = "head", dims: int | None = None) -> None:
+    """Bring the database at `url` up to `revision`. Commits on its own connection."""
+    command.upgrade(alembic_config(url, dims), revision)
 
 
 def sync_chunks(conn: psycopg.Connection, chunks: list[Chunk]) -> int:
@@ -131,9 +134,10 @@ def main() -> None:
     from research_assistant.ingest import load_chunks
     from research_assistant.llm import embed
 
+    settings = get_settings()
+    migrate(settings.database_url, dims=settings.embedding_dims)
     chunks = load_chunks()
     with connect() as conn:  # commits on clean exit, rolls back on error
-        init_schema(conn, get_settings().embedding_dims)
         deleted = sync_chunks(conn, chunks)
         embedded = embed_missing(conn, embed)
         seed_leads(conn)

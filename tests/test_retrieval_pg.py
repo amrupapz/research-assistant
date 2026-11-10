@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from research_assistant.db import embed_missing, init_schema, sync_chunks
+from research_assistant.db import embed_missing, sync_chunks
 from research_assistant.ingest import load_chunks
 from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
 from research_assistant.schemas import Chunk
@@ -20,7 +20,6 @@ DATA = Path(__file__).parent.parent / "data"
 @pytest.fixture
 def pg(db):
     """Schema + the real data/ chunks (no embeddings)."""
-    init_schema(db, 1536)
     sync_chunks(db, load_chunks(DATA))
     return db
 
@@ -94,7 +93,7 @@ def _chunk(cid: str, text: str) -> Chunk:
 
 @pytest.fixture
 def pets(db):
-    init_schema(db, 3)
+    db.execute("ALTER TABLE chunks ALTER COLUMN embedding TYPE vector(3)")  # 3-d toys; rolled back
     sync_chunks(db, [_chunk("c#0", "a cat"), _chunk("d#0", "a dog"), _chunk("v#0", "a car")])
     assert embed_missing(db, fake_embed) == 3
     return db

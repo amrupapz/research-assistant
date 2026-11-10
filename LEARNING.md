@@ -676,3 +676,39 @@ else possible. **Unknown is not no**: missing evidence gives "possible", never "
 - `.replace("{company}", ...)` not `.format()`: a question containing other braces won't crash.
 
 **My answer:** _(fill in after check questions)_
+
+## D4 M2 — Alembic migrations
+
+**Concept:** a migration is a numbered schema change with upgrade() and downgrade(). The DB
+records which ones it has (`alembic_version`), so every DB (dev, test, Docker, CI) reaches the
+same schema with one command. Without it: `CREATE TABLE IF NOT EXISTS` silently skips new
+columns on an existing table, dev and test drift, and there's no clean way back.
+
+**What was built**
+- `uv add alembic` (pulls in SQLAlchemy, used ONLY to open the connection: `postgresql+psycopg://`).
+  Migrations are plain SQL in `op.execute`. No ORM, no autogenerate.
+- `alembic.ini` + `migrations/env.py`: URL from config.py (or passed in by code/tests), never in the ini.
+- `0001_baseline`: chunks + leads exactly as before (dims from settings). `0002_agent_state`: the M0 tables.
+- db.py: SCHEMA/init_schema removed → `migrate(url, revision="head", dims=None)`. `python -m research_assistant.db` migrates first.
+- Tests: test DB migrated once per session; each test still rolls back. `test_migrations_pg.py`:
+  up/down step by step + every constraint actually fires.
+
+**Baseline + stamp:** an existing DB already has chunks/leads, so running 0001 would fail
+("relation already exists"). `alembic stamp 0001` writes the version WITHOUT running it.
+A fresh DB just runs 0001.
+
+**Change from the M0 sketch:** qualifications has no finding_id. qualify_lead doesn't create a
+research_finding; it stores per-criterion results as `criteria jsonb` (with chunk_ids).
+
+**Gotchas**
+- Postgres DDL is transactional: a migration that fails halfway leaves NOTHING behind. (MySQL can't do this.)
+- downgrade drops in reverse FK order: a table can't be dropped while another references it.
+- `sends.approval_id` FK proves the approval EXISTS, not that it says "approved". There's a test
+  that documents this limit (a declined approval passes). The code (M5) must check it.
+- A CHECK can only see its own row: `status='sent' → sent_at NOT NULL` works; "approval is approved" can't.
+- Constraint tests: a failed statement aborts the whole transaction, so each expected failure
+  runs inside `db.transaction()` (a SAVEPOINT) to keep the test's transaction usable.
+- Up/down tests COMMIT (DDL on the shared test DB), so a fixture always migrates back to head.
+- The `vector(3)` toy test now ALTERs the column inside its rolled-back transaction instead of creating its own table.
+
+**My answer:** _(fill in after check questions)_
