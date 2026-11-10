@@ -85,3 +85,18 @@
 
 **My answer:** _(fill in after check questions)_
 
+## D1 M5 — variance + seeding evals
+
+**Concept:** Same question, same settings → the model still varies. Measure it before trusting one answer. Evals = fixed questions + expected behavior, re-run on every prompt change.
+
+**Results (gpt-6-luna, prompt v2, 5 runs each):**
+- `temperature` → 400 "not supported with this model" (a reasoning model). Not retried, which is correct for a 400. So: 5 runs at the default only.
+- Stripe: 5/5 high, 5/5 needs_sources=false; 5/5 different wordings (302–374 chars).
+- Anthropic latest round: 5/5 medium, 5/5 needs_sources=true; all repeat the same $13B Series F (Sept 2025) fact.
+- The text varies every time, but the structured fields were 100% stable. So evals should check fields, not exact text.
+- Possible prompt issue: "latest round" on facts that may be >1 year old got `medium`. Arguably it should be `low`. Day 6 eval candidate.
+
+**Seeded:** evals/questions.jsonl, 10 questions (5 stable / 5 unknowable) with `expect_needs_sources`.
+
+**My answer:** _(fill in after check questions)_
+

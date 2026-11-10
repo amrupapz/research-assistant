@@ -1,0 +1,10 @@
+{"id": "q01", "question": "What does Stripe sell, and to whom?", "kind": "stable", "expect_needs_sources": false}
+{"id": "q02", "question": "What is Shopify's business model?", "kind": "stable", "expect_needs_sources": false}
+{"id": "q03", "question": "Who are Notion's main competitors?", "kind": "stable", "expect_needs_sources": false}
+{"id": "q04", "question": "What kind of customers buy Datadog, and what problem does it solve for them?", "kind": "stable", "expect_needs_sources": false}
+{"id": "q05", "question": "Is Atlassian mainly a B2B or B2C company, and why?", "kind": "stable", "expect_needs_sources": false}
+{"id": "q06", "question": "How much did Anthropic raise in its latest funding round?", "kind": "unknowable", "expect_needs_sources": true}
+{"id": "q07", "question": "What is Figma's current headcount?", "kind": "unknowable", "expect_needs_sources": true}
+{"id": "q08", "question": "Who is the current CEO of Intel?", "kind": "unknowable", "expect_needs_sources": true}
+{"id": "q09", "question": "What does Linear charge per seat on its Business plan today?", "kind": "unknowable", "expect_needs_sources": true}
+{"id": "q10", "question": "What product did Vercel launch most recently?", "kind": "unknowable", "expect_needs_sources": true}

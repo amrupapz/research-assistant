@@ -80,13 +80,22 @@ def with_retries[T](
 
 
 def ask(
-    question: str, client: OpenAI | None = None, settings: Settings | None = None
+    question: str,
+    client: OpenAI | None = None,
+    settings: Settings | None = None,
+    temperature: float | None = None,
 ) -> ResearchAnswer:
     """Ask one question; return a validated ResearchAnswer or raise. Always logs one run record."""
     settings = settings or get_settings()
     client = client or make_client(settings)
+    extra = {} if temperature is None else {"temperature": temperature}  # only send if set
 
-    record: dict = {"model": settings.model, "prompt_version": PROMPT_VERSION, "retries": 0}
+    record: dict = {
+        "model": settings.model,
+        "prompt_version": PROMPT_VERSION,
+        "temperature": temperature,
+        "retries": 0,
+    }
     start = time.perf_counter()
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
@@ -104,6 +113,7 @@ def ask(
                 instructions=SYSTEM_PROMPT,  # static -> cacheable
                 input=question,  # per-request data goes here
                 max_output_tokens=settings.max_output_tokens,
+                **extra,
             ),
             max_attempts=settings.max_attempts,
             base_delay=settings.base_delay_s,

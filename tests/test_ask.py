@@ -156,3 +156,13 @@ def test_off_schema_json_raises_logs_invalid_output_and_is_not_retried(tmp_path)
     [run] = _read_runs(tmp_path)
     assert run["status"] == "invalid_output"
     assert run["retries"] == 0
+
+
+def test_temperature_sent_only_when_set(tmp_path):
+    client = _client(COMPLETED)
+    ask("q", client=client, settings=_settings(tmp_path))
+    assert "temperature" not in client.responses.parse.call_args.kwargs
+
+    ask("q", client=client, settings=_settings(tmp_path), temperature=0.2)
+    assert client.responses.parse.call_args.kwargs["temperature"] == 0.2
+    assert _read_runs(tmp_path)[-1]["temperature"] == 0.2
