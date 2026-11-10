@@ -91,9 +91,9 @@ M3 Persist the agent: drafts move from memory to Postgres; every tool call becom
    a step and its effect commit in ONE transaction.
 M4 Resume: `agent --resume <run_id>` continues after the last committed step. Simulate a crash
    after research, before the draft/send.
-M5 Never double-send   ✍️ I WRITE send_once(draft_id) (idempotency key + unique constraint;
-   a crash between "sent" and "recorded" must not send twice). No code given; if I ask you
-   to write it, refuse and give me a hint.
+M5 Never double-send: send_once(draft_id) (idempotency key + unique constraint;
+   a crash between "sent" and "recorded" must not send twice). Changed by me on Day 4: Claude
+   writes it step by step with beginner explanations (I was stuck); I answer the check questions.
 M6 Memory across days: outreach status per lead (contacted_at, replied); `agent "follow up
    leads with no reply after 3 days"`; reuse research findings < 7 days old instead of re-running.
 M7 Tests + evals: crash/resume, double-send, migration up/down, follow-up case in agent_cases.

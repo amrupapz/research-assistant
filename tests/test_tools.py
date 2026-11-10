@@ -5,7 +5,7 @@ import pytest
 
 from research_assistant import tools
 from research_assistant.schemas import Chunk, Citation, Lead, ResearchAnswer
-from research_assistant.state import get_draft, list_drafts
+from research_assistant.state import get_draft, list_drafts, record_approval
 from research_assistant.tools import (
     REGISTRY,
     ToolContext,
@@ -162,8 +162,14 @@ def _draft(ctx, subject="Hi", body="Hello Dana"):
     return run_tool("draft_email", json.dumps({"lead_id": "L1", "subject": subject, "body": body}), ctx)
 
 
+def _approve(ctx, draft_id="D1"):
+    """What the agent does when the human types y."""
+    record_approval(ctx.conn, draft_id, True, None)
+
+
 def test_send_email_writes_the_stored_draft_to_outbox(ctx):
     _draft(ctx)
+    _approve(ctx)
     out = run_tool("send_email", '{"draft_id": "D1"}', ctx)
 
     path = ctx.outbox_dir / "D1.eml"
@@ -182,9 +188,18 @@ def test_send_email_unknown_draft(ctx):
 
 def test_send_email_only_once(ctx):
     _draft(ctx)
+    _approve(ctx)
     run_tool("send_email", '{"draft_id": "D1"}', ctx)
-    with pytest.raises(ToolError, match="already sent"):
+    again = run_tool("send_email", '{"draft_id": "D1"}', ctx)
+    assert again["status"] == "already sent"  # not an error: the goal (sent once) is met
+    assert len(list(ctx.outbox_dir.glob("*.eml"))) == 1
+
+
+def test_send_email_without_approval_is_refused(ctx):
+    _draft(ctx)
+    with pytest.raises(ToolError, match="no approval"):
         run_tool("send_email", '{"draft_id": "D1"}', ctx)
+    assert not ctx.outbox_dir.exists()
 
 
 @pytest.mark.parametrize(

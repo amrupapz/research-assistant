@@ -164,3 +164,46 @@ def latest_qualification(conn: psycopg.Connection, lead_id: str) -> dict | None:
         [lead_id],
     ).fetchone()
     return dict(zip(["fit", "criteria", "icp_version", "created_at"], row, strict=True)) if row else None
+
+
+# --- sends: the ledger that makes "send exactly once" possible (D4 M5) ----------------------
+
+
+def latest_approval(conn: psycopg.Connection, draft_id: str) -> tuple[int, str] | None:
+    """(approval_id, 'approved' | 'declined') of the human's MOST RECENT answer for this draft, or None."""
+    n = _draft_number(draft_id)
+    if n is None:
+        return None
+    return conn.execute(
+        "SELECT approval_id, decision FROM approvals WHERE draft_id = %s ORDER BY approval_id DESC LIMIT 1", [n]
+    ).fetchone()
+
+
+def claim_send(conn: psycopg.Connection, draft_id: str, approval_id: int, key: str, channel: str) -> int | None:
+    """Write 'about to send' (status pending). Returns send_id, or None if this draft is ALREADY claimed.
+
+    ON CONFLICT DO NOTHING: if the UNIQUE(draft_id) or UNIQUE(idempotency_key) row exists, insert
+    nothing and return no row (instead of raising and aborting the transaction).
+    """
+    row = conn.execute(
+        "INSERT INTO sends (draft_id, approval_id, idempotency_key, channel) VALUES (%s, %s, %s, %s) "
+        "ON CONFLICT DO NOTHING RETURNING send_id",
+        [_draft_number(draft_id), approval_id, key, channel],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_send(conn: psycopg.Connection, draft_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT send_id, status, idempotency_key, channel, sent_at, provider_message_id FROM sends WHERE draft_id = %s",
+        [_draft_number(draft_id)],
+    ).fetchone()
+    cols = ["send_id", "status", "idempotency_key", "channel", "sent_at", "provider_message_id"]
+    return dict(zip(cols, row, strict=True)) if row else None
+
+
+def mark_sent(conn: psycopg.Connection, draft_id: str, provider_message_id: str) -> None:
+    conn.execute(
+        "UPDATE sends SET status = 'sent', sent_at = now(), provider_message_id = %s WHERE draft_id = %s",
+        [provider_message_id, _draft_number(draft_id)],
+    )

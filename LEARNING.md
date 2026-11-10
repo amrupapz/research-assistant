@@ -813,4 +813,81 @@ live runs. Without resume, a crash throws away paid-for research and a re-run du
   resume sees send_email as pending and runs it again. The outbox-file check happens to stop it
   today; real email wouldn't. That's send_once.
 
+**Live demo (crash after search_company, then --resume):** turn 1 proposed search_company AND
+get_lead in parallel; the crash came after search committed, so resume hit the half-done-turn case
+live: it ran ONLY get_lead (no model call first), then asked the model for turn 2 → draft D4.
+Stored reasoning items replayed fine ~20 s later (a week-old run is still untested).
+- **`now()` is the TRANSACTION START time**, not the insert time: search_company's step shows 9 ms
+  after the model turn although the search took 4 s. So `created_at` = when the step STARTED;
+  the gap to the next row = how long it took. (`clock_timestamp()` = wall-clock time.) Kept as is.
+- psql: a uuid in SQL needs single quotes: `run_id = '3bdf...'`. Without them → "trailing junk after numeric literal".
+
+**Check answers (given by Claude):**
+1. *If SimulatedCrash extended Exception?* `_Loop.drive` has `except Exception` → it would call
+   finish_run("failed"), so the run would end up `failed`. Less honest because a real crash (kill -9,
+   power loss, OOM-killer, laptop lid) never runs any except/finally: the run stays `running` with no
+   process behind it. The demo would test a path real crashes never take, and the realistic case
+   ("running" but dead) would go untested. Worse, you might build on the false belief
+   "crashed runs get marked failed" (e.g. an M6 query for stuck runs that only looks at failed).
+2. *How could continuing an agent-v3 run under agent-v4 go wrong?* The stored conversation was
+   produced under v3's rules and tool list; v4 code runs its pending calls and continues it.
+   Concrete: draft ids changed meaning in M3. In P3 "D1" meant this run's in-memory draft; now it
+   means row 1 of the drafts table, which belongs to some OTHER run (maybe another lead). A resumed
+   old conversation with a pending `send_email {"draft_id": "D1"}` would send a different email than
+   the one the model drafted. Same idea for a renamed/removed tool or a changed arg schema (pending
+   call becomes invalid) and for the model check (reasoning items from one model can't be fed to another).
+   **Gotcha:** the guard only works if you BUMP the version whenever tool semantics change. M3
+   changed draft-id meaning without a bump (agent-v4 already came with M1), so the check would not
+   have caught that one. Rule: tool behavior change = prompt/agent version bump.
+
+## D4 M5 — send_once (never double-send)
+
+**Who wrote it:** Claude, step by step, at my request. I changed the CLAUDE.md rule on Day 4
+because I was stuck. I answer the check questions.
+
+**Concept (beginner version):** sending an email is an EXTERNAL effect, so a database transaction
+can't undo it, and the email and its record can't commit together. So keep a **ledger** (the
+`sends` table) and write in it BEFORE acting:
+1. **CLAIM:** write "about to send D7" (status=pending) and COMMIT.
+2. **SEND:** deliver the email, stamped with an **idempotency key** ("draft-7", always the same for D7).
+3. **RECORD:** mark it sent and COMMIT.
+A retry reads the ledger: no row → send; `sent` → do nothing; `pending` → an earlier attempt died,
+so ask the channel "did key draft-7 go out?". Yes → just record it. No → send now. The channel
+can't tell (real email) → REFUSE and let a human check, because sending twice is worse than not sending.
+
+**What was built**
+- `state.py`: latest_approval, claim_send (`INSERT ... ON CONFLICT DO NOTHING`), get_send, mark_sent.
+- `sending.py`: idempotency_key, deliver (outbox: temp file + atomic rename, key in an
+  `X-Idempotency-Key` header), was_delivered, send_once.
+- `send_email` calls send_once; `Tool.external=True` for send_email.
+- agent: the human's answer is saved immediately in its own transaction; external tools run
+  OUTSIDE the step transaction (send_once commits its own claim and record).
+- 14 tests: every crash point, refusal without approval, latest answer wins, resume after a crash mid-send → exactly one email.
+
+**Gotchas**
+- **The trap from M3:** tools run INSIDE the step transaction. There the claim would only be a
+  savepoint, not committed before the email leaves → back to all-or-nothing, which an email can't
+  be. External tools must run outside it.
+- **The key must come from the draft,** not uuid4(): a retry must carry the SAME key to be recognized.
+- **The UNIQUE constraint only protects rows that EXIST**, so the claim row is committed BEFORE sending (my M2 check answer).
+- **The FK only proves an approval row exists.** "approved, and the LATEST answer" is checked in code.
+- **Atomic file write:** write `.D7.eml.tmp`, then `os.replace` → a crash mid-write never leaves a
+  half file that looks sent.
+- **ON CONFLICT DO NOTHING** instead of catching UniqueViolation: a failed statement would abort
+  the transaction; DO NOTHING just returns no row.
+- **"already sent" is a success, not an error:** the goal (sent exactly once) is met.
+- **Resume + send:** after a crash mid-send the send_email step isn't committed, so resume runs it
+  again and asks the human again. send_once makes that harmless.
+
+**Live runs + two fixes**
+- Send D4 → `sends` has 1 row (sent, key draft-4, outbox/D4.eml). Sending again + "y" → "already sent", still 1 row and 1 file; `approvals` has 2 rows (a history of decisions, not current state).
+- **Fix 1, approval screen:** it asked me to approve an already-sent email, so "y" did nothing.
+  The screen now reads the ledger first: `⚠ ALREADY SENT at ... Approving will NOT send it again.` (or "an earlier send did not finish").
+- **Fix 2, decline message:** after "n" the model said "D4 was not sent", which is FALSE (sent at 02:02).
+  The decline text says "It was NOT done" (true for THIS attempt), and the model generalized it.
+  Now a decline of an already-sent draft adds "Note: D4 was ALREADY SENT earlier ... unaffected."
+  Live result: "Draft D4 was already sent on 2026-11-11 at 02:02. This send attempt was declined, and the earlier email is unaffected."
+- **Lesson:** the model only knows what tools TELL it. A message that's true for one attempt can
+  turn into a false statement about the world. Put the relevant state in the tool output.
+
 **My answer:** _(fill in after check questions)_

@@ -26,6 +26,7 @@ from research_assistant.log import log_run
 from research_assistant.permissions import Decision, ToolCall, authorize
 from research_assistant.prompts import AGENT_PROMPT_VERSION
 from research_assistant.tools import (
+    REGISTRY,
     ToolContext,
     ToolError,
     execute,
@@ -65,14 +66,18 @@ def no_approver(call: ToolCall, ctx: ToolContext) -> bool:
     return False
 
 
-def _execute(name: str, args, ctx: ToolContext, record: dict) -> dict:
+def _execute(name: str, args, ctx: ToolContext, record: dict, savepoint: bool = True) -> dict:
     """Run an authorized (and, if needed, approved) call; turn failures into {"error": ...}.
 
-    The tool runs inside a SAVEPOINT: if it fails halfway, its partial writes are undone, but the
-    surrounding step transaction survives and still records the error.
+    Normally the tool runs inside a SAVEPOINT: if it fails halfway, its partial writes are undone,
+    but the surrounding step transaction survives and still records the error. External tools
+    (savepoint=False) manage their own commits.
     """
     try:
-        with ctx.conn.transaction():
+        if savepoint:
+            with ctx.conn.transaction():
+                output = execute(name, args, ctx)
+        else:
             output = execute(name, args, ctx)
         record["status"] = "ok"
         return output
@@ -114,8 +119,12 @@ def handle_call(
     start = time.perf_counter()
     try:
         args, output = _decide(name, call.get("arguments", ""), ctx, authorize_fn, approve_fn, record)
+        _save_approval(ctx, record)  # its own commit: send_once checks for it (M5)
+        external = args is not None and REGISTRY[name].external
+        if external:  # e.g. send_email: commits its own ledger steps, so it can't sit inside ours
+            output = _execute(name, args, ctx, record, savepoint=False)
         with ctx.conn.transaction():
-            if args is not None:
+            if args is not None and not external:
                 output = _execute(name, args, ctx, record)
             _save_step(ctx, call, step, record, output)
         record["output_preview"] = json.dumps(output, default=str)[:500]  # what the MODEL saw back
@@ -148,21 +157,27 @@ def _decide(
         if approved:
             return args, None
         record["status"] = "rejected"
-        return None, {
-            "error": f"DECLINED: the user said no to {name}. It was NOT done. "
+        message = (
+            f"DECLINED: the user said no to {name}. It was NOT done. "
             "Tell the user plainly that they declined it. Do not retry unless they ask."
-        }
+        )
+        return None, {"error": message + _already_sent_note(ctx, args)}
     record["status"] = "denied"  # "deny" -- or any unexpected value: fail closed
     return None, {"error": f"{name} is not permitted"}
 
 
-def _save_step(ctx: ToolContext, call: dict, step: int, record: dict, output: dict) -> None:
-    """Inside the step transaction: the approval (if a human was asked about a draft) + the step row."""
-    if ctx.run_id is None:
-        return
+def _save_approval(ctx: ToolContext, record: dict) -> None:
+    """If a human was asked about a draft, record their answer NOW, in its own transaction."""
     draft_id = (record.get("validated_args") or {}).get("draft_id")
     if "approved" in record and draft_id:
-        state.record_approval(ctx.conn, draft_id, record["approved"], ctx.run_id)  # no-op if no such draft
+        with ctx.conn.transaction():
+            state.record_approval(ctx.conn, draft_id, record["approved"], ctx.run_id)  # no-op if no such draft
+
+
+def _save_step(ctx: ToolContext, call: dict, step: int, record: dict, output: dict) -> None:
+    """Inside the step transaction: the step row."""
+    if ctx.run_id is None:
+        return
     state.add_step(
         ctx.conn,
         ctx.run_id,
@@ -342,12 +357,41 @@ class _Loop:
                 raise SimulatedCrash(f"simulated crash after {call['name']} (its step is committed)")
 
 
+def _already_sent_note(ctx: ToolContext, args) -> str:
+    """A decline only means THIS attempt didn't happen. If the ledger says the draft went out
+    earlier, the model must know, or it tells the user "it was not sent" (seen live in M5)."""
+    draft_id = getattr(args, "draft_id", None)
+    send = state.get_send(ctx.conn, draft_id) if draft_id else None
+    if send is None or send["status"] != "sent":
+        return ""
+    return (
+        f" Note: draft {draft_id} was ALREADY SENT earlier, at {send['sent_at']:%Y-%m-%d %H:%M}; "
+        "that email is unaffected. Do not tell the user it was never sent."
+    )
+
+
+def _ledger_warnings(ctx: ToolContext, draft) -> list[str]:
+    """What the sends ledger says about this draft: approving must never look like it will send
+    something that won't be sent (or might already have been)."""
+    send = state.get_send(ctx.conn, draft.draft_id) if draft is not None else None
+    if send is None:
+        return []
+    if send["status"] == "sent":
+        return [f"ALREADY SENT at {send['sent_at']:%Y-%m-%d %H:%M}. Approving will NOT send it again."]
+    return [
+        (
+            "An earlier send of this draft did not finish. Approving checks whether it went out "
+            "and only sends if it did not."
+        )
+    ]
+
+
 def cli_approve(call: ToolCall, ctx: ToolContext, input_fn: Callable[[str], str] = input) -> bool:
     """Show what will REALLY happen (from our own store, not the model's words) and ask y/N."""
     print(f"\n=== APPROVAL NEEDED: {call.name} ===", file=sys.stderr)
-    for w in ctx.warnings:
-        print(f"⚠ {w}", file=sys.stderr)
     draft = state.get_draft(ctx.conn, call.args.draft_id) if call.name == "send_email" and call.args else None
+    for w in [*_ledger_warnings(ctx, draft), *ctx.warnings]:
+        print(f"⚠ {w}", file=sys.stderr)
     if draft is not None:
         print(f"To: {draft.to}\nSubject: {draft.subject}\n\n{draft.body}\n", file=sys.stderr)
     else:

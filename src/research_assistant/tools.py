@@ -7,7 +7,6 @@ from it (the shape the model sees) + a function. REGISTRY is the whitelist: noth
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -20,6 +19,7 @@ from research_assistant.llm import ask, judge_icp
 from research_assistant.qualify import load_icp, qualify
 from research_assistant.retrieval import hybrid_search
 from research_assistant.schemas import Lead
+from research_assistant.sending import SendError, send_once
 from research_assistant.state import get_draft, insert_draft, save_qualification
 
 LEAD_ID = r"^L[0-9]{1,6}$"
@@ -148,25 +148,18 @@ def draft_email(args: DraftEmailArgs, ctx: ToolContext) -> dict:
 
 
 def send_email(args: SendEmailArgs, ctx: ToolContext) -> dict:
-    """"Send" a stored draft by writing outbox/<draft_id>.eml. Only runs after a human said yes.
+    """Send a stored, APPROVED draft exactly once (sending.send_once). Only runs after a human said yes.
 
     Sends exactly the stored draft: the model passes only a draft_id, so it can't change the
-    recipient or text between your approval and the send. Each draft can be sent once.
+    recipient or text between your approval and the send.
     """
     draft = get_draft(ctx.conn, args.draft_id)
     if draft is None:
         raise ToolError(f"no draft with id {args.draft_id!r}")
-    path = ctx.outbox_dir / f"{draft.draft_id}.eml"
-    if path.exists():
-        raise ToolError(f"draft {draft.draft_id} was already sent")
-    msg = EmailMessage()
-    msg["From"] = "sales-agent@example.com"
-    msg["To"] = draft.to
-    msg["Subject"] = draft.subject
-    msg.set_content(draft.body)
-    ctx.outbox_dir.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(msg))
-    return {"draft_id": draft.draft_id, "to": draft.to, "status": "sent (written to outbox)", "path": str(path)}
+    try:
+        return send_once(ctx.conn, draft, ctx.outbox_dir)
+    except SendError as e:
+        raise ToolError(str(e)) from e
 
 
 @dataclass(frozen=True)
@@ -175,6 +168,9 @@ class Tool:
     description: str
     args_model: type[BaseModel]
     fn: Callable[[Any, ToolContext], dict]
+    # external: has an effect outside the DB (an email). It runs OUTSIDE the step transaction and
+    # commits its own ledger steps, because a transaction can't undo or contain it (D4 M5).
+    external: bool = False
 
 
 # Strict mode guarantees the SHAPE. Length limits etc. stay in Pydantic, enforced by us, so we
@@ -225,6 +221,7 @@ REGISTRY: dict[str, Tool] = {
             "Send a saved draft to its lead. Requires the user's approval; only use when the user asked to send.",
             SendEmailArgs,
             send_email,
+            external=True,
         ),
     ]
 }
