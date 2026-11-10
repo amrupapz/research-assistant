@@ -145,8 +145,9 @@ def test_round_trip_sends_back_output_items_and_matching_call_id(tmp_path):
 
 
 def test_agent_prompt_rules():
-    """v2: wait for dependent results, search by company name (LEARNING.md D3 M2). v3: send rules."""
-    assert AGENT_PROMPT_VERSION == "agent-v3"
+    """v2: wait for dependent results, search by company name (LEARNING.md D3 M2). v3: send rules. v4: qualify."""
+    assert AGENT_PROMPT_VERSION == "agent-v4"
+    assert "qualify_lead" in AGENT_PROMPT
     assert "wait for that result" in AGENT_PROMPT
     assert "never by lead id" in AGENT_PROMPT
     assert "Drafting is not sending" in AGENT_PROMPT

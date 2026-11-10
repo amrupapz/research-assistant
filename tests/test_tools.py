@@ -27,7 +27,7 @@ def ctx(monkeypatch, tmp_path):
 
 
 def test_one_definition_per_registered_tool():
-    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "draft_email", "send_email"]
+    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "qualify_lead", "draft_email", "send_email"]
 
 
 @pytest.mark.parametrize("definition", tool_definitions(), ids=lambda d: d["name"])

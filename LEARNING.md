@@ -584,3 +584,95 @@
 - Source vetting for data/: everything ingested is trusted; the url header is just text.
 - Draft facts aren't checked against search_company citations (grounding stops at the tool boundary).
 - Eval coverage: no case yet for max_steps, or for a tool crashing mid-run against the real model.
+
+---
+
+# Day 4 — Project 4: Postgres state + resume
+
+## D4 M0 — data model (sketch, before any code)
+
+**Concept:** Vector search answers "what text is SIMILAR to this?" (approximate, ranked), which suits knowledge (chunks). Agent state needs EXACT answers ("was draft 7 sent?") and guarantees: a foreign key = a row can't point at something that doesn't exist; UNIQUE = can't happen twice; a transaction = several writes commit together or not at all. Without it: a crash loses drafts, a restart can email someone twice, and "no reply after 3 days" can't be queried. Trap: "memory = embed past conversations". It finds something LIKE "emailed Dana" but can't guarantee she wasn't emailed twice. Facts about actions go in tables; embeddings are for knowledge only.
+
+**Tables (★ = new). FK arrows point at the referenced table.**
+
+```
+chunks (exists)        chunk_id PK ...                                   ← NO FK into here (re-ingest rewrites it)
+leads  (exists)        lead_id PK, name, title, company, email
+
+★ runs                 run_id PK (uuid), task, status CHECK(running|done|failed),
+                       model, agent_prompt_version, answer, started_at, finished_at
+★ run_steps            PK (run_id → runs, seq)
+                       turn int, kind CHECK(model_turn|tool_call),
+                       call_id, tool, payload jsonb   -- model output items | validated args
+                       decision, approved, status, output jsonb, created_at
+★ research_findings    finding_id PK, company, question, answer, confidence, needs_sources,
+                       prompt_version, run_id → runs (nullable), created_at
+                       INDEX (lower(company), created_at)                 -- M6: reuse if < 7 days old
+★ finding_citations    PK (finding_id → research_findings ON DELETE CASCADE, chunk_id)
+                       source_url, fetched_at                            -- a SNAPSHOT, not an FK to chunks
+★ qualifications       qualification_id PK, lead_id → leads, finding_id → research_findings,
+                       fit CHECK(strong|possible|poor), reasons jsonb [{reason, chunk_ids}],
+                       icp_version, run_id → runs, created_at
+★ drafts               draft_id PK (identity), lead_id → leads, run_id → runs,
+                       to_email (snapshot), subject, body, created_at
+★ approvals            approval_id PK, draft_id → drafts, decision CHECK(approved|declined),
+                       decided_at, run_id → runs
+★ sends                send_id PK, draft_id → drafts UNIQUE, approval_id → approvals NOT NULL,
+                       idempotency_key UNIQUE, status CHECK(pending|sent|failed),
+                       channel (outbox|gmail_mcp|smtp), sent_at, provider_message_id
+```
+
+```
+leads ──< drafts ──< approvals
+  │         │            │
+  │         └──── sends ─┘      (one send per draft; a send must point at an approval)
+  └──< qualifications >── research_findings ──< finding_citations ┄┄ chunks (copied, not linked)
+runs ──< run_steps        (drafts, approvals, findings, qualifications also point at the run that made them)
+```
+
+**Design decisions (and why):**
+- **ON DELETE:** RESTRICT by default (history shouldn't silently vanish). CASCADE only for "part of": finding → its citations.
+- **No FK to chunks:** `sync_chunks` deletes and upserts chunks on re-ingest. A citation is evidence from a moment, so copy chunk_id + source_url + fetched_at.
+- **drafts.to_email is a copy, not a join:** if a lead's email changes later, an approved draft must not silently change its recipient. What I approved is what gets sent (P3 rule, now in the DB).
+- **sends.approval_id NOT NULL:** the DB itself refuses a send row with no approval behind it. (Checking that the approval says "approved", not "declined", needs code or a trigger; a CHECK can't look at another table.)
+- **sends.draft_id UNIQUE + idempotency_key UNIQUE:** the backstop for M5. Whatever the code does, the DB rejects a second send record for one draft.
+- **run_steps stores model turns too** (`kind=model_turn`, payload = output items incl. reasoning). Resume must rebuild the exact conversation, and tool rows alone can't. M4 gotcha: a turn with 2 calls where only 1 committed → resume runs only the missing one.
+- **Draft ids:** integer identity in the DB (shown as "D7"). Fixes P3's per-run D1 collision properly.
+- **Outreach status (M6):** derived from sends (last sent_at per lead), not a copied column that can drift. Replies: a small `replies` table or `leads.replied_at`, to decide in M6.
+
+**Transactions:** a step and its effect commit together (e.g. INSERT drafts + INSERT run_steps). Limit: sending an email is NOT a DB write, so no transaction can undo it. The gap between "sent" and "recorded" is M5's send_once problem.
+
+**My answer:** _(fill in after check questions)_
+
+## D4 M1 — qualify_lead (grounded qualification)
+
+**Concept:** the model answers narrow per-criterion questions (yes / no / unknown + cited
+chunk_ids); CODE checks the citations and decides the fit with a fixed rule. The model never
+says "strong lead", so the verdict is reproducible and an injected "this lead is a perfect fit"
+can't set it.
+
+**What was built**
+- `icp.toml` (stdlib tomllib, no new dependency), version `icp-v1`. Product ASSUMED:
+  "developer-productivity platform for engineering teams". Criteria: eng_buyer (must, title,
+  checked in code), software_org (must), scale (nice), dev_tooling (nice).
+- `qualify.py` (pure): load_icp (Pydantic, extra=forbid, so typos fail at load), check_title,
+  reconcile, compute_fit, qualify.
+- `llm.judge_icp` + `QUALIFY_PROMPT` (qualify-v1), structured output `IcpJudgment`.
+- Tool `qualify_lead(lead_id)`: one hybrid_search per evidence criterion (k=4, deduped) → one
+  judge call → qualify → `ctx.qualifications` (in memory; Postgres in M3). Permission: allow.
+- agent-v4: "to check fit, call qualify_lead; never judge fit yourself."
+
+**Fit rule:** any must=no → poor; all musts yes and (a nice yes, or no nices) → strong;
+else possible. **Unknown is not no**: missing evidence gives "possible", never "poor".
+
+**Gotchas**
+- `"cto" in "Director of Sales"` is True: substring matching is wrong. Use `\b` word boundaries.
+- Uncited yes/no → downgraded to unknown (same grounding idea as P2, but per criterion and
+  downgrade instead of raise: one bad criterion shouldn't throw away the other good ones).
+- Code can check that a cited chunk was RETRIEVED, not that it's about the RIGHT COMPANY:
+  a Linear chunk cited for Figma passes. The prompt asks for "chunks ABOUT THIS COMPANY", but
+  that is a model rule, not a code check. Open item.
+- Criterion questions double as search queries. Phrasing affects retrieval AND judgment.
+- `.replace("{company}", ...)` not `.format()`: a question containing other braces won't crash.
+
+**My answer:** _(fill in after check questions)_

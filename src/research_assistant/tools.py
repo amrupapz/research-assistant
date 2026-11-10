@@ -15,9 +15,10 @@ import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from research_assistant.db import fetch_lead
-from research_assistant.llm import ask
+from research_assistant.llm import ask, judge_icp
+from research_assistant.qualify import load_icp, qualify
 from research_assistant.retrieval import hybrid_search
-from research_assistant.schemas import Draft, Lead
+from research_assistant.schemas import Draft, Lead, Qualification
 
 LEAD_ID = r"^L[0-9]{1,6}$"
 DRAFT_ID = r"^D[0-9]{1,6}$"
@@ -40,6 +41,11 @@ class SearchCompanyArgs(BaseModel):
 class GetLeadArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     lead_id: str = Field(pattern=LEAD_ID, description="Lead id, e.g. 'L1'.")
+
+
+class QualifyLeadArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    lead_id: str = Field(pattern=LEAD_ID, description="Lead id to qualify, e.g. 'L1'.")
 
 
 class DraftEmailArgs(BaseModel):
@@ -80,6 +86,8 @@ class ToolContext:
     drafts: dict[str, Draft] = field(default_factory=dict)  # in memory for now; Postgres in P4
     outbox_dir: Path = Path("outbox")  # "sending" = writing a .eml file here; never real email
     warnings: list[str] = field(default_factory=list)  # shown to the human at approval time
+    qualifications: dict[str, Qualification] = field(default_factory=dict)  # by lead_id; Postgres in M3
+    icp_path: Path = Path("icp.toml")
 
 
 def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
@@ -103,6 +111,21 @@ def search_company(args: SearchCompanyArgs, ctx: ToolContext) -> dict:
 
 def get_lead(args: GetLeadArgs, ctx: ToolContext) -> dict:
     return _lead_or_error(ctx, args.lead_id).model_dump()
+
+
+def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
+    """Score a lead against icp.toml: title checked in code, evidence judged by the model, fit by code."""
+    lead = _lead_or_error(ctx, args.lead_id)
+    icp = load_icp(ctx.icp_path)
+    criteria = icp.evidence_criteria()
+    chunks = {}  # one search per criterion, deduped, in first-seen order
+    for c in criteria:
+        for chunk, _ in hybrid_search(ctx.conn, c.question_for(lead.company), k=4):
+            chunks.setdefault(chunk.chunk_id, chunk)
+    judgment = judge_icp(lead.company, [(c.id, c.question_for(lead.company)) for c in criteria], list(chunks.values()))
+    result = qualify(lead, icp, judgment.results, set(chunks))
+    ctx.qualifications[lead.lead_id] = result
+    return result.model_dump()
 
 
 def _next_draft_id(ctx: ToolContext) -> str:
@@ -191,6 +214,13 @@ REGISTRY: dict[str, Tool] = {
             search_company,
         ),
         Tool("get_lead", "Look up a sales lead by id: name, title, company, email.", GetLeadArgs, get_lead),
+        Tool(
+            "qualify_lead",
+            "Score a lead against our ideal customer profile using saved sources. Returns fit "
+            "(strong / possible / poor) with a cited reason per criterion.",
+            QualifyLeadArgs,
+            qualify_lead,
+        ),
         Tool(
             "draft_email",
             "Save an email draft to a lead. Does NOT send it. Returns the draft with its draft_id.",

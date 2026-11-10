@@ -68,3 +68,32 @@ class Draft(BaseModel):
     to: str
     subject: str
     body: str
+
+
+Met = Literal["yes", "no", "unknown"]
+Fit = Literal["strong", "possible", "poor"]
+
+
+class CriterionResult(BaseModel):
+    """One ICP criterion judged for one company. yes/no must cite chunks (checked in code)."""
+
+    id: str = Field(description="The criterion id exactly as given, e.g. 'software_org'.")
+    met: Met = Field(description="yes / no only if a chunk about this company clearly answers it; else unknown.")
+    reason: str = Field(description="One short sentence: what the evidence shows, or that it is missing.")
+    chunk_ids: list[str] = Field(description="Exact ids of the chunks that support yes/no. Empty for unknown.")
+
+
+class IcpJudgment(BaseModel):
+    """The model's structured output for qualify_lead: one result per criterion. It never picks the fit."""
+
+    results: list[CriterionResult]
+
+
+class Qualification(BaseModel):
+    """A lead scored against the ICP. `fit` is computed in code (qualify.compute_fit), never by the model."""
+
+    lead_id: str
+    company: str
+    fit: Fit
+    criteria: list[CriterionResult]
+    icp_version: str

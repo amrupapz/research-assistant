@@ -17,10 +17,13 @@ from research_assistant.prompts import (
     AGENT_PROMPT,
     AGENT_PROMPT_VERSION,
     PROMPT_VERSION,
+    QUALIFY_PROMPT,
+    QUALIFY_PROMPT_VERSION,
     SYSTEM_PROMPT,
+    build_qualify_message,
     build_user_message,
 )
-from research_assistant.schemas import Chunk, ResearchAnswer
+from research_assistant.schemas import Chunk, IcpJudgment, ResearchAnswer
 
 # The exact strict schema `responses.parse(text_format=ResearchAnswer)` used to send, built by the
 # SDK's own helper. We call `responses.create` instead because `.parse` validates the JSON inside
@@ -28,6 +31,7 @@ from research_assistant.schemas import Chunk, ResearchAnswer
 # and gets logged as invalid_output with no tokens or request_id (found by D3 M5 evals).
 # Private SDK path: if an upgrade moves it, the import fails loudly at startup.
 RESEARCH_ANSWER_FORMAT = type_to_text_format_param(ResearchAnswer)
+ICP_JUDGMENT_FORMAT = type_to_text_format_param(IcpJudgment)
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -161,6 +165,69 @@ def ask(
             record["status"] = "ungrounded"  # valid JSON, but citations don't check out
         record.setdefault("status", "error")  # keep "incomplete" if the API told us that
         record.setdefault("request_id", getattr(e, "request_id", None))  # API errors carry it
+        record["error"] = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        log_run(record, settings.runs_dir)
+
+
+def judge_icp(
+    company: str,
+    criteria: list[tuple[str, str]],
+    chunks: list[Chunk],
+    client: OpenAI | None = None,
+    settings: Settings | None = None,
+    today: date | None = None,
+) -> IcpJudgment:
+    """Judge each (id, question) criterion yes/no/unknown from the chunks only. Always logs one record.
+
+    Returns the model's raw judgment. It is NOT trusted: qualify.reconcile checks its ids and
+    citations, and qualify.compute_fit (code) decides the fit.
+    """
+    settings = settings or get_settings()
+    client = client or make_client(settings)
+    record: dict = {
+        "kind": "qualify_judgment",
+        "model": settings.model,
+        "prompt_version": QUALIFY_PROMPT_VERSION,
+        "company": company,
+        "retries": 0,
+        "retrieved_ids": [c.chunk_id for c in chunks],
+    }
+    start = time.perf_counter()
+
+    def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+        record["retries"] += 1
+        print(f"[retry] qualify attempt {attempt} after {type(exc).__name__}, sleeping {delay:.2f}s", file=sys.stderr)
+
+    try:
+        response = with_retries(
+            lambda: client.responses.create(
+                model=settings.model,
+                text={"format": ICP_JUDGMENT_FORMAT},
+                instructions=QUALIFY_PROMPT,  # static -> cacheable
+                input=build_qualify_message(company, criteria, chunks, today or date.today()),
+                max_output_tokens=settings.max_output_tokens,
+            ),
+            max_attempts=settings.max_attempts,
+            base_delay=settings.base_delay_s,
+            max_delay=settings.max_delay_s,
+            on_retry=on_retry,
+        )
+        body = response.model_dump()
+        record["request_id"] = response._request_id
+        record["response_id"] = body.get("id")
+        record["status"] = body.get("status")
+        record.update(_usage(body))
+        judgment = IcpJudgment.model_validate_json(extract_output_text(body))  # raises on incomplete / off-schema
+        record["results"] = [{"id": r.id, "met": r.met, "chunk_ids": r.chunk_ids} for r in judgment.results]
+        return judgment
+    except Exception as e:
+        if isinstance(e, ValidationError):
+            record["status"] = "invalid_output"
+        record.setdefault("status", "error")
+        record.setdefault("request_id", getattr(e, "request_id", None))
         record["error"] = f"{type(e).__name__}: {e}"
         raise
     finally:

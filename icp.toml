@@ -1,0 +1,49 @@
+# Ideal customer profile (ICP) used by the qualify_lead tool.
+# Bump `version` whenever the criteria change: every stored qualification records the version
+# that scored it, so old scores can be told apart from new ones.
+#
+# check = "title"    -> decided in CODE from leads.title (exact phrase, case-insensitive). No model.
+# check = "evidence" -> the model answers `question` (yes / no / unknown) from retrieved chunks,
+#                       citing chunk_ids; code downgrades any uncited yes/no to unknown.
+# {company} in a question is replaced with the lead's company name.
+#
+# Fit (decided in code, qualify.compute_fit):
+#   any must = no                      -> poor
+#   every must = yes and a nice = yes  -> strong   (or no nice criteria at all)
+#   anything else                      -> possible (unknown is NOT no)
+
+version = "icp-v1"
+product = "A developer-productivity platform for engineering teams (assumed for this project)."
+
+[[criteria]]
+id = "eng_buyer"
+must = true
+check = "title"
+titles = [
+  "cto",
+  "chief technology officer",
+  "vp engineering",
+  "vp of engineering",
+  "head of engineering",
+  "head of platform",
+  "director of engineering",
+  "engineering manager",
+]
+
+[[criteria]]
+id = "software_org"
+must = true
+check = "evidence"
+question = "Does {company} build its own software products with in-house engineering teams?"
+
+[[criteria]]
+id = "scale"
+must = false
+check = "evidence"
+question = "Is {company} a large organization (over 500 employees, or thousands of customer teams or users)?"
+
+[[criteria]]
+id = "dev_tooling"
+must = false
+check = "evidence"
+question = "Does {company} invest in developer tools, platform engineering, or developer experience?"
