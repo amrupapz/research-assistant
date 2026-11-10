@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     max_attempts: int = 3  # total tries, including the first
     base_delay_s: float = 0.5
     max_delay_s: float = 8.0
+    database_url: str = "postgresql://localhost/research_assistant"
 
 
 @lru_cache

@@ -166,3 +166,26 @@
 - `figma-company-profile#001` is a 51-word tail that starts mid-table ("| 9% |") and never says "Figma". A chunk loses its context. Fix in M3: embed `title + text`, not text alone.
 - The overlap repeats a fact in two chunks (`$18 per user` is in linear-pricing#000 and #001). Top-k can return near-duplicates. Worth watching in M4.
 - Word windows ignore structure (headings, tables). Splitting on headings is a possible upgrade, but only if the evals show it's needed.
+
+## D2 M2 — keyword search (Postgres full-text)
+
+**Concept:** Postgres turns each chunk into a `tsvector` (stemmed words, stopwords dropped: "raises" → `rais`) and each query into a `tsquery`. `@@` finds matches, `ts_rank_cd` ranks them, and a GIN index keeps it fast. It's strong on exact tokens (names, numbers, codes), which embeddings blur. Without it we'd be stuck with `LIKE '%x%'`: no stemming, no ranking, full table scan.
+
+**Setup:** Upgraded Postgres 16 → 17.11 (Homebrew), pgvector 0.8.7 installed and verified (`CREATE EXTENSION vector`). DBs: `research_assistant` (dev) and `research_assistant_test`. Added `psycopg[binary]` and `database_url` in config.
+
+**Built:** `db.py` (`init_schema`: chunks table + generated `tsv` column + GIN index; `sync_chunks`: upsert + delete stale, idempotent; caller owns the transaction). `retrieval.py` (`keyword_search`, CLI prints the tsquery). 10 new tests (53 total): 2 mock tests, 8 integration tests that run in a rolled-back transaction and skip if Postgres is down.
+
+**Results:** Exact terms work: "Lip-Bu Tan", "Series H", "Agent Runtime", "$18" (→ `'18'`), "raised" (stemmed). Full q06/q07/q08 questions → **no matches**: `websearch_to_tsquery` ANDs every word ('much' & 'latest' & 'round' …).
+
+**Answers (worked through with Claude, verified with real OR queries):**
+- OR doesn't fix "Figma headcount". The gold chunks rank top-2 only because they repeat "Figma"; 'headcount' matched nothing (the pages say "employees"/"Figmates"). Noise appears (linear-pricing#001 via "current"). Worse: "current or CEO or Intel" ranks the **outdated 2024 page #1** (1.6 vs 1.0) because it repeats the words more. Keyword rank counts words; it knows nothing about freshness. OR trades precision for recall.
+- Rollback: every test starts from the same 13 chunks, so tests stay independent. Separate test DB: sync_chunks deletes anything not in data/, so one accidental commit would wipe the dev DB (and the paid-for embeddings later). The dev DB can also hold extra rows (e.g. a manual fake#000) that make results flaky.
+
+**Gotchas:**
+- AND semantics: natural-language questions miss. Fixes: OR the terms, or let vector search (M3) handle paraphrase and fuse the two (M4).
+- The title is in every chunk's tsv, so "Series H" also matches anthropic-funding#001, which only says it in the title. That's good for context but adds noise in the ranking.
+- "$18" → `'18'`: the `$` is dropped, so any standalone "18" matches. ("18A" stays one token, `18a`, so it doesn't.)
+- Postgres tokenizes "user/month" as a `file` token (`ts_debug`), so "Business per user" → 0 hits on the Linear page. Tokenization can silently hide the gold chunk.
+- Even "Business user/month" ranks linear-pricing#001 (FAQ with the old $16) above #000 (price table). Being in the top-k doesn't mean ranked first.
+- psql: a `\` meta-command takes the rest of the line as arguments. Paste it alone, never together with SQL.
+- The old Postgres 16 data dir is still at /opt/homebrew/var/postgresql@16 (service stopped, unlinked). Delete later if unused.
