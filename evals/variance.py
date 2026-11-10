@@ -20,7 +20,7 @@ def run(question: str, n: int) -> None:
     print(f"{'#':>2}  {'conf':<6} {'src':<5} {'len':>4}  answer")
     results = []
     for i in range(1, n + 1):
-        r = ask(question)
+        r = ask(question, [])  # Day 1 experiment; since prompt v3 (strict grounding) this abstains
         results.append(r)
         flat = r.answer.replace("\n", " ")
         print(f"{i:>2}  {r.confidence:<6} {r.needs_sources!s:<5} {len(r.answer):>4}  {flat[:60]}")

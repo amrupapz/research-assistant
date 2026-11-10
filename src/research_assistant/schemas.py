@@ -6,16 +6,27 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class Citation(BaseModel):
+    chunk_id: str = Field(description="Exact id of a chunk from <untrusted_data>, e.g. 'figma-about#000'.")
+    source_url: str = Field(description="That chunk's source_url, copied exactly.")
+
+
 class ResearchAnswer(BaseModel):
-    answer: str = Field(description="Concise answer for a salesperson: a few sentences or a short list.")
+    answer: str = Field(
+        description="Concise answer for a salesperson. Put [chunk_id] after every factual claim. "
+        "If the sources don't answer the question, say so."
+    )
     confidence: Literal["low", "medium", "high"] = Field(
-        description="How sure you are the answer is correct AND current."
+        description="How well the provided sources support the answer, including how current they are."
     )
     assumptions: list[str] = Field(
-        description="Things you assumed or inferred rather than knew. Empty list if none."
+        description="Things you inferred rather than read in the sources. Empty list if none."
     )
     needs_sources: bool = Field(
-        description="True if the answer depends on recent or changing facts that must be verified."
+        description="True if the provided sources are missing, conflicting, or outdated for this question."
+    )
+    citations: list[Citation] = Field(
+        description="Every chunk cited in the answer. Empty only if the sources don't answer the question."
     )
 
 

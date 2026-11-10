@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -10,7 +11,7 @@ from pydantic import SecretStr, ValidationError
 from research_assistant.config import Settings
 from research_assistant.llm import IncompleteResponseError, ask
 from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT
-from research_assistant.schemas import ResearchAnswer
+from research_assistant.schemas import Chunk, Citation, ResearchAnswer
 
 
 def _settings(runs_dir: Path) -> Settings:
@@ -38,12 +39,23 @@ def _read_runs(runs_dir: Path) -> list[dict]:
     return [json.loads(line) for line in lines]
 
 
+CHUNKS = [
+    Chunk(
+        chunk_id="stripe#000",
+        source_url="https://stripe.example/about",
+        fetched_at=date(2026, 11, 1),
+        title="About Stripe",
+        text="Stripe sells payments infrastructure.",
+    )
+]
+
 ANSWER_JSON = json.dumps(
     {
-        "answer": "Payments.",
+        "answer": "Payments. [stripe#000]",
         "confidence": "high",
         "assumptions": [],
         "needs_sources": False,
+        "citations": [{"chunk_id": "stripe#000", "source_url": "https://stripe.example/about"}],
     }
 )
 
@@ -74,21 +86,26 @@ COMPLETED = {
 def test_ask_returns_text_and_sends_system_prompt(tmp_path):
     client = _client(COMPLETED)
 
-    answer = ask("What does Stripe sell?", client=client, settings=_settings(tmp_path))
+    answer = ask("What does Stripe sell?", CHUNKS, client=client, settings=_settings(tmp_path))
 
     assert answer == ResearchAnswer(
-        answer="Payments.", confidence="high", assumptions=[], needs_sources=False
+        answer="Payments. [stripe#000]",
+        confidence="high",
+        assumptions=[],
+        needs_sources=False,
+        citations=[Citation(chunk_id="stripe#000", source_url="https://stripe.example/about")],
     )
     kwargs = client.responses.parse.call_args.kwargs
     assert kwargs["instructions"] == SYSTEM_PROMPT  # static system prompt
-    assert kwargs["input"] == "What does Stripe sell?"  # question in the user message
+    assert "Question: What does Stripe sell?" in kwargs["input"]  # question + chunks in the user message
+    assert '<chunk id="stripe#000"' in kwargs["input"]
     assert kwargs["model"] == "test-model"
     assert kwargs["max_output_tokens"] == 123
     assert kwargs["text_format"] is ResearchAnswer  # schema sent to the API
 
 
 def test_success_logs_one_record_with_required_fields(tmp_path):
-    ask("q", client=_client(COMPLETED), settings=_settings(tmp_path))
+    ask("q", CHUNKS, client=_client(COMPLETED), settings=_settings(tmp_path))
 
     [run] = _read_runs(tmp_path)
     assert run["status"] == "completed"
@@ -110,7 +127,7 @@ def test_truncated_response_is_logged_as_incomplete(tmp_path):
     client = _client(body)
 
     with pytest.raises(IncompleteResponseError):
-        ask("q", client=client, settings=_settings(tmp_path))
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     assert client.responses.parse.call_count == 1  # same request would truncate again
     [run] = _read_runs(tmp_path)
@@ -123,7 +140,7 @@ def test_api_exception_is_logged_then_reraised(tmp_path):
     client.responses.parse.side_effect = TimeoutError("boom")
 
     with pytest.raises(TimeoutError):
-        ask("q", client=client, settings=_settings(tmp_path))
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     [run] = _read_runs(tmp_path)
     assert run["status"] == "error"
@@ -137,9 +154,9 @@ def test_ask_retries_timeout_and_logs_retry_count(tmp_path):
     req = httpx2.Request("POST", "https://api.openai.com/v1/responses")
     client.responses.parse.side_effect = [openai.APITimeoutError(request=req), good]
 
-    answer = ask("q", client=client, settings=_settings(tmp_path))
+    answer = ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
-    assert answer.answer == "Payments."
+    assert answer.answer == "Payments. [stripe#000]"
     [run] = _read_runs(tmp_path)
     assert run["retries"] == 1
     assert run["status"] == "completed"
@@ -152,7 +169,7 @@ def test_off_schema_json_raises_logs_invalid_output_and_is_not_retried(tmp_path)
     client = _client(_with_text(COMPLETED, bad))
 
     with pytest.raises(ValidationError):
-        ask("q", client=client, settings=_settings(tmp_path))
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     assert client.responses.parse.call_count == 1  # retrying won't fix our schema mismatch
     [run] = _read_runs(tmp_path)
@@ -162,10 +179,10 @@ def test_off_schema_json_raises_logs_invalid_output_and_is_not_retried(tmp_path)
 
 def test_temperature_sent_only_when_set(tmp_path):
     client = _client(COMPLETED)
-    ask("q", client=client, settings=_settings(tmp_path))
+    ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
     assert "temperature" not in client.responses.parse.call_args.kwargs
 
-    ask("q", client=client, settings=_settings(tmp_path), temperature=0.2)
+    ask("q", CHUNKS, client=client, settings=_settings(tmp_path), temperature=0.2)
     assert client.responses.parse.call_args.kwargs["temperature"] == 0.2
     assert _read_runs(tmp_path)[-1]["temperature"] == 0.2
 
@@ -189,9 +206,9 @@ def test_rate_limit_is_retried_then_succeeds(tmp_path):
         good,
     ]
 
-    answer = ask("q", client=client, settings=_settings(tmp_path))
+    answer = ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
-    assert answer.answer == "Payments."
+    assert answer.answer == "Payments. [stripe#000]"
     assert client.responses.parse.call_count == 2
     [run] = _read_runs(tmp_path)
     assert (run["status"], run["retries"]) == ("completed", 1)
@@ -204,7 +221,7 @@ def test_bad_key_401_not_retried_and_request_id_logged(tmp_path):
     )
 
     with pytest.raises(openai.AuthenticationError):
-        ask("q", client=client, settings=_settings(tmp_path))
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     assert client.responses.parse.call_count == 1
     [run] = _read_runs(tmp_path)
@@ -218,7 +235,7 @@ def test_refusal_raises_instead_of_returning_empty_answer(tmp_path):
     client = _client({**COMPLETED, "output": [refusal]})
 
     with pytest.raises(IncompleteResponseError):
-        ask("q", client=client, settings=_settings(tmp_path))
+        ask("q", CHUNKS, client=client, settings=_settings(tmp_path))
 
     [run] = _read_runs(tmp_path)
     assert run["status"] == "completed"  # API finished fine...

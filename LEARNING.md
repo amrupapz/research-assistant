@@ -240,3 +240,30 @@
 - Exact ties are common (figma-about#000 = figma-company-profile#000 = 1/61 + 1/62). The chunk_id tiebreak decides, which is arbitrary but deterministic.
 - The outdated Intel page still wins, because both methods like it. Retrieval can't know freshness; M5 must use `fetched_at`.
 - Filler at #3 (anthropic-funding#001 for "Business per user") comes from OR-mode noise plus vector always returning k.
+
+## D2 M5 — grounded answers with citations (strict)
+
+**Concept:** The model answers only from retrieved chunks, which go in the user message inside `<untrusted_data>` (data, not instructions; this also keeps the system prompt static). Every claim cites `[chunk_id]`, and **code** checks the citations: cited ids must have been retrieved, source_url must match, and an uncited answer must abstain. Without this the model silently mixes in memory facts, invents plausible citations, and can't be audited.
+
+**Built:** `Citation{chunk_id, source_url}` + `ResearchAnswer.citations`. Prompt **v3** (strict grounding, prefer the newest fetched_at and first-party pages, surface conflicts, flag >12-month-old evidence, abstain wording). `build_user_message(question, chunks, today)`: chunk id/url/fetched_at/title as attributes, text HTML-escaped so a page can't close `</untrusted_data>`. `check_grounding` → `UngroundedAnswerError`, logged `status="ungrounded"`, not retried. The run log gains `retrieved_ids` + `cited_ids`. The `ask` CLI = hybrid k=5 → grounded answer → sources with fetched dates. Decision: **strict**, so q01–q05 abstain (no pages for them). 12 new tests (86 total).
+
+**Results (gpt-6-luna, v3, ~2.1k input tokens, 2–7 s each):**
+| q | answer | cited | conf / needs_sources |
+|---|---|---|---|
+| q06 | $22.5B Series H, Oct 14 2026 ✅ (not the older Series G) | anthropic-funding#000 | high / no |
+| q07 | 2,140 (Figma) vs 1,870 (third-party), trusts Figma, says they conflict ✅ | both | low / yes |
+| q08 | Lip-Bu Tan ✅, although retrieval ranked the 2024 page #1 | intel-leadership#000 | high / no |
+| q09 | $18 annual / $22 monthly ✅ (not the old $16) | linear-pricing#000 | high / no |
+| q10 | Agent Runtime, Nov 4 2026 ✅ | vercel-changelog#000 | high / no |
+| q01 Stripe | abstains ✅ (strict) | — | low / yes |
+| pizza | abstains ✅ even though 5 chunks were retrieved | — | low / yes |
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- Freshness was solved at the **generation** step: retrieval put the 2024 Intel page #1, and the model used fetched_at to pick the 2026 page. The log proves which step did what (`retrieved_ids` vs `cited_ids`).
+- q08 didn't mention that the 2024 page names a different CEO. Is a superseded snapshot a "conflict"? Debatable. Day 6 eval candidate.
+- The abstain decision comes from the model, not a score threshold (RRF scores are useless for that; see M4). That's cheap here, but every off-topic question still costs a full LLM call.
+- Caching (corrected): an exact repeat of the Intel question got `cached=2159`. The cache matches the prefix of the whole input (system + user message), not just the system prompt. Different questions share only system prompt + "Today/Question", which is <1024 tokens → 0. Putting the chunk block before the question would let follow-ups on the same chunks hit the cache.
+- Paraphrase flips behavior: "How many people work at Figma?" retrieved the conflicting profile chunk (#3) but cited only figma-about, high / needs_sources=false. q07's wording reported the conflict. This is a generation failure that check_grounding can't catch (the citations are valid). → M6 needs paraphrase variants + a conflict check.
+- `evals/variance.py` (Day 1) now abstains: `ask` requires chunks.

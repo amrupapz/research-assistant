@@ -1,17 +1,19 @@
 """The ONLY module that talks to OpenAI."""
 
 import random
+import re
 import sys
 import time
 from collections.abc import Callable
+from datetime import date
 
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pydantic import ValidationError
 
 from research_assistant.config import Settings, get_settings
 from research_assistant.log import log_run
-from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT
-from research_assistant.schemas import ResearchAnswer
+from research_assistant.prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_user_message
+from research_assistant.schemas import Chunk, ResearchAnswer
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -81,11 +83,16 @@ def with_retries[T](
 
 def ask(
     question: str,
+    chunks: list[Chunk],
     client: OpenAI | None = None,
     settings: Settings | None = None,
     temperature: float | None = None,
+    today: date | None = None,
 ) -> ResearchAnswer:
-    """Ask one question; return a validated ResearchAnswer or raise. Always logs one run record."""
+    """Answer from the given chunks only; return a validated, grounded ResearchAnswer or raise.
+
+    Always logs one run record, including which chunks were retrieved and which were cited.
+    """
     settings = settings or get_settings()
     client = client or make_client(settings)
     extra = {} if temperature is None else {"temperature": temperature}  # only send if set
@@ -95,6 +102,7 @@ def ask(
         "prompt_version": PROMPT_VERSION,
         "temperature": temperature,
         "retries": 0,
+        "retrieved_ids": [c.chunk_id for c in chunks],
     }
     start = time.perf_counter()
 
@@ -111,7 +119,7 @@ def ask(
                 model=settings.model,
                 text_format=ResearchAnswer,  # API forces JSON matching this schema
                 instructions=SYSTEM_PROMPT,  # static -> cacheable
-                input=question,  # per-request data goes here
+                input=build_user_message(question, chunks, today or date.today()),  # per-request data
                 max_output_tokens=settings.max_output_tokens,
                 **extra,
             ),
@@ -129,10 +137,14 @@ def ask(
         result = ResearchAnswer.model_validate_json(text)  # raises ValidationError if off-schema
         record["confidence"] = result.confidence
         record["needs_sources"] = result.needs_sources
+        record["cited_ids"] = [c.chunk_id for c in result.citations]
+        check_grounding(result, chunks)  # raises UngroundedAnswerError
         return result
     except Exception as e:
         if isinstance(e, ValidationError):
             record["status"] = "invalid_output"  # API said completed, but JSON is off-schema
+        if isinstance(e, UngroundedAnswerError):
+            record["status"] = "ungrounded"  # valid JSON, but citations don't check out
         record.setdefault("status", "error")  # keep "incomplete" if the API told us that
         record.setdefault("request_id", getattr(e, "request_id", None))  # API errors carry it
         record["error"] = f"{type(e).__name__}: {e}"
@@ -201,6 +213,29 @@ def _usage(body: dict) -> dict:
         "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens"),
         "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
     }
+
+
+class UngroundedAnswerError(Exception):
+    """The answer cites chunks we didn't give it, or makes claims without any citation."""
+
+
+INLINE_CITATION = re.compile(r"\[([^\[\]\s]+#\d+)\]")  # "[figma-about#000]" -> "figma-about#000"
+
+
+def check_grounding(result: ResearchAnswer, chunks: list[Chunk]) -> None:
+    """Raise UngroundedAnswerError unless every citation points at a chunk we actually retrieved."""
+    by_id = {c.chunk_id: c for c in chunks}
+    for cit in result.citations:
+        chunk = by_id.get(cit.chunk_id)
+        if chunk is None:
+            raise UngroundedAnswerError(f"cites {cit.chunk_id!r}, which was not retrieved")
+        if cit.source_url != chunk.source_url:
+            raise UngroundedAnswerError(f"{cit.chunk_id}: source_url {cit.source_url!r} != {chunk.source_url!r}")
+    unknown = set(INLINE_CITATION.findall(result.answer)) - by_id.keys()
+    if unknown:
+        raise UngroundedAnswerError(f"answer text cites unretrieved chunks: {sorted(unknown)}")
+    if not result.citations and not result.needs_sources:
+        raise UngroundedAnswerError("no citations, but needs_sources is false (an uncited answer must abstain)")
 
 
 class IncompleteResponseError(Exception):
