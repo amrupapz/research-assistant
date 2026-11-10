@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     base_delay_s: float = 0.5
     max_delay_s: float = 8.0
     database_url: str = "postgresql://localhost/research_assistant"
+    embedding_model: str = "text-embedding-3-small"  # EMBEDDING_MODEL in .env wins
+    embedding_dims: int = 1536  # must match the model; checked on every embed call
 
 
 @lru_cache

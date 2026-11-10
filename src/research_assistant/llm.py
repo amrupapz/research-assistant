@@ -142,6 +142,56 @@ def ask(
         log_run(record, settings.runs_dir)
 
 
+class EmbeddingError(Exception):
+    """The embeddings response doesn't match what we asked for (count or dimensions)."""
+
+
+def embed(
+    texts: list[str],
+    client: OpenAI | None = None,
+    settings: Settings | None = None,
+) -> list[list[float]]:
+    """Embed texts in one batch; return one vector per text, in input order. Always logs one run record."""
+    if not texts:
+        return []
+    settings = settings or get_settings()
+    client = client or make_client(settings)
+
+    record: dict = {"kind": "embedding", "model": settings.embedding_model, "n_texts": len(texts), "retries": 0}
+    start = time.perf_counter()
+
+    def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+        record["retries"] += 1
+        print(f"[retry] embed attempt {attempt} after {type(exc).__name__}, sleeping {delay:.2f}s", file=sys.stderr)
+
+    try:
+        response = with_retries(
+            lambda: client.embeddings.create(model=settings.embedding_model, input=texts),
+            max_attempts=settings.max_attempts,
+            base_delay=settings.base_delay_s,
+            max_delay=settings.max_delay_s,
+            on_retry=on_retry,
+        )
+        record["request_id"] = response._request_id
+        record["input_tokens"] = response.usage.prompt_tokens
+        vectors = [d.embedding for d in sorted(response.data, key=lambda d: d.index)]
+        if len(vectors) != len(texts):
+            raise EmbeddingError(f"asked for {len(texts)} embeddings, got {len(vectors)}")
+        bad = {len(v) for v in vectors} - {settings.embedding_dims}
+        if bad:
+            raise EmbeddingError(f"expected {settings.embedding_dims} dims, got {sorted(bad)}")
+        record["status"] = "completed"
+        return vectors
+    except Exception as e:
+        record["status"] = "error"
+        record.setdefault("request_id", getattr(e, "request_id", None))
+        record["error"] = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        log_run(record, settings.runs_dir)
+
+
 def _usage(body: dict) -> dict:
     """Pull token counts out of a Responses API body (missing -> None)."""
     usage = body.get("usage") or {}

@@ -189,3 +189,29 @@
 - Even "Business user/month" ranks linear-pricing#001 (FAQ with the old $16) above #000 (price table). Being in the top-k doesn't mean ranked first.
 - psql: a `\` meta-command takes the rest of the line as arguments. Paste it alone, never together with SQL.
 - The old Postgres 16 data dir is still at /opt/homebrew/var/postgresql@16 (service stopped, unlinked). Delete later if unused.
+
+## D2 M3 — embeddings + pgvector (vector search)
+
+**Concept:** An embedding model maps text to a vector, and texts with similar meaning point in similar directions. pgvector stores the vectors in Postgres; `<=>` is cosine distance, so `ORDER BY embedding <=> query` returns the closest chunks. It catches paraphrases that keyword search misses ("headcount" ≈ "employees"). Its weakness is exact tokens, and it has no notion of freshness either.
+
+**Built:** `llm.embed(texts)`: one batch, same retry rules, run-log line `kind=embedding` (request_id, n_texts, input_tokens, latency, retries), checks count + dims. `db.py`: `embedding vector(1536)` column; the upsert NULLs the embedding when title/text changes; `embed_missing` embeds only NULL rows (2nd run: embedded 0); we embed `title + "\n\n" + text`. `retrieval.vector_search` + CLI `--mode vector`. 9 new tests (62 total); the integration tests use hand-made 3-d vectors, no API calls.
+
+**Results (text-embedding-3-small, 13 chunks = 3,162 tokens):**
+| q | vector top-1 | gold in top-3? | keyword (full question) |
+|---|---|---|---|
+| q06 Anthropic raise | anthropic-funding#000 (.78) | ✅ | 0 hits |
+| q07 Figma headcount | figma-company-profile#000 (.73), figma-about#000 #2 | ✅ both | 0 hits |
+| q08 Intel CEO | **intel-leadership-2024#000** (.6653), current page #2 (.6636) | ✅ but outdated ranks #1 | 0 hits |
+| q09 Linear Business | linear-pricing#000 (.62) | ✅ | 0 hits |
+| q10 Vercel launch | vercel-changelog#000 (.52) | ✅ | 0 hits |
+
+"Business per user" → Linear #001, #000 (keyword: 0 hits). "18A" → vector returns junk (Figma, .15); keyword finds all three Intel chunks.
+
+**My answer:** _(fill in after check questions)_
+
+**Gotchas:**
+- Vector search always returns k results, even for "best pizza in Naples" (top .09). No "no match" → we need a score floor or abstain logic in M5.
+- Scores are only relative: q08's outdated vs. current page differ by 0.0017. Embeddings know the topic, not which fact is current. Freshness has to come from `fetched_at` (M5).
+- `figma-company-profile#001` (the short, generic table tail) shows up #3 for almost every query: a "hub" chunk that is vaguely close to everything.
+- Exact tokens ("18A") → keyword wins; paraphrases → vector wins. That's the case for hybrid search (M4).
+- No HNSW index yet: with 13 rows a full scan is fine. Add `USING hnsw (embedding vector_cosine_ops)` when there are thousands of rows.

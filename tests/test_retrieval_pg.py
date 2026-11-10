@@ -11,9 +11,9 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from research_assistant.db import connect, init_schema, sync_chunks
+from research_assistant.db import connect, embed_missing, init_schema, sync_chunks
 from research_assistant.ingest import load_chunks
-from research_assistant.retrieval import keyword_search
+from research_assistant.retrieval import keyword_search, vector_search
 from research_assistant.schemas import Chunk
 
 TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/research_assistant_test")
@@ -21,18 +21,25 @@ DATA = Path(__file__).parent.parent / "data"
 
 
 @pytest.fixture
-def pg():
+def db():
+    """Empty schema, rolled back after the test."""
     try:
         conn = connect(TEST_DB)
     except psycopg.OperationalError as e:
         pytest.skip(f"Postgres not reachable ({e.__class__.__name__}); run: createdb research_assistant_test")
     try:
-        init_schema(conn)
-        sync_chunks(conn, load_chunks(DATA))
         yield conn
     finally:
         conn.rollback()
         conn.close()
+
+
+@pytest.fixture
+def pg(db):
+    """Schema + the real data/ chunks (no embeddings)."""
+    init_schema(db, 1536)
+    sync_chunks(db, load_chunks(DATA))
+    return db
 
 
 def _ids(results):
@@ -75,3 +82,53 @@ def test_sync_is_idempotent_and_prunes_stale_chunks(pg):
     assert sync_chunks(pg, chunks) == 1
     assert sync_chunks(pg, chunks) == 0
     assert pg.execute("SELECT count(*) FROM chunks").fetchone()[0] == len(chunks)
+
+
+# ---------- vector search with hand-made 3-d "embeddings" (no API) ----------
+
+AXES = {"cat": [1.0, 0.0, 0.0], "dog": [0.0, 1.0, 0.0], "car": [0.0, 0.0, 1.0]}
+
+
+def fake_embed(texts: list[str]) -> list[list[float]]:
+    """Each text points along the axis of the first animal/vehicle word it contains."""
+    out = []
+    for t in texts:
+        if "kitten" in t:
+            out.append([0.9, 0.3, 0.0])  # mostly cat, a bit dog
+        else:
+            out.append(next(v for word, v in AXES.items() if word in t))
+    return out
+
+
+def _chunk(cid: str, text: str) -> Chunk:
+    return Chunk(chunk_id=cid, source_url="https://x.example", fetched_at=date(2026, 1, 1), title="t", text=text)
+
+
+@pytest.fixture
+def pets(db):
+    init_schema(db, 3)
+    sync_chunks(db, [_chunk("c#0", "a cat"), _chunk("d#0", "a dog"), _chunk("v#0", "a car")])
+    assert embed_missing(db, fake_embed) == 3
+    return db
+
+
+def test_vector_search_ranks_by_meaning(pets):
+    results = vector_search(pets, "kitten", k=3, embed=fake_embed)
+    assert _ids(results) == ["c#0", "d#0", "v#0"]
+    scores = [s for _, s in results]
+    assert scores[0] > scores[1] > scores[2]
+    assert scores[2] == pytest.approx(0.0)  # orthogonal -> cosine similarity 0
+
+
+def test_embed_missing_only_embeds_new_or_changed(pets):
+    assert embed_missing(pets, fake_embed) == 0  # nothing new
+
+    calls = []
+
+    def spy(texts):
+        calls.append(texts)
+        return fake_embed(texts)
+
+    sync_chunks(pets, [_chunk("c#0", "a cat"), _chunk("d#0", "a different dog"), _chunk("v#0", "a car")])
+    assert embed_missing(pets, spy) == 1
+    assert calls == [["t\n\na different dog"]]  # title + text, only the changed chunk

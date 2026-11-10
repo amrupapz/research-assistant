@@ -1,11 +1,17 @@
 """Postgres connection + schema. Functions don't commit; the caller owns the transaction."""
 
+from collections.abc import Callable
+
 import psycopg
 
 from research_assistant.schemas import Chunk
 
+EmbedFn = Callable[[list[str]], list[list[float]]]
+
 # tsv is computed by Postgres from title + text on every insert/update (stemmed, stopwords dropped).
+# embedding is filled later by embed_missing(); NULL means "needs embedding".
 SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id    text PRIMARY KEY,
     source_url  text NOT NULL,
@@ -15,8 +21,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || text)) STORED
 );
 CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector({dims});
 """
 
+# On conflict, `chunks.x` is the existing row and `EXCLUDED.x` the new one.
+# Changed content -> stale embedding -> reset to NULL so embed_missing() redoes it.
 UPSERT = """
 INSERT INTO chunks (chunk_id, source_url, fetched_at, title, text)
 VALUES (%(chunk_id)s, %(source_url)s, %(fetched_at)s, %(title)s, %(text)s)
@@ -24,7 +33,11 @@ ON CONFLICT (chunk_id) DO UPDATE SET
     source_url = EXCLUDED.source_url,
     fetched_at = EXCLUDED.fetched_at,
     title      = EXCLUDED.title,
-    text       = EXCLUDED.text
+    text       = EXCLUDED.text,
+    embedding  = CASE
+        WHEN (chunks.title, chunks.text) IS DISTINCT FROM (EXCLUDED.title, EXCLUDED.text) THEN NULL
+        ELSE chunks.embedding
+    END
 """
 
 
@@ -36,8 +49,8 @@ def connect(url: str | None = None) -> psycopg.Connection:
     return psycopg.connect(url)
 
 
-def init_schema(conn: psycopg.Connection) -> None:
-    conn.execute(SCHEMA)
+def init_schema(conn: psycopg.Connection, dims: int) -> None:
+    conn.execute(SCHEMA.format(dims=int(dims)))
 
 
 def sync_chunks(conn: psycopg.Connection, chunks: list[Chunk]) -> int:
@@ -51,16 +64,43 @@ def sync_chunks(conn: psycopg.Connection, chunks: list[Chunk]) -> int:
         return cur.rowcount
 
 
+def embedding_input(title: str, text: str) -> str:
+    """What we embed for a chunk: the title gives context the chunk text may lack (M1 gotcha)."""
+    return f"{title}\n\n{text}"
+
+
+def to_pgvector(vector: list[float]) -> str:
+    """pgvector's text format '[0.1,0.2,...]'; cast with ::vector in SQL. Avoids an extra dependency."""
+    return "[" + ",".join(repr(float(x)) for x in vector) + "]"
+
+
+def embed_missing(conn: psycopg.Connection, embed: EmbedFn) -> int:
+    """Embed only chunks whose embedding is NULL (new or changed). Returns how many were embedded."""
+    rows = conn.execute("SELECT chunk_id, title, text FROM chunks WHERE embedding IS NULL ORDER BY chunk_id").fetchall()
+    if not rows:
+        return 0
+    vectors = embed([embedding_input(title, text) for _, title, text in rows])
+    with conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE chunks SET embedding = %s::vector WHERE chunk_id = %s",
+            [(to_pgvector(v), chunk_id) for (chunk_id, _, _), v in zip(rows, vectors, strict=True)],
+        )
+    return len(rows)
+
+
 def main() -> None:
-    """Load data/ into Postgres: `uv run python -m research_assistant.db`."""
+    """Load data/ into Postgres and embed new/changed chunks: `uv run python -m research_assistant.db`."""
+    from research_assistant.config import get_settings
     from research_assistant.ingest import load_chunks
+    from research_assistant.llm import embed
 
     chunks = load_chunks()
     with connect() as conn:  # commits on clean exit, rolls back on error
-        init_schema(conn)
+        init_schema(conn, get_settings().embedding_dims)
         deleted = sync_chunks(conn, chunks)
+        embedded = embed_missing(conn, embed)
         total = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
-    print(f"synced {len(chunks)} chunks, deleted {deleted} stale; table now has {total}")
+    print(f"synced {len(chunks)} chunks, deleted {deleted} stale, embedded {embedded}; table now has {total}")
 
 
 if __name__ == "__main__":

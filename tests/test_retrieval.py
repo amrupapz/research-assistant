@@ -25,3 +25,26 @@ def test_keyword_search_passes_query_as_a_parameter_not_in_sql():
     sql, params = conn.execute.call_args.args
     assert evil not in sql
     assert params == {"q": evil, "k": 7}
+
+
+def test_vector_search_embeds_query_once_and_passes_vector_as_parameter():
+    from research_assistant.retrieval import vector_search
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    calls = []
+
+    def fake_embed(texts):
+        calls.append(texts)
+        return [[0.5, -1.0, 2.0]]
+
+    assert vector_search(conn, "headcount", k=4, embed=fake_embed) == []
+    assert calls == [["headcount"]]
+    _, params = conn.execute.call_args.args
+    assert params == {"v": "[0.5,-1.0,2.0]", "k": 4}
+
+
+def test_to_pgvector_format():
+    from research_assistant.db import to_pgvector
+
+    assert to_pgvector([1, 0.25, -3e-05]) == "[1.0,0.25,-3e-05]"
