@@ -17,6 +17,13 @@ def log_run(record: dict, runs_dir: Path) -> Path:
         f.write(json.dumps(record, default=str) + "\n")
 
     # Human-readable one-liner on stderr (stdout stays just the answer).
+    if record.get("kind") == "tool_call":
+        print(
+            f"[tool] step {record.get('step')} {record.get('tool')} "
+            f"decision={record.get('decision', '-')} status={record.get('status')} {record.get('latency_ms')}ms",
+            file=sys.stderr,
+        )
+        return path
     print(
         f"[run] {record.get('status')} {record.get('latency_ms')}ms "
         f"in={record.get('input_tokens')} out={record.get('output_tokens')} "

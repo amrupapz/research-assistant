@@ -143,13 +143,22 @@ def _brief(e: ValidationError) -> str:
     return "; ".join(f"{'.'.join(map(str, err['loc'])) or '(root)'}: {err['msg']}" for err in e.errors())
 
 
-def run_tool(name: str, raw_args: str, ctx: ToolContext) -> dict:
-    """Look up the tool, validate the model's JSON-string arguments, run it. ToolError on anything fixable."""
+def validate_call(name: str, raw_args: str) -> BaseModel:
+    """Known tool + valid JSON-string arguments -> the parsed args model. ToolError otherwise."""
     tool = REGISTRY.get(name)
     if tool is None:
         raise ToolError(f"unknown tool {name!r}; available: {sorted(REGISTRY)}")
     try:
-        args = tool.args_model.model_validate_json(raw_args)
+        return tool.args_model.model_validate_json(raw_args)
     except ValidationError as e:
         raise ToolError(f"invalid arguments for {name}: {_brief(e)}") from e
-    return tool.fn(args, ctx)
+
+
+def execute(name: str, args: BaseModel, ctx: ToolContext) -> dict:
+    """Run an already validated (and, in the loop, authorized) call."""
+    return REGISTRY[name].fn(args, ctx)
+
+
+def run_tool(name: str, raw_args: str, ctx: ToolContext) -> dict:
+    """validate_call + execute, with NO permission check. Tests and scratch use only; the agent goes through authorize."""
+    return execute(name, validate_call(name, raw_args), ctx)

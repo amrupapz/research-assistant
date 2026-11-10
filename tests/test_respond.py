@@ -142,3 +142,10 @@ def test_round_trip_sends_back_output_items_and_matching_call_id(tmp_path):
     assert sent[-1] == {"type": "function_call_output", "call_id": "call_abc", "output": '{"name": "Dana Kim"}'}
     assert extract_function_calls(second) == []
     assert [r["tool_calls"] for r in _read_runs(tmp_path)] == [["get_lead"], []]
+
+
+def test_agent_prompt_v2_rules():
+    """agent-v2: fix for searching by lead id before get_lead returned (see LEARNING.md D3 M2)."""
+    assert AGENT_PROMPT_VERSION == "agent-v2"
+    assert "wait for that result" in AGENT_PROMPT
+    assert "never by lead id" in AGENT_PROMPT

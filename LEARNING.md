@@ -362,3 +362,51 @@
 - A failed lookup must not leave side effects (no draft is stored for L999).
 
 **My answer:** _(fill in after check questions)_
+
+**M1 check answers (given by Claude):**
+1. Three layers, each with something only it catches:
+   - Strict mode (API side) stops the model from producing a wrong type, a missing field, or an extra field in the first place. Pydantic is the backup for when strict mode is off or the call comes from somewhere else.
+   - Pydantic (our side) catches a body over 2000 chars or an empty subject. We don't send maxLength to the API, so strict mode allows them.
+   - The tool function catches `L999`: right shape, but no such lead.
+   - Next layer (M2): `authorize()` decides whether a perfectly valid call is ALLOWED.
+2. Error text goes back to the model as tool output. Echoing the value would feed injected text back into the next turn, looking like a message from our own code, and would also put it in the logs. Field + reason is enough to fix the call.
+
+## D3 M2 — agent loop
+
+**Concept:** An agent is a loop: call the model, run what it proposes, append the results, call again, until it answers in text or hits `max_steps`. Every proposed call goes through one gate: validate → authorize → execute. Every outcome (result, error, denial) goes back as a `function_call_output` and gets its own log line. Without the loop, multi-step tasks stall. Without max_steps, a confused model loops forever. Without authorize, any valid call runs.
+
+**Built:**
+- `agent.py`: `run_agent` (loop, max_steps=6), `handle_call` (the gate), `agent "task"` CLI.
+- `tools.py`: `run_tool` split into `validate_call` + `execute`, so authorize sits between them.
+- `permissions.py`: `ToolCall`, `Decision`, and the `authorize` stub (✍️ mine).
+- log lines `kind=tool_call` (step, call_id, tool, args≤500 chars, decision, status, latency).
+- 25 new tests (12 loop + 13 for authorize, failing until I write it).
+
+**Design decisions:**
+- Status values: `invalid` (bad args/unknown tool) → never reaches authorize. `denied` / `blocked` (needs approval; M3 adds the y/n) → the tool never runs. `error` → the tool crashed.
+- Fail closed: an unexpected decision value ("yes") = deny, and if authorize itself raises, the whole run stops. Better a crash than running a call nobody approved.
+- Tool crash: the model gets `search_company failed (RuntimeError)`. The full error (which might hold secrets or hostnames) stays in OUR log only.
+- Every call in a turn gets an output (parallel calls), or the next request is a 400.
+
+**My answer:** _(fill in after check questions)_
+
+**Functions:** `authorize` (Claude wrote it at my request; I should be able to explain each line):
+- `ALLOWED` / `NEEDS_APPROVAL` are frozensets of exact names. Anything not in them falls through to `return "deny"`. That's default-deny: a tool someone adds later, or a name the model invents, is blocked until someone lists it on purpose.
+- `in` on a set is an exact match, so "Get_Lead", "get_lead " and "send_email\n" are all denied without any special-case code.
+- The checks are in order: allow first, then needs_approval, then deny. A name can't be in two sets by accident and get the looser answer.
+
+**First real run** ("look up L2, research their company, draft an intro"): 3 turns, 4 model calls + 1 embedding.
+- Step 1 had TWO calls in parallel, `get_lead` and `search_company("What does the company associated with lead L2 do?")`. The model searched before it knew the company. The search depended on the lead but was sent in the same turn.
+- Retrieval hit the Intel leadership pages (probably "lead"≈"leadership"), but the QUESTION was about "lead L2's company", which no chunk mentions → `ask`: cited [], needs_sources=true. (Claude first called this a data gap. Wrong: run 2 below got the facts from the same chunks.)
+- Grounding held across the tool boundary. The agent said the sources didn't cover it and wrote a generic draft instead of inventing Intel facts.
+- Fix options: agent-v2 prompt ("wait for results you depend on; pass company names to search_company") vs `parallel_tool_calls=False` (guaranteed, but slower).
+- The nested `ask` was the most expensive call (2,207 input tokens). Tools that call models cost a lot.
+
+**agent-v2** (prompt: wait for results you depend on; ask search_company by company name, never lead id). Same task, 1 run:
+- 4 turns, strictly one after another: `get_lead(L2)` → `search_company("What does Intel do?")` → `draft_email` → answer. Before (v1): 3 turns, search sent alongside get_lead.
+- `ask` retrieved the same Intel chunks as in run 1 → now cited intel-leadership#000/#001, high, needs_sources=false. Draft names real Intel facts.
+- So the run-1 failure was 100% the query. Same evidence, different question → opposite result.
+- Cost: +1 turn (sequential). Worth it when there's a dependency.
+- 1 run ≠ fixed. M5: repeat this case ×5, check search_company is never in step 1 and its question names the company.
+
+**Open (for M4/M5):** the draft body has no citations and isn't checked. "Semiconductor products for PCs" paraphrases "client" products, which is fine here. But nothing stops the agent model from adding an uncited claim between search_company and draft_email. Grounding is checked inside `ask` but NOT across the tool boundary.
