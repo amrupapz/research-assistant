@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx2
+import openai
 import pytest
 from pydantic import SecretStr, ValidationError
 
@@ -105,9 +107,12 @@ def test_success_logs_one_record_with_required_fields(tmp_path):
 def test_truncated_response_is_logged_as_incomplete(tmp_path):
     body = {**COMPLETED, "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
 
-    with pytest.raises(IncompleteResponseError):
-        ask("q", client=_client(body), settings=_settings(tmp_path))
+    client = _client(body)
 
+    with pytest.raises(IncompleteResponseError):
+        ask("q", client=client, settings=_settings(tmp_path))
+
+    assert client.responses.parse.call_count == 1  # same request would truncate again
     [run] = _read_runs(tmp_path)
     assert run["status"] == "incomplete"
     assert "max_output_tokens" in run["error"]
@@ -127,9 +132,6 @@ def test_api_exception_is_logged_then_reraised(tmp_path):
 
 
 def test_ask_retries_timeout_and_logs_retry_count(tmp_path):
-    import httpx2
-    import openai
-
     client = _client(COMPLETED)
     good = client.responses.parse.return_value
     req = httpx2.Request("POST", "https://api.openai.com/v1/responses")
@@ -166,3 +168,58 @@ def test_temperature_sent_only_when_set(tmp_path):
     ask("q", client=client, settings=_settings(tmp_path), temperature=0.2)
     assert client.responses.parse.call_args.kwargs["temperature"] == 0.2
     assert _read_runs(tmp_path)[-1]["temperature"] == 0.2
+
+
+# ---------- M6: failure paths through ask() with a fake client ----------
+
+_REQ = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+
+
+def _status_error(cls, status: int, code: str, request_id: str | None = None):
+    headers = {"x-request-id": request_id} if request_id else {}
+    response = httpx2.Response(status, request=_REQ, headers=headers)
+    return cls("boom", response=response, body={"code": code})
+
+
+def test_rate_limit_is_retried_then_succeeds(tmp_path):
+    client = _client(COMPLETED)
+    good = client.responses.parse.return_value
+    client.responses.parse.side_effect = [
+        _status_error(openai.RateLimitError, 429, "rate_limit_exceeded"),
+        good,
+    ]
+
+    answer = ask("q", client=client, settings=_settings(tmp_path))
+
+    assert answer.answer == "Payments."
+    assert client.responses.parse.call_count == 2
+    [run] = _read_runs(tmp_path)
+    assert (run["status"], run["retries"]) == ("completed", 1)
+
+
+def test_bad_key_401_not_retried_and_request_id_logged(tmp_path):
+    client = MagicMock()
+    client.responses.parse.side_effect = _status_error(
+        openai.AuthenticationError, 401, "invalid_api_key", request_id="req_401"
+    )
+
+    with pytest.raises(openai.AuthenticationError):
+        ask("q", client=client, settings=_settings(tmp_path))
+
+    assert client.responses.parse.call_count == 1
+    [run] = _read_runs(tmp_path)
+    assert run["status"] == "error"
+    assert run["retries"] == 0
+    assert run["request_id"] == "req_401"  # failed calls still carry the support ID
+
+
+def test_refusal_raises_instead_of_returning_empty_answer(tmp_path):
+    refusal = {"type": "message", "content": [{"type": "refusal", "refusal": "I can't help."}]}
+    client = _client({**COMPLETED, "output": [refusal]})
+
+    with pytest.raises(IncompleteResponseError):
+        ask("q", client=client, settings=_settings(tmp_path))
+
+    [run] = _read_runs(tmp_path)
+    assert run["status"] == "completed"  # API finished fine...
+    assert "no output_text" in run["error"]  # ...but there was no answer to use

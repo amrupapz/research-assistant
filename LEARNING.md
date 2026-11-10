@@ -100,3 +100,31 @@
 
 **My answer:** _(fill in after check questions)_
 
+## D1 M6 — tests with a fake client
+
+**Concept:** A fake client lets tests trigger failures that are hard to cause on demand (429, 401, 5xx, truncation, refusal, bad JSON) instantly and for free, so later projects can't silently break them.
+
+**Added:** 429 then success (retries=1); 401 not retried, `request_id` taken from the error's header; refusal → IncompleteResponseError; a cut-off answer is not retried. 31 tests total, ~0.3s.
+
+**Gotchas:**
+- A refusal is logged as status `completed` + `error`: the API finished, but there was no answer. Could become its own status (`refused`) later.
+- A test can be wrong too (M3: 6 timeouts with 7 attempts). Check the test's setup before changing the code.
+
+---
+
+## Project 1 wrap-up (Day 1)
+
+`ask "question"` → one model call that is:
+- configured from `.env` (key as SecretStr, model, timeout, limits)
+- logged as one JSONL line per call, including failures (request_id, tokens, latency, status, retries, confidence)
+- retried only on transient errors, with exponential backoff + jitter, and never on 400/401/404/quota/truncation
+- structured: `ResearchAnswer {answer, confidence, assumptions, needs_sources}`, validated by Pydantic
+- tested: 31 tests with a fake client; no real API calls in tests
+
+**Functions I wrote:** `extract_output_text` (myself); `with_retries` (Claude gave me the code; I should be able to explain each line).
+
+**Open questions to carry forward:**
+- Over-a-year-old "latest" facts rated `medium`, not `low` → Day 6 eval.
+- `cached_tokens` is always 0: prompt + schema (~350 tokens) is below the ~1024-token caching minimum.
+- After the week: honor `Retry-After`; a `refused` status.
+
