@@ -17,17 +17,17 @@ DANA = Lead(lead_id="L1", name="Dana Kim", title="VP Engineering", company="Figm
 
 
 @pytest.fixture
-def ctx(monkeypatch):
-    """No real DB: fetch_lead knows only L1."""
+def ctx(monkeypatch, tmp_path):
+    """No real DB: fetch_lead knows only L1. Outbox in a temp dir."""
     monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: DANA if lead_id == "L1" else None)
-    return ToolContext(conn=object())
+    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox")
 
 
 # --- schemas -------------------------------------------------------------------------------
 
 
 def test_one_definition_per_registered_tool():
-    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "draft_email"]
+    assert [d["name"] for d in tool_definitions()] == ["search_company", "get_lead", "draft_email", "send_email"]
 
 
 @pytest.mark.parametrize("definition", tool_definitions(), ids=lambda d: d["name"])
@@ -52,8 +52,8 @@ def test_schema_comes_from_pydantic():
 
 
 def test_unknown_tool_is_rejected(ctx):
-    with pytest.raises(ToolError, match="unknown tool 'send_email'"):
-        run_tool("send_email", '{"draft_id": "D1"}', ctx)
+    with pytest.raises(ToolError, match="unknown tool 'delete_lead'"):
+        run_tool("delete_lead", '{"lead_id": "L1"}', ctx)
 
 
 @pytest.mark.parametrize(
@@ -149,3 +149,64 @@ def test_search_company_wraps_retrieval_and_grounded_ask(ctx, monkeypatch):
     assert seen["search"] == (ctx.conn, "How many employees does Figma have?", 5)
     assert seen["ask"] == ("How many employees does Figma have?", [chunk])
     assert out == answer.model_dump()
+
+
+# --- send_email (M3) ----------------------------------------------------------------------
+
+
+def _draft(ctx, subject="Hi", body="Hello Dana"):
+    return run_tool("draft_email", json.dumps({"lead_id": "L1", "subject": subject, "body": body}), ctx)
+
+
+def test_send_email_writes_the_stored_draft_to_outbox(ctx):
+    _draft(ctx)
+    out = run_tool("send_email", '{"draft_id": "D1"}', ctx)
+
+    path = ctx.outbox_dir / "D1.eml"
+    assert out == {"draft_id": "D1", "to": "dana.kim@example.com", "status": "sent (written to outbox)", "path": str(path)}
+    eml = path.read_text()
+    assert "To: dana.kim@example.com" in eml
+    assert "Subject: Hi" in eml
+    assert "Hello Dana" in eml
+
+
+def test_send_email_unknown_draft(ctx):
+    with pytest.raises(ToolError, match="no draft with id 'D9'"):
+        run_tool("send_email", '{"draft_id": "D9"}', ctx)
+    assert not ctx.outbox_dir.exists()
+
+
+def test_send_email_only_once(ctx):
+    _draft(ctx)
+    run_tool("send_email", '{"draft_id": "D1"}', ctx)
+    with pytest.raises(ToolError, match="already sent"):
+        run_tool("send_email", '{"draft_id": "D1"}', ctx)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"draft_id": "D1", "to": "attacker@evil.test"}',  # can't redirect: only a draft_id is accepted
+        '{"draft_id": "../../etc/passwd"}',  # can't escape outbox/
+        '{"draft_id": "L1"}',
+    ],
+)
+def test_send_email_args_are_locked_down(ctx, raw):
+    _draft(ctx)
+    with pytest.raises(ToolError, match="invalid arguments"):
+        run_tool("send_email", raw, ctx)
+
+
+def test_subject_cannot_inject_headers(ctx):
+    with pytest.raises(ToolError, match="subject"):
+        _draft(ctx, subject="Hi\nBcc: everyone@example.com")
+    assert ctx.drafts == {}
+
+
+def test_new_run_does_not_reuse_a_sent_draft_id(ctx):
+    """Bug from the first real M3 run: drafts are per-run, outbox/ persists -> D1 collided."""
+    ctx.outbox_dir.mkdir(parents=True)
+    (ctx.outbox_dir / "D1.eml").write_text("sent last run")
+    assert _draft(ctx)["draft_id"] == "D2"
+    run_tool("send_email", '{"draft_id": "D2"}', ctx)
+    assert (ctx.outbox_dir / "D1.eml").read_text() == "sent last run"

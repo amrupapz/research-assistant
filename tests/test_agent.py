@@ -7,8 +7,9 @@ import pytest
 from pydantic import SecretStr
 
 from research_assistant import tools
-from research_assistant.agent import MaxStepsError, run_agent
+from research_assistant.agent import MaxStepsError, cli_approve, run_agent
 from research_assistant.config import Settings
+from research_assistant.permissions import ToolCall
 from research_assistant.schemas import Lead
 from research_assistant.tools import ToolContext
 
@@ -53,9 +54,9 @@ def allow_all(call):
 
 
 @pytest.fixture
-def ctx(monkeypatch):
+def ctx(monkeypatch, tmp_path):
     monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: DANA if lead_id == "L1" else None)
-    return ToolContext(conn=object())
+    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox")
 
 
 @pytest.fixture
@@ -113,7 +114,7 @@ def test_parallel_calls_each_get_an_output(ctx, settings):
     ("decision", "status", "message"),
     [
         ("deny", "denied", "draft_email is not permitted"),
-        ("needs_approval", "blocked", "draft_email needs human approval"),
+        ("needs_approval", "rejected", "the user did not approve draft_email"),  # no approver = no
         ("yes", "denied", "draft_email is not permitted"),  # unexpected value -> fail closed
     ],
 )
@@ -178,3 +179,102 @@ def test_max_steps(ctx, settings):
     with pytest.raises(MaxStepsError, match="after 3 steps"):
         run_agent("t", ctx, max_steps=3, respond_fn=model, authorize_fn=allow_all, settings=settings)
     assert len(model.sent) == 3
+
+
+# --- approval gate (M3) ---------------------------------------------------------------------
+
+
+def needs_approval_for_send(call):
+    return "needs_approval" if call.name == "send_email" else "allow"
+
+
+def _draft_then_send():
+    return FakeModel(
+        turn(call("draft_email", {"lead_id": "L1", "subject": "Hi", "body": "Hello"}, "d")),
+        turn(call("send_email", {"draft_id": "D1"}, "s")),
+        final("done"),
+    )
+
+
+def test_approved_send_writes_outbox(ctx, settings):
+    asked = []
+    result = run_agent(
+        "draft and send",
+        ctx,
+        respond_fn=_draft_then_send(),
+        authorize_fn=needs_approval_for_send,
+        approve_fn=lambda c, x: asked.append(c) or True,
+        settings=settings,
+    )
+    [c] = asked  # asked once, only for send_email, with validated args
+    assert (c.name, c.args.draft_id) == ("send_email", "D1")
+    assert (ctx.outbox_dir / "D1.eml").exists()
+    send = result.tool_calls[-1]
+    assert (send["decision"], send["approved"], send["status"]) == ("needs_approval", True, "ok")
+
+
+@pytest.mark.parametrize("answer", [False, None, "yes", 1])  # only a literal True approves
+def test_anything_but_true_is_a_no(ctx, settings, answer):
+    model = _draft_then_send()
+    result = run_agent(
+        "t", ctx, respond_fn=model, authorize_fn=needs_approval_for_send, approve_fn=lambda c, x: answer, settings=settings
+    )
+    assert not ctx.outbox_dir.exists()
+    send = result.tool_calls[-1]
+    assert (send["approved"], send["status"]) == (False, "rejected")
+    assert "did not approve send_email" in json.loads(model.outputs(2)[-1]["output"])["error"]
+
+
+def test_default_is_no_approver(ctx, settings):
+    run_agent("t", ctx, respond_fn=_draft_then_send(), authorize_fn=needs_approval_for_send, settings=settings)
+    assert not ctx.outbox_dir.exists()
+
+
+def test_allowed_calls_never_ask(ctx, settings):
+    asked = []
+    model = FakeModel(turn(call("get_lead", {"lead_id": "L1"})), final("ok"))
+    run_agent("t", ctx, respond_fn=model, authorize_fn=allow_all, approve_fn=lambda c, x: asked.append(c), settings=settings)
+    assert asked == []
+
+
+def test_real_policy_end_to_end(ctx, settings):
+    """With the REAL authorize: draft runs freely, send waits for the human."""
+    asked = []
+    run_agent("t", ctx, respond_fn=_draft_then_send(), approve_fn=lambda c, x: asked.append(c.name) or False, settings=settings)
+    assert asked == ["send_email"]
+    assert list(ctx.drafts) == ["D1"]
+    assert not ctx.outbox_dir.exists()
+
+
+# --- cli_approve ----------------------------------------------------------------------------
+
+
+def _ctx_with_draft(ctx):
+    tools.run_tool("draft_email", json.dumps({"lead_id": "L1", "subject": "Hi", "body": "Hello Dana"}), ctx)
+    return ctx
+
+
+SEND_D1 = ToolCall("send_email", tools.SendEmailArgs(draft_id="D1"))
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [("y", True), ("Y", True), (" yes ", True), ("", False), ("n", False), ("sure", False), ("yes please", False)],
+)
+def test_cli_approve_answers(ctx, typed, expected):
+    assert cli_approve(SEND_D1, _ctx_with_draft(ctx), input_fn=lambda prompt: typed) is expected
+
+
+def test_cli_approve_eof_is_no(ctx):
+    def eof(prompt):
+        raise EOFError
+
+    assert cli_approve(SEND_D1, _ctx_with_draft(ctx), input_fn=eof) is False
+
+
+def test_cli_approve_shows_the_stored_draft(ctx, capsys):
+    cli_approve(SEND_D1, _ctx_with_draft(ctx), input_fn=lambda prompt: "n")
+    err = capsys.readouterr().err
+    assert "To: dana.kim@example.com" in err
+    assert "Subject: Hi" in err
+    assert "Hello Dana" in err

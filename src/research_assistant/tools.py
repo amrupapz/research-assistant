@@ -6,6 +6,8 @@ from it (the shape the model sees) + a function. REGISTRY is the whitelist: noth
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from email.message import EmailMessage
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -17,6 +19,8 @@ from research_assistant.retrieval import hybrid_search
 from research_assistant.schemas import Draft, Lead
 
 LEAD_ID = r"^L[0-9]{1,6}$"
+DRAFT_ID = r"^D[0-9]{1,6}$"
+ONE_LINE = r"^[^\r\n]*$"  # header values: a newline would let the model inject "Bcc: ..."
 
 
 class SearchCompanyArgs(BaseModel):
@@ -34,12 +38,17 @@ class GetLeadArgs(BaseModel):
 class DraftEmailArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     lead_id: str = Field(pattern=LEAD_ID, description="Lead id of the recipient, e.g. 'L1'.")
-    subject: str = Field(min_length=1, max_length=120, description="Email subject line.")
+    subject: str = Field(min_length=1, max_length=120, pattern=ONE_LINE, description="Email subject line (one line).")
     body: str = Field(
         min_length=1,
         max_length=2000,
         description="Plain-text email body. Use only facts returned by search_company.",
     )
+
+
+class SendEmailArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    draft_id: str = Field(pattern=DRAFT_ID, description="Id of a draft from draft_email, e.g. 'D1'.")
 
 
 class ToolError(Exception):
@@ -52,6 +61,7 @@ class ToolContext:
 
     conn: psycopg.Connection | Any
     drafts: dict[str, Draft] = field(default_factory=dict)  # in memory for now; Postgres in P4
+    outbox_dir: Path = Path("outbox")  # "sending" = writing a .eml file here; never real email
 
 
 def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
@@ -71,11 +81,23 @@ def get_lead(args: GetLeadArgs, ctx: ToolContext) -> dict:
     return _lead_or_error(ctx, args.lead_id).model_dump()
 
 
+def _next_draft_id(ctx: ToolContext) -> str:
+    """D1, D2, ... skipping ids already in memory OR already in outbox/ from an earlier run.
+
+    Drafts live in memory (until P4), so every run restarts at D1; without the outbox check a
+    new D1 would collide with last run's sent D1.eml.
+    """
+    n = len(ctx.drafts) + 1
+    while f"D{n}" in ctx.drafts or (ctx.outbox_dir / f"D{n}.eml").exists():
+        n += 1
+    return f"D{n}"
+
+
 def draft_email(args: DraftEmailArgs, ctx: ToolContext) -> dict:
     """Store a draft addressed to the lead's email from OUR table (the model never picks the address)."""
     lead = _lead_or_error(ctx, args.lead_id)
     draft = Draft(
-        draft_id=f"D{len(ctx.drafts) + 1}",
+        draft_id=_next_draft_id(ctx),
         lead_id=lead.lead_id,
         to=lead.email,
         subject=args.subject,
@@ -83,6 +105,28 @@ def draft_email(args: DraftEmailArgs, ctx: ToolContext) -> dict:
     )
     ctx.drafts[draft.draft_id] = draft
     return {**draft.model_dump(), "status": "draft (not sent)"}
+
+
+def send_email(args: SendEmailArgs, ctx: ToolContext) -> dict:
+    """"Send" a stored draft by writing outbox/<draft_id>.eml. Only runs after a human said yes.
+
+    Sends exactly the stored draft: the model passes only a draft_id, so it can't change the
+    recipient or text between your approval and the send. Each draft can be sent once.
+    """
+    draft = ctx.drafts.get(args.draft_id)
+    if draft is None:
+        raise ToolError(f"no draft with id {args.draft_id!r}")
+    path = ctx.outbox_dir / f"{draft.draft_id}.eml"
+    if path.exists():
+        raise ToolError(f"draft {draft.draft_id} was already sent")
+    msg = EmailMessage()
+    msg["From"] = "sales-agent@example.com"
+    msg["To"] = draft.to
+    msg["Subject"] = draft.subject
+    msg.set_content(draft.body)
+    ctx.outbox_dir.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(msg))
+    return {"draft_id": draft.draft_id, "to": draft.to, "status": "sent (written to outbox)", "path": str(path)}
 
 
 @dataclass(frozen=True)
@@ -128,6 +172,12 @@ REGISTRY: dict[str, Tool] = {
             "Save an email draft to a lead. Does NOT send it. Returns the draft with its draft_id.",
             DraftEmailArgs,
             draft_email,
+        ),
+        Tool(
+            "send_email",
+            "Send a saved draft to its lead. Requires the user's approval; only use when the user asked to send.",
+            SendEmailArgs,
+            send_email,
         ),
     ]
 }

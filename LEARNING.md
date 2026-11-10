@@ -410,3 +410,42 @@
 - 1 run ≠ fixed. M5: repeat this case ×5, check search_company is never in step 1 and its question names the company.
 
 **Open (for M4/M5):** the draft body has no citations and isn't checked. "Semiconductor products for PCs" paraphrases "client" products, which is fine here. But nothing stops the agent model from adding an uncited claim between search_company and draft_email. Grounding is checked inside `ask` but NOT across the tool boundary.
+- agent-v2 run 2: same 4-turn sequential order, query "What does Intel do?" again (2/2). The nested `ask` had **cached=2198 / 2201** input tokens: first cache hit. Same system prompt + same question + same retrieved chunks as the previous run, and over the ~1024-token minimum. The agent turns (<1024) stay at 0. Caching cuts cost and latency; the answer doesn't change.
+
+**M2 check answers (given by Claude):**
+1. `if decision == "allow": run / else: block` fails closed: a typo, None, "yes", or a forgotten new value means the tool does NOT run. The reverse (`if == "deny": block / else: run`) fails open: any unexpected value, even "needs_approval" if someone forgets to handle it, runs the tool. Same idea as default-deny inside authorize, one layer up. Test: `test_not_allowed_means_not_executed[yes]`. The fake authorize returns "yes" → no draft stored, status=denied.
+2. The next request contains both function_calls AND one function_call_output per call_id: `{"error": "no lead with id ..."}` for get_lead, plus draft_email's result or error. The failure is data the model can react to. The API requires every function_call in `input` to have a matching output (same call_id). A missing one = an incomplete conversation → 400. That's why the loop gives EVERY call an output (invalid, denied, error included). Test: `test_parallel_calls_each_get_an_output`. agent-v2's "wait for results you depend on" should stop the dependent draft_email from being sent in the same turn at all.
+
+## D3 M3 — approval gate (send_email)
+
+**Concept:** Some actions can't be undone (a sent email can't be recalled). For those, the program pauses and a PERSON decides, after seeing exactly what will happen. `authorize()` → `needs_approval` triggers the pause. Only an explicit yes runs the tool; anything else is a no. Without it, one injected page or model mistake sends mail in my name, and the logs only tell me afterwards.
+
+**Built:**
+- `send_email(draft_id)` writes `outbox/<id>.eml` (stdlib `EmailMessage`, From sales-agent@example.com). `outbox/` is gitignored. Never real email.
+- `handle_call`: needs_approval → `approve_fn(call, ctx)` → only a literal `True` runs it. The log record gets `approved: true/false`; a no → status `rejected` and the model is told "the user did not approve; don't retry unless they ask".
+- `cli_approve`: shows To/Subject/Body from OUR draft store, asks `Approve? [y/N]`. Only y/yes counts; Enter, "sure", "yes please", Ctrl-D/EOF → no. The default `no_approver` (tests/evals/batch) always says no.
+- Prompt agent-v3: "Drafting is not sending. Only call send_email when the user explicitly asked."
+- 24 new tests, 176 total.
+
+**Design decisions (each one blocks a specific attack):**
+- send_email takes ONLY a draft_id → the model can't change the recipient or text between my approval and the send. What I approve is what gets sent.
+- The approval screen reads the draft from our store, not from the model's description of it. The model could SAY "harmless follow-up" about a draft that says something else.
+- draft_id pattern `^D[0-9]{1,6}$` → no `../../` path tricks in the outbox filename.
+- Subject must be one line → no "Hi\nBcc: everyone@…" header injection.
+- Each draft sends once (the .eml already exists → error).
+- Default = no approver = no. A run with nobody at the keyboard can never send.
+
+**Gotcha:** the tool_call `latency_ms` for send_email now includes my thinking time at the prompt.
+
+**My answer:** _(fill in after check questions)_
+
+**First real run (y):** L1/Figma, 4 turns. The approval screen showed the stored draft → `y` → `outbox/D1.eml` (quoted-printable: `=E2=80=99` = ’, `=` at line end = soft break).
+- Step 1 = get_lead + search_company in parallel, and that was CORRECT: the task named Figma, so the search didn't depend on the lead. agent-v2/v3 rule followed in both directions.
+- Signature was blank ("Best,"): the agent has no sender identity and didn't invent one. I approved anyway, and approvers skim. Later: sender name in config.
+- Agent turn 4 had cached=1066: the agent conversation itself is now over 1024 tokens.
+- **Bug found by this run (fixed):** drafts live in memory, so every run restarts at D1, but outbox/ persists → the next run's D1 would hit "already sent". `_next_draft_id` now skips ids already in outbox/. Test: `test_new_run_does_not_reuse_a_sent_draft_id`. Real fix in P4: drafts in Postgres with real ids.
+- Run 2 (y): got D2 (fix works), sent. I approved "andFigma Make": the source says "and Figma Make", so the model dropped a space. Facts grounded, but the typo passed the human gate. Approval ≠ proofreading. M4/M5: code checks before the human (draft facts ⊆ search_company citations, non-empty signature).
+- **Run 3 (n):** `send_email → needs_approval approved=False / rejected`. outbox still only D1, D2. The model did NOT retry send_email and ended the run. ✅ The blocked action stayed blocked against the real model.
+  - Its final message said "wasn't sent because the send step requires separate approval". That's misleading: it sounds pending/procedural, but I DECLINED. The tool output said "the user did not approve". M5: the final answer must say it was declined; maybe word the error as "The user declined to send D3."
+  - Same task as run 2, but this time sequential (get_lead, then search). Parallel vs sequential varies run to run; both are valid here.
+  - The model dropped another space ("productteams") in the final answer. Pattern across runs for gpt-6-luna.

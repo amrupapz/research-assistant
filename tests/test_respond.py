@@ -144,8 +144,9 @@ def test_round_trip_sends_back_output_items_and_matching_call_id(tmp_path):
     assert [r["tool_calls"] for r in _read_runs(tmp_path)] == [["get_lead"], []]
 
 
-def test_agent_prompt_v2_rules():
-    """agent-v2: fix for searching by lead id before get_lead returned (see LEARNING.md D3 M2)."""
-    assert AGENT_PROMPT_VERSION == "agent-v2"
+def test_agent_prompt_rules():
+    """v2: wait for dependent results, search by company name (LEARNING.md D3 M2). v3: send rules."""
+    assert AGENT_PROMPT_VERSION == "agent-v3"
     assert "wait for that result" in AGENT_PROMPT
     assert "never by lead id" in AGENT_PROMPT
+    assert "Drafting is not sending" in AGENT_PROMPT
