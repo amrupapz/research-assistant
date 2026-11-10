@@ -8,13 +8,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "httpx2>=2.16.0",
     "openai>=3.49.0",
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
 ]
 
 [project.scripts]
-research-assistant = "research_assistant:main"
+ask = "research_assistant.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
