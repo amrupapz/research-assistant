@@ -35,6 +35,7 @@ from research_assistant.llm import (
 )
 from research_assistant.prompts import AGENT_PROMPT_VERSION, PROMPT_VERSION
 from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
+from research_assistant.state import list_drafts
 from research_assistant.tools import ToolContext
 
 ROOT = Path(__file__).parent.parent
@@ -116,6 +117,7 @@ def run_answers(conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
 def run_agent_case(conn, case) -> dict:
     """One real agent run with a TEMP outbox and a scripted approver. Returns plain data for grading."""
     asked = []
+    conn.execute("SELECT 1")  # open an outer transaction: the run's steps become savepoints, rolled back below
     with tempfile.TemporaryDirectory() as tmp:
         ctx = ToolContext(conn=conn, outbox_dir=Path(tmp) / "outbox")
 
@@ -130,9 +132,11 @@ def run_agent_case(conn, case) -> dict:
         except (MaxStepsError, IncompleteResponseError) as e:
             error = f"{type(e).__name__}: {e}"
         sent = sorted(f.name for f in ctx.outbox_dir.glob("*.eml")) if ctx.outbox_dir.exists() else []
+    drafts = [d.model_dump() for d in list_drafts(conn, ctx.run_id)] if ctx.run_id else []
+    conn.rollback()  # evals leave no runs, drafts or approvals behind in the dev DB
     return {
         "tool_calls": tool_calls,
-        "drafts": [d.model_dump() for d in ctx.drafts.values()],
+        "drafts": drafts,
         "sent": sent,
         "answer": answer,
         "error": error,

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -18,7 +19,8 @@ from research_assistant.db import fetch_lead
 from research_assistant.llm import ask, judge_icp
 from research_assistant.qualify import load_icp, qualify
 from research_assistant.retrieval import hybrid_search
-from research_assistant.schemas import Draft, Lead, Qualification
+from research_assistant.schemas import Lead
+from research_assistant.state import get_draft, insert_draft, save_qualification
 
 LEAD_ID = r"^L[0-9]{1,6}$"
 DRAFT_ID = r"^D[0-9]{1,6}$"
@@ -80,13 +82,15 @@ class ToolError(Exception):
 
 @dataclass
 class ToolContext:
-    """What tools may touch. Passed in, so tests can fake it."""
+    """What tools may touch. Passed in, so tests can point it at the test DB and a temp outbox.
+
+    State (drafts, approvals, qualifications) lives in Postgres via conn (D4 M3), not here.
+    """
 
     conn: psycopg.Connection | Any
-    drafts: dict[str, Draft] = field(default_factory=dict)  # in memory for now; Postgres in P4
+    run_id: UUID | None = None  # set by run_agent; None for direct run_tool calls
     outbox_dir: Path = Path("outbox")  # "sending" = writing a .eml file here; never real email
-    warnings: list[str] = field(default_factory=list)  # shown to the human at approval time
-    qualifications: dict[str, Qualification] = field(default_factory=dict)  # by lead_id; Postgres in M3
+    warnings: list[str] = field(default_factory=list)  # shown at approval time; rebuilt from run_steps on resume
     icp_path: Path = Path("icp.toml")
 
 
@@ -97,16 +101,24 @@ def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
     return lead
 
 
+def search_warning(question: str, result: dict) -> str | None:
+    """The approval-time warning for a search result, or None. A pure function of the stored output,
+    so a resumed run (M4) can rebuild the warnings from run_steps."""
+    if not result.get("needs_sources"):  # missing / conflicting / outdated: the human should know
+        return None
+    return (
+        f"search_company({question!r}) flagged its sources as missing, conflicting, or unverified "
+        f"(confidence={result.get('confidence')}). Check any claims from it before sending."
+    )
+
+
 def search_company(args: SearchCompanyArgs, ctx: ToolContext) -> dict:
     """Hybrid retrieval + the grounded P2 answer (a model call inside a tool call; both are logged)."""
     chunks = [chunk for chunk, _ in hybrid_search(ctx.conn, args.question, k=5)]
-    result = ask(args.question, chunks)
-    if result.needs_sources:  # missing / conflicting / outdated: the human should know before approving
-        ctx.warnings.append(
-            f"search_company({args.question!r}) flagged its sources as missing, conflicting, or unverified "
-            f"(confidence={result.confidence}). Check any claims from it before sending."
-        )
-    return result.model_dump()
+    output = ask(args.question, chunks).model_dump()
+    if warning := search_warning(args.question, output):
+        ctx.warnings.append(warning)
+    return output
 
 
 def get_lead(args: GetLeadArgs, ctx: ToolContext) -> dict:
@@ -124,33 +136,14 @@ def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
             chunks.setdefault(chunk.chunk_id, chunk)
     judgment = judge_icp(lead.company, [(c.id, c.question_for(lead.company)) for c in criteria], list(chunks.values()))
     result = qualify(lead, icp, judgment.results, set(chunks))
-    ctx.qualifications[lead.lead_id] = result
+    save_qualification(ctx.conn, result, ctx.run_id)
     return result.model_dump()
-
-
-def _next_draft_id(ctx: ToolContext) -> str:
-    """D1, D2, ... skipping ids already in memory OR already in outbox/ from an earlier run.
-
-    Drafts live in memory (until P4), so every run restarts at D1; without the outbox check a
-    new D1 would collide with last run's sent D1.eml.
-    """
-    n = len(ctx.drafts) + 1
-    while f"D{n}" in ctx.drafts or (ctx.outbox_dir / f"D{n}.eml").exists():
-        n += 1
-    return f"D{n}"
 
 
 def draft_email(args: DraftEmailArgs, ctx: ToolContext) -> dict:
     """Store a draft addressed to the lead's email from OUR table (the model never picks the address)."""
     lead = _lead_or_error(ctx, args.lead_id)
-    draft = Draft(
-        draft_id=_next_draft_id(ctx),
-        lead_id=lead.lead_id,
-        to=lead.email,
-        subject=args.subject,
-        body=args.body,
-    )
-    ctx.drafts[draft.draft_id] = draft
+    draft = insert_draft(ctx.conn, lead, args.subject, args.body, ctx.run_id)  # id from the DB: never collides
     return {**draft.model_dump(), "status": "draft (not sent)"}
 
 
@@ -160,7 +153,7 @@ def send_email(args: SendEmailArgs, ctx: ToolContext) -> dict:
     Sends exactly the stored draft: the model passes only a draft_id, so it can't change the
     recipient or text between your approval and the send. Each draft can be sent once.
     """
-    draft = ctx.drafts.get(args.draft_id)
+    draft = get_draft(ctx.conn, args.draft_id)
     if draft is None:
         raise ToolError(f"no draft with id {args.draft_id!r}")
     path = ctx.outbox_dir / f"{draft.draft_id}.eml"

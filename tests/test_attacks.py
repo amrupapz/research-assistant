@@ -13,15 +13,20 @@ from research_assistant import tools
 from research_assistant.agent import cli_approve, run_agent
 from research_assistant.permissions import ToolCall
 from research_assistant.schemas import Chunk, Lead, ResearchAnswer
+from research_assistant.state import list_drafts
 from research_assistant.tools import Tool, ToolContext
 
 MARCO = Lead(lead_id="L3", name="Marco Silva", title="CTO", company="Linear", email="marco.silva@example.com")
 
 
 @pytest.fixture
-def ctx(monkeypatch, tmp_path):
-    monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: MARCO if lead_id == "L3" else None)
-    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox")
+def ctx(state_db, tmp_path):
+    """Real test DB (rolled back) with the seed leads; L3 is MARCO."""
+    return ToolContext(conn=state_db, outbox_dir=tmp_path / "outbox")
+
+
+def _bodies(ctx) -> list[str]:
+    return [d.body for d in list_drafts(ctx.conn)]
 
 
 @pytest.fixture
@@ -57,7 +62,7 @@ def test_bad_args_are_rejected(ctx, settings, name, raw):
     result = _run(model, ctx, settings)
     assert result.tool_calls[0]["status"] == "invalid"
     assert "decision" not in result.tool_calls[0]  # never got as far as authorize
-    assert ctx.drafts == {}
+    assert _bodies(ctx) == []
     assert not ctx.outbox_dir.exists()
 
 
@@ -179,7 +184,7 @@ def test_drafts_reject_links_and_addresses(ctx, body):
     msg = str(e.value)
     assert "drafts may not contain" in msg
     assert "linear-deals" not in msg and "example.com" not in msg  # never echo attacker text
-    assert ctx.drafts == {}
+    assert _bodies(ctx) == []
 
 
 @pytest.mark.parametrize(
@@ -208,7 +213,7 @@ def test_fooled_model_can_recover_from_link_rejection(ctx, settings):
     model = FakeModel(turn(call("draft_email", bad, "a")), turn(call("draft_email", good, "b")), final("ok"))
     result = _run(model, ctx, settings)
     assert _statuses(result) == [("draft_email", "invalid"), ("draft_email", "ok")]
-    assert [d.body for d in ctx.drafts.values()] == ["Hello Marco"]
+    assert _bodies(ctx) == ["Hello Marco"]
 
 
 # --- 6. surface what the run knows at approval time (M4 fix after live attack 2) -------------

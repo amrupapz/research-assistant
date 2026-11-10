@@ -5,6 +5,7 @@ import pytest
 
 from research_assistant import tools
 from research_assistant.schemas import Chunk, Citation, Lead, ResearchAnswer
+from research_assistant.state import get_draft, list_drafts
 from research_assistant.tools import (
     REGISTRY,
     ToolContext,
@@ -17,10 +18,13 @@ DANA = Lead(lead_id="L1", name="Dana Kim", title="VP Engineering", company="Figm
 
 
 @pytest.fixture
-def ctx(monkeypatch, tmp_path):
-    """No real DB: fetch_lead knows only L1. Outbox in a temp dir."""
-    monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: DANA if lead_id == "L1" else None)
-    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox")
+def ctx(state_db, tmp_path):
+    """Real test DB (rolled back) with the seed leads; L1 is DANA. Outbox in a temp dir."""
+    return ToolContext(conn=state_db, outbox_dir=tmp_path / "outbox")
+
+
+def _drafts(ctx) -> list[str]:
+    return [d.draft_id for d in list_drafts(ctx.conn)]
 
 
 # --- schemas -------------------------------------------------------------------------------
@@ -105,7 +109,7 @@ def test_draft_email_uses_our_address_and_does_not_send(ctx):
         "body": "Hello Dana",
         "status": "draft (not sent)",
     }
-    assert list(ctx.drafts) == ["D1"]
+    assert _drafts(ctx) == ["D1"]
     second = run_tool("draft_email", json.dumps({"lead_id": "L1", "subject": "Re", "body": "Again"}), ctx)
     assert second["draft_id"] == "D2"
 
@@ -113,7 +117,7 @@ def test_draft_email_uses_our_address_and_does_not_send(ctx):
 def test_draft_email_unknown_lead_stores_nothing(ctx):
     with pytest.raises(ToolError, match="L999"):
         run_tool("draft_email", json.dumps({"lead_id": "L999", "subject": "Hi", "body": "x"}), ctx)
-    assert ctx.drafts == {}
+    assert _drafts(ctx) == []
 
 
 def test_search_company_wraps_retrieval_and_grounded_ask(ctx, monkeypatch):
@@ -200,13 +204,19 @@ def test_send_email_args_are_locked_down(ctx, raw):
 def test_subject_cannot_inject_headers(ctx):
     with pytest.raises(ToolError, match="subject"):
         _draft(ctx, subject="Hi\nBcc: everyone@example.com")
-    assert ctx.drafts == {}
+    assert _drafts(ctx) == []
 
 
-def test_new_run_does_not_reuse_a_sent_draft_id(ctx):
-    """Bug from the first real M3 run: drafts are per-run, outbox/ persists -> D1 collided."""
-    ctx.outbox_dir.mkdir(parents=True)
-    (ctx.outbox_dir / "D1.eml").write_text("sent last run")
-    assert _draft(ctx)["draft_id"] == "D2"
-    run_tool("send_email", '{"draft_id": "D2"}', ctx)
-    assert (ctx.outbox_dir / "D1.eml").read_text() == "sent last run"
+def test_draft_ids_never_repeat_across_runs(ctx):
+    """P3 bug: drafts were per-run, so every run restarted at D1 and collided with last run's D1.eml.
+    P3 patched it by skipping ids in outbox/; D4 M3 fixes it properly: the id comes from the DB."""
+    first = _draft(ctx)["draft_id"]
+    next_run = ToolContext(conn=ctx.conn, outbox_dir=ctx.outbox_dir)  # a fresh context, same DB
+    second = _draft(next_run)["draft_id"]
+    assert (first, second) == ("D1", "D2")
+    assert get_draft(ctx.conn, "D1").body == "Hello Dana"  # still there for the next run
+
+
+def test_get_draft_rejects_malformed_ids(ctx):
+    _draft(ctx)
+    assert [get_draft(ctx.conn, i) for i in ["D", "1", "L1", "D1x", "D-1"]] == [None] * 5

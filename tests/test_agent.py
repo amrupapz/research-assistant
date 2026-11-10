@@ -11,6 +11,7 @@ from research_assistant.agent import MaxStepsError, cli_approve, run_agent
 from research_assistant.config import Settings
 from research_assistant.permissions import ToolCall
 from research_assistant.schemas import Lead
+from research_assistant.state import list_drafts
 from research_assistant.tools import ToolContext
 
 DANA = Lead(lead_id="L1", name="Dana Kim", title="VP Engineering", company="Figma", email="dana.kim@example.com")
@@ -54,9 +55,13 @@ def allow_all(call):
 
 
 @pytest.fixture
-def ctx(monkeypatch, tmp_path):
-    monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: DANA if lead_id == "L1" else None)
-    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox")
+def ctx(state_db, tmp_path):
+    """Real test DB (rolled back) with the seed leads; L1 is DANA."""
+    return ToolContext(conn=state_db, outbox_dir=tmp_path / "outbox")
+
+
+def _drafts(ctx) -> list[str]:
+    return [d.draft_id for d in list_drafts(ctx.conn)]
 
 
 @pytest.fixture
@@ -125,7 +130,7 @@ def test_not_allowed_means_not_executed(ctx, settings, decision, status, message
     model = FakeModel(turn(draft), final("couldn't"))
     result = run_agent("t", ctx, respond_fn=model, authorize_fn=lambda c: decision, settings=settings)
 
-    assert ctx.drafts == {}  # the tool never ran
+    assert _drafts(ctx) == []  # the tool never ran
     assert message in json.loads(model.outputs(1)[0]["output"])["error"]
     assert result.tool_calls[0]["status"] == status
 
@@ -172,7 +177,7 @@ def test_authorize_crash_stops_the_run(ctx, settings):
     model = FakeModel(turn(call("draft_email", {"lead_id": "L1", "subject": "s", "body": "b"})), final("x"))
     with pytest.raises(NotImplementedError):
         run_agent("t", ctx, respond_fn=model, authorize_fn=broken, settings=settings)
-    assert ctx.drafts == {}
+    assert _drafts(ctx) == []
 
 
 def test_max_steps(ctx, settings):
@@ -244,7 +249,7 @@ def test_real_policy_end_to_end(ctx, settings):
     asked = []
     run_agent("t", ctx, respond_fn=_draft_then_send(), approve_fn=lambda c, x: asked.append(c.name) or False, settings=settings)
     assert asked == ["send_email"]
-    assert list(ctx.drafts) == ["D1"]
+    assert _drafts(ctx) == ["D1"]
     assert not ctx.outbox_dir.exists()
 
 

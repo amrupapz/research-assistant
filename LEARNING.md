@@ -642,7 +642,9 @@ runs ──< run_steps        (drafts, approvals, findings, qualifications also 
 
 **Transactions:** a step and its effect commit together (e.g. INSERT drafts + INSERT run_steps). Limit: sending an email is NOT a DB write, so no transaction can undo it. The gap between "sent" and "recorded" is M5's send_once problem.
 
-**My answer:** _(fill in after check questions)_
+**Check answers (given by Claude):**
+1. *Why is "embed past conversations and search them" wrong for "did we already email Dana?"* Vector search returns the most SIMILAR text, ranked, never "no match". It will happily return "drafted an email to Dana" (drafted, not sent) or "emailed Dan K." for the query, and it can't count, so it can't tell you she was emailed TWICE. Tables answer exactly: `SELECT 1 FROM sends JOIN drafts ... WHERE lead_id='L1' AND status='sent'` is yes or no.
+2. *What does `sends.approval_id NOT NULL` + FK guarantee?* Every send row points at an approval row that really exists, so the DB refuses a send with no approval record behind it. It does NOT guarantee that approval says "approved" (a declined one satisfies the FK), or that it's for the SAME draft. Both are checks the code must make (M5); a CHECK constraint can only see its own row.
 
 ## D4 M1 — qualify_lead (grounded qualification)
 
@@ -675,7 +677,9 @@ else possible. **Unknown is not no**: missing evidence gives "possible", never "
 - Criterion questions double as search queries. Phrasing affects retrieval AND judgment.
 - `.replace("{company}", ...)` not `.format()`: a question containing other braces won't crash.
 
-**My answer:** _(fill in after check questions)_
+**Check answers (given by Claude):**
+1. *Why does unknown give "possible", not "poor"?* Unknown means "our sources don't say", which describes data/, not the company. If unknown counted as no, every company we haven't researched yet would score "poor", so the team would drop good leads (Intel today: right buyer title, zero evidence either way) just because research was thin. "possible" says "maybe; research more before deciding".
+2. *How can a wrong "yes" pass the retrieved check?* (a) It cites a chunk that WAS retrieved but is about a different company (a Linear chunk for Figma: retrieval mixes companies). (b) It cites the right company's chunk, but the chunk doesn't actually say that (e.g. "about page mentions developers" → dev_tooling=yes). Code checks that the id exists in the retrieved set, not what the chunk means. The live run showed (b): Figma dev_tooling=yes was a stretch.
 
 ## D4 M2 — Alembic migrations
 
@@ -710,5 +714,103 @@ research_finding; it stores per-criterion results as `criteria jsonb` (with chun
   runs inside `db.transaction()` (a SAVEPOINT) to keep the test's transaction usable.
 - Up/down tests COMMIT (DDL on the shared test DB), so a fixture always migrates back to head.
 - The `vector(3)` toy test now ALTERs the column inside its rolled-back transaction instead of creating its own table.
+
+**Check answers (given by Claude):**
+1. *Why does 0001 fail on the dev DB, and what does stamp write?* The dev DB already has chunks and leads, so `CREATE TABLE chunks` fails ("relation already exists") and Postgres rolls the whole migration back. `stamp 0001` runs no migration SQL; it only creates `alembic_version` and writes "0001", i.e. "assume 0001 already ran". Safe here because the existing tables match 0001 exactly. Dangerous if they didn't (e.g. a missing column): Alembic would believe the schema is at 0001 and later migrations would run on a schema that isn't what they expect, failing or silently diverging.
+2. *Crash after the email went out, before the sends row committed: does UNIQUE stop a resend?* No. The row never committed, so on retry there is nothing for UNIQUE to collide with, and the email goes out twice. A constraint only protects rows that EXIST. So the row (with its idempotency key) has to be written and committed BEFORE the external send, as "pending", and then updated to "sent" afterwards. That's the shape of M5 (you write send_once).
+
+## D4 M3 — persist the agent (a step and its effect in one transaction)
+
+**Concept:** an action has two facts: the EFFECT (a draft row) and the RECORD that it happened (a
+run_steps row). Commit them separately and a crash between them makes the DB lie (an orphan draft,
+or a step pointing at nothing). One transaction = the DB shows both or neither, so "last committed
+step" is a trustworthy place for M4 to resume from. Limit: a file in outbox/ or a real email is not
+a DB write, so no transaction can undo it (M5).
+
+**What was built**
+- `state.py`: start_run/finish_run, add_step (seq = max+1 from the DB), insert_draft/get_draft/
+  list_drafts, record_approval, save_qualification/latest_qualification. Plain SQL, never commits.
+- Tools: draft_email → `drafts` table (id from the DB identity, shown as "D7"; `_next_draft_id` is
+  gone), send_email/cli_approve read the draft from the DB, qualify_lead → `qualifications`.
+  `ToolContext.drafts`/`.qualifications` removed; `run_id` added.
+- agent.py: `runs` row at start; a `model_turn` step after every model reply (output items incl.
+  reasoning); each tool call = validate → authorize → ASK THE HUMAN (no transaction open) →
+  ONE transaction {tool effect in a savepoint, approval row, step row}; finish_run done/failed.
+- `agent` CLI uses `connect(autocommit=True)` and prints the run_id (needed for M4 `--resume`).
+- evals: each agent case runs inside an outer transaction that is rolled back → no eval runs or drafts left in the dev DB.
+
+**Deviation from the plan:** search_company does NOT save research_findings yet. The table needs
+`company`, and search_company only takes a `question`. M6 (reuse findings < 7 days) will add a
+company argument + migration 0003. Approval warnings stay in memory (ctx.warnings) until M4.
+
+**Gotchas**
+- **Autocommit or nothing commits.** psycopg opens a transaction on your first query. After that,
+  `with conn.transaction():` is only a SAVEPOINT and nothing commits until the outer one does.
+  Verified: non-autocommit + a read first → another connection sees 0 rows; autocommit → 1.
+  Tests and evals USE this on purpose (outer transaction, rolled back); the CLI must not.
+- **Never hold a transaction open while waiting for a human** (locks held for as long as you think).
+  Approval happens BEFORE the step transaction opens (tested).
+- **A tool that fails halfway:** savepoint around the tool → its partial writes roll back, but the
+  step transaction survives and records status=error.
+- **Sequences don't roll back.** A rolled-back INSERT still uses up its id, so test drafts could be
+  D37. `TRUNCATE ... RESTART IDENTITY` in the test fixture is the exception: it IS transactional.
+- **The DB CHECK caught a real case:** a buggy authorize returning "yes" is enforced as deny, but
+  storing "yes" violates CHECK(decision IN ...). Store what was ENFORCED ("deny"); the JSONL log keeps the raw value.
+- record_approval inserts via `SELECT ... FROM drafts WHERE draft_id = ...` → 0 rows for a missing
+  draft instead of an FK error that would abort the whole step.
+- Each step transaction around search_company / qualify_lead stays open during their model calls
+  (seconds). Fine for one user; with concurrency you'd do the slow call first and only the writes in the transaction.
+
+**Check answers (given by Claude):**
+1. *Why ask y/N BEFORE opening the step transaction?* A transaction holds locks and a database
+   connection until it ends. Inside it, waiting for a human means: if you walk away for 10 minutes,
+   the transaction stays open 10 minutes. The rows it touched are locked, so another process that
+   needs them (another run, a migration, M6's follow-up job) blocks. Postgres can't clean up old row
+   versions behind it (bloat), and a server idle-in-transaction timeout may kill the connection, so
+   your "y" fails after all. Rule: transactions are for the database's work only, short and with no
+   waiting on people or slow networks. So decide first, then open, write, commit.
+2. *How can a rolled-back test prove anything about commits?* It doesn't prove anything about the
+   final COMMIT. It proves ATOMICITY: the draft and the step are inside the same `conn.transaction()`
+   block, so when the step insert raises, the block rolls back and the draft goes with it. In the
+   test that block is a SAVEPOINT inside the fixture's outer transaction. A savepoint rolls back
+   exactly like a transaction, so "no orphan draft" is really checked. It RELIES on production
+   using autocommit, where the same block is a real BEGIN/COMMIT. That's why the gotcha was verified
+   separately (another connection saw 0 rows vs 1).
+
+## D4 M4 — resume after a crash
+
+**Concept:** a crashed run's conversation is fully in run_steps (model turns + tool outputs).
+Resume rebuilds the exact model input from those rows, runs ONLY the calls that have no committed
+step, and continues the loop. Committed steps are replayed, never re-run, because their effects are
+already in the DB. Re-asking the model is no substitute: the same task took 3 different paths in 3
+live runs. Without resume, a crash throws away paid-for research and a re-run duplicates drafts.
+
+**What was built**
+- `rebuild(task, steps)` → (input items, last turn, pending calls, final answer or None).
+- `resume_agent(run_id, ctx, ...)`: refuses unknown/done runs and runs started under another
+  agent prompt version or model; sets status back to running; rebuilds warnings from stored
+  search_company outputs (`tools.search_warning` is now a pure function of the output).
+- `_Loop` shared by run_agent and resume_agent; pending calls of an interrupted turn run first.
+- `SimulatedCrash(BaseException)` + hidden `--crash-after TOOL`: dies right after that tool's step
+  commits. BaseException like a real kill, so `except Exception` doesn't mark the run failed.
+- CLI: `agent --resume RUN_ID`.
+
+**Gotchas**
+- **Half-done turn:** the model proposed 2 calls, only 1 committed → run only the missing one, and
+  make sure EVERY call of that turn has an output before the next request (else API 400).
+- **Crash after the final answer was saved** but before finish_run: resume returns the stored
+  answer without calling the model at all.
+- **`max_steps` counts all turns**, old + new. A run that failed on max_steps needs a bigger
+  --max-steps to resume.
+- **jsonb reorders object keys** (shorter keys first), so the replayed function_call_output string
+  isn't byte-identical to the original: same JSON, different text. Fine for the model; it can cost
+  a prompt-cache miss on the resumed request. (`json` instead of `jsonb` would keep the text.)
+- **Status semantics:** `failed` = we caught an error and said so; `running` with no process = it
+  died (kill, Ctrl-C, SimulatedCrash). Both are resumable; only `done` isn't.
+- **Mismatched prompt/model refused:** a conversation started under agent-v4 rules shouldn't be
+  finished under different tools or rules. Bump the prompt version → old crashed runs can't resume.
+- **Limit (M5):** a crash INSIDE send_email after the .eml is written but before its step commits →
+  resume sees send_email as pending and runs it again. The outbox-file check happens to stop it
+  today; real email wouldn't. That's send_once.
 
 **My answer:** _(fill in after check questions)_

@@ -24,6 +24,7 @@ from research_assistant.qualify import (
     reconcile,
 )
 from research_assistant.schemas import Chunk, CriterionResult, IcpJudgment, Lead
+from research_assistant.state import latest_qualification
 from research_assistant.tools import ToolContext, run_tool
 
 ICP = Icp.model_validate(
@@ -231,8 +232,8 @@ def test_judge_icp_truncated_is_an_error(tmp_path):
 
 
 @pytest.fixture
-def ctx(monkeypatch, tmp_path):
-    monkeypatch.setattr(tools, "fetch_lead", lambda conn, lead_id: DANA if lead_id == "L1" else None)
+def ctx(state_db, tmp_path):
+    """Real test DB (rolled back) with the seed leads; L1 is DANA."""
     icp_path = tmp_path / "icp.toml"
     icp_path.write_text(
         'version = "icp-test"\nproduct = "test"\n'
@@ -240,7 +241,7 @@ def ctx(monkeypatch, tmp_path):
         '[[criteria]]\nid = "software"\nmust = true\ncheck = "evidence"\nquestion = "Does {company} build software?"\n'
         '[[criteria]]\nid = "scale"\nmust = false\ncheck = "evidence"\nquestion = "Is {company} large?"\n'
     )
-    return ToolContext(conn=object(), outbox_dir=tmp_path / "outbox", icp_path=icp_path)
+    return ToolContext(conn=state_db, outbox_dir=tmp_path / "outbox", icp_path=icp_path)
 
 
 def test_tool_searches_per_criterion_and_stores_the_result(ctx, monkeypatch):
@@ -256,7 +257,9 @@ def test_tool_searches_per_criterion_and_stores_the_result(ctx, monkeypatch):
     assert searched == ["Does Figma build software?", "Is Figma large?"]
     assert judged_with["chunk_ids"] == ["figma-about#000"]  # deduped across the two searches
     assert out["fit"] == "possible"
-    assert ctx.qualifications["L1"].fit == "possible"
+    stored = latest_qualification(ctx.conn, "L1")
+    assert (stored["fit"], stored["icp_version"]) == ("possible", "icp-test")
+    assert [c["met"] for c in stored["criteria"]] == ["yes", "yes", "unknown"]
 
 
 def test_poisoned_page_cannot_set_the_fit(ctx, monkeypatch):

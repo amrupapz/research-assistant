@@ -39,12 +39,13 @@ ON CONFLICT (chunk_id) DO UPDATE SET
 """
 
 
-def connect(url: str | None = None) -> psycopg.Connection:
+def connect(url: str | None = None, autocommit: bool = False) -> psycopg.Connection:
+    """autocommit=True for the agent: each `with conn.transaction():` block is then a real commit."""
     if url is None:
         from research_assistant.config import get_settings
 
         url = get_settings().database_url
-    return psycopg.connect(url)
+    return psycopg.connect(url, autocommit=autocommit)
 
 
 ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
