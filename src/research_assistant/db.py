@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import psycopg
 
-from research_assistant.schemas import Chunk
+from research_assistant.schemas import Chunk, Lead
 
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
@@ -22,7 +22,22 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
 ALTER TABLE chunks ADD COLUMN IF NOT EXISTS embedding vector({dims});
+CREATE TABLE IF NOT EXISTS leads (
+    lead_id  text PRIMARY KEY,
+    name     text NOT NULL,
+    title    text NOT NULL,
+    company  text NOT NULL,
+    email    text NOT NULL
+);
 """
+
+# Fictional contacts, one per company in data/. example.com is reserved: mail there goes nowhere.
+SEED_LEADS = [
+    Lead(lead_id="L1", name="Dana Kim", title="VP Engineering", company="Figma", email="dana.kim@example.com"),
+    Lead(lead_id="L2", name="Priya Raman", title="Head of Platform", company="Intel", email="priya.raman@example.com"),
+    Lead(lead_id="L3", name="Marco Silva", title="CTO", company="Linear", email="marco.silva@example.com"),
+    Lead(lead_id="L4", name="Jordan Lee", title="Engineering Manager", company="Vercel", email="jordan.lee@example.com"),
+]
 
 # On conflict, `chunks.x` is the existing row and `EXCLUDED.x` the new one.
 # Changed content -> stale embedding -> reset to NULL so embed_missing() redoes it.
@@ -64,6 +79,28 @@ def sync_chunks(conn: psycopg.Connection, chunks: list[Chunk]) -> int:
         return cur.rowcount
 
 
+def seed_leads(conn: psycopg.Connection, leads: list[Lead] = SEED_LEADS) -> None:
+    """Upsert the seed leads (running it twice changes nothing)."""
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO leads (lead_id, name, title, company, email)
+            VALUES (%(lead_id)s, %(name)s, %(title)s, %(company)s, %(email)s)
+            ON CONFLICT (lead_id) DO UPDATE SET
+                name = EXCLUDED.name, title = EXCLUDED.title,
+                company = EXCLUDED.company, email = EXCLUDED.email
+            """,
+            [lead.model_dump() for lead in leads],
+        )
+
+
+def fetch_lead(conn: psycopg.Connection, lead_id: str) -> Lead | None:
+    row = conn.execute(
+        "SELECT lead_id, name, title, company, email FROM leads WHERE lead_id = %s", (lead_id,)
+    ).fetchone()
+    return None if row is None else Lead(**dict(zip(Lead.model_fields, row, strict=True)))
+
+
 def embedding_input(title: str, text: str) -> str:
     """What we embed for a chunk: the title gives context the chunk text may lack (M1 gotcha)."""
     return f"{title}\n\n{text}"
@@ -99,8 +136,10 @@ def main() -> None:
         init_schema(conn, get_settings().embedding_dims)
         deleted = sync_chunks(conn, chunks)
         embedded = embed_missing(conn, embed)
+        seed_leads(conn)
         total = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
     print(f"synced {len(chunks)} chunks, deleted {deleted} stale, embedded {embedded}; table now has {total}")
+    print(f"seeded {len(SEED_LEADS)} leads")
 
 
 if __name__ == "__main__":

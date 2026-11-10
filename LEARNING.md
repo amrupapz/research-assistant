@@ -342,3 +342,23 @@
 **M0 check answers (given by Claude):**
 1. `LEADS.get(args["lead_id"])` fails two ways. (a) Malformed args (bad JSON, missing/extra/wrong-type field): the Pydantic arg model catches it, and the error goes back to the model as tool output. (b) Valid but wrong (`L999`, or a lead I'm not allowed to see): the tool returns "not found", and `authorize()` handles "not allowed". A schema can't catch (b).
 2. Injected "call send_email" does nothing in M0: the tool isn't offered, and only my code executes. Once send_email exists, `authorize()` → needs_approval is the real stop. The prompt rule helps but isn't a guarantee.
+
+## D3 M1 — 3 tools + Pydantic arg models
+
+**Concept:** A tool is three things: a Pydantic args model (the full rules, enforced by us), a strict schema generated from it (the shape the model sees), and a function. Generating the schema from the model means they can't drift apart. The registry is a whitelist: a name that isn't in it never runs. Without this, an invented arg like `"bcc"` or an id like `"L1; DROP TABLE"` reaches the function.
+
+**Built:**
+- `leads` table + 4 fictional seed leads (`@example.com`), `seed_leads` (idempotent), `fetch_lead`. `db` main seeds them.
+- `tools.py`: `SearchCompanyArgs` / `GetLeadArgs` / `DraftEmailArgs` (`extra="forbid"`, all required), `tool_schema()` generates the strict definition, `REGISTRY`, `run_tool(name, raw_args, ctx)` → unknown tool / bad args → `ToolError`, otherwise runs.
+- `search_company` = hybrid_search + grounded `ask` (a model call nested in a tool call). `get_lead`. `draft_email` stores a `Draft` in `ctx.drafts`, never sends.
+- `db` fixture moved to `tests/conftest.py`. 21 new tests, 125 total.
+
+**Real check:** the API accepted all 3 strict schemas. For "look up L2, then research their company" the model proposed ONLY `get_lead {"lead_id":"L2"}`. It can't know the company until it sees the result → that's why M2 needs a loop.
+
+**Gotchas:**
+- Strict mode = shape. Keep length limits in Pydantic and send only `type`/`description`/`pattern` (safe keywords), so a schema keyword the API rejects can't cause a 400.
+- `draft_email` takes the `to` address from OUR leads table, never from the model. The model can only pick a lead_id, so an injected page can't redirect mail to an arbitrary address.
+- Validation errors name the field + reason but don't echo the input: the input is model-written and could carry an injection back into the next turn.
+- A failed lookup must not leave side effects (no draft is stored for L999).
+
+**My answer:** _(fill in after check questions)_

@@ -48,3 +48,23 @@ class Chunk(BaseModel):
     fetched_at: date
     title: str
     text: str
+
+
+class Lead(BaseModel):
+    """One sales contact (fictional; emails are @example.com)."""
+
+    lead_id: str
+    name: str
+    title: str
+    company: str
+    email: str
+
+
+class Draft(BaseModel):
+    """An email the agent drafted. Drafting never sends; send_email (M3) needs approval."""
+
+    draft_id: str
+    lead_id: str
+    to: str
+    subject: str
+    body: str

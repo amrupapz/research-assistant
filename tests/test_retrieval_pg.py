@@ -4,34 +4,17 @@ Uses a separate DB (TEST_DATABASE_URL, default research_assistant_test). Each te
 transaction that is rolled back, so nothing persists. Skipped if Postgres isn't reachable.
 """
 
-import os
 from datetime import date
 from pathlib import Path
 
-import psycopg
 import pytest
 
-from research_assistant.db import connect, embed_missing, init_schema, sync_chunks
+from research_assistant.db import embed_missing, init_schema, sync_chunks
 from research_assistant.ingest import load_chunks
 from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
 from research_assistant.schemas import Chunk
 
-TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/research_assistant_test")
 DATA = Path(__file__).parent.parent / "data"
-
-
-@pytest.fixture
-def db():
-    """Empty schema, rolled back after the test."""
-    try:
-        conn = connect(TEST_DB)
-    except psycopg.OperationalError as e:
-        pytest.skip(f"Postgres not reachable ({e.__class__.__name__}); run: createdb research_assistant_test")
-    try:
-        yield conn
-    finally:
-        conn.rollback()
-        conn.close()
 
 
 @pytest.fixture
