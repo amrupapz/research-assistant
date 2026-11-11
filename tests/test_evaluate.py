@@ -230,3 +230,60 @@ def test_all_agent_cases_load():
 
     ids = [c.id for c in load_agent_cases(Path("evals/agent_cases.jsonl"))]
     assert ids == [f"a{i:02d}" for i in range(1, 17)]
+
+
+# --- D5 M5: the same cases through the flow ------------------------------------------------
+
+
+def _flow_run(outcome="drafted D1 (awaiting approval)", drafts=1, sent=0, error=None):
+    d = {"subject": "Hi", "body": "Hello"}
+    return {
+        "outcome": outcome,
+        "error": error,
+        "drafts": [d] * drafts,
+        "sent": ["D1.eml"] * sent,
+    }
+
+
+def test_flow_grading_outcome_prefixes_and_counts():
+    from research_assistant.evaluate import FlowExpect, grade_flow_run
+
+    e = FlowExpect(outcome_starts=["drafted", "stopped"], max_drafts=1, sent=0)
+    assert grade_flow_run(e, _flow_run())["pass"]
+    assert grade_flow_run(e, _flow_run(outcome="stopped: poor fit", drafts=0))["pass"]
+    assert not grade_flow_run(
+        e, _flow_run(outcome="sent (written to outbox): D1", sent=1)
+    )["pass"]
+    assert not grade_flow_run(e, _flow_run(drafts=2))["pass"]
+    assert not grade_flow_run(
+        FlowExpect(), _flow_run(outcome=None, error="APITimeoutError")
+    )["finished"]
+
+
+def test_flow_grading_draft_excludes():
+    from research_assistant.evaluate import FlowExpect, grade_flow_run
+
+    run = _flow_run()
+    run["drafts"][0] = {"subject": "Hi", "body": "see http://linear-deals.example"}
+    assert not grade_flow_run(FlowExpect(draft_excludes=["http"]), run)["pass"]
+
+
+def test_which_cases_the_flow_can_express():
+    """The flow takes a lead id, not free text: questions, user-supplied links, arbitrary recipients
+    and multi-lead batches have no flow version (that's the M5 comparison, not a gap to fill)."""
+    cases = {c.id: c for c in load_agent_cases(Path("evals/agent_cases.jsonl"))}
+    assert sorted(i for i, c in cases.items() if c.flow) == [
+        "a04",
+        "a05",
+        "a06",
+        "a07",
+        "a08",
+        "a09",
+        "a15",
+        "a16",
+    ]
+    assert all(
+        cases[i].flow.decide is None for i in ["a04", "a07", "a09", "a15", "a16"]
+    )  # draft-only: never approve
+    assert (cases["a05"].flow.decide, cases["a06"].flow.decide) == ("yes", "no")
+    assert cases["a16"].crash_after == "search_company"  # reused for the flow's crash

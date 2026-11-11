@@ -112,6 +112,24 @@ class AgentSetup(BaseModel):
     replies: list[PastEvent] = []  # a reply recorded from this lead, N days ago
 
 
+class FlowExpect(BaseModel):
+    """What the LangGraph flow must do for the same case (D5 M5). Only the checks set are graded."""
+
+    outcome_starts: list[str] = []  # the outcome starts with ONE of these, e.g. ["drafted", "stopped"]
+    drafts: int | None = None
+    max_drafts: int | None = None  # e.g. 1: "at most one", when a poor fit may stop before drafting
+    draft_excludes: list[str] = []
+    sent: int | None = None
+
+
+class FlowSpec(BaseModel):
+    """How the flow runs a case. The flow takes a lead id, not free text: no `task`."""
+
+    lead_id: str
+    decide: Literal["yes", "no"] | None = None  # at approve; None = leave it waiting (draft-only tasks)
+    expect: FlowExpect = FlowExpect()
+
+
 class AgentCase(BaseModel):
     id: str
     task: str
@@ -120,6 +138,7 @@ class AgentCase(BaseModel):
     crash_after: str | None = None  # M7: crash right after this tool's step commits, then --resume
     expect: AgentExpect
     observe: list[str] = []  # strings to REPORT if they appear in a draft (not graded), e.g. "30%"
+    flow: FlowSpec | None = None  # D5 M5: the same case for the LangGraph flow (None: the flow can't express it)
 
 
 def load_agent_cases(path: Path) -> list[AgentCase]:
@@ -185,3 +204,24 @@ def observations(case: AgentCase, run: dict) -> list[str]:
     """Which `observe` strings showed up in any draft (reported, not graded)."""
     texts = " ".join(f"{d['subject']} {d['body']}" for d in run["drafts"]).lower()
     return [s for s in case.observe if s.lower() in texts]
+
+
+def grade_flow_run(expect: FlowExpect, run: dict) -> dict[str, bool]:
+    """Named checks on one flow run. Pure: run = {"outcome": str | None, "error": str | None,
+    "drafts": [Draft dicts], "sent": [filenames]}."""
+    checks: dict[str, bool] = {"finished": run["error"] is None}
+    outcome = run["outcome"] or ""
+    if expect.outcome_starts:
+        checks["outcome"] = any(outcome.startswith(p) for p in expect.outcome_starts)
+    drafts = run["drafts"]
+    if expect.drafts is not None:
+        checks[f"drafts_{expect.drafts}"] = len(drafts) == expect.drafts
+    if expect.max_drafts is not None:
+        checks[f"max_drafts_{expect.max_drafts}"] = len(drafts) <= expect.max_drafts
+    texts = [f"{d['subject']}\n{d['body']}".lower() for d in drafts]
+    for bad in expect.draft_excludes:
+        checks[f"draft_excludes_{bad}"] = all(bad.lower() not in t for t in texts)
+    if expect.sent is not None:
+        checks[f"sent_{expect.sent}"] = len(run["sent"]) == expect.sent
+    checks["pass"] = all(checks.values())
+    return checks

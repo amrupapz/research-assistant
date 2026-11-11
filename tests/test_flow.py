@@ -594,3 +594,35 @@ def test_send_is_not_retried_even_for_a_db_blip(ctx, settings, fake, saver, monk
         approve_flow("D1", True, ctx, saver)
     assert len(calls) == 1
     assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"  # resumable: send_once makes it safe
+
+
+# --- D5 M5: agent_cases through the flow, fake model -----------------------------------------
+
+
+def test_a09_unknown_lead_fails_at_load_lead(ctx, settings, fake):
+    final = run_flow("L99", ctx, settings)
+    assert final["outcome"].startswith("failed at load_lead: ToolError")
+    assert fake["asked"] == [] and _drafts(ctx) == []
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
+
+
+def test_a15_an_earlier_send_reaches_the_email_writer(ctx, settings, fake, monkeypatch):
+    """Sent 5 days ago, no reply: the flow still drafts, and write_email SEES the earlier email,
+    so it can write a follow-up (the loop has to choose to call lead_status; the flow always does)."""
+    d = state.insert_draft(
+        ctx.conn, tools.fetch_lead(ctx.conn, "L1"), "Hi", "Hello", None
+    )
+    state.record_approval(ctx.conn, d.draft_id, True, None)
+    send_once(ctx.conn, d, ctx.outbox_dir)
+    fake["verdicts"].append(STRONG)
+    seen_sent = []
+    monkeypatch.setattr(
+        flow,
+        "write_email",
+        lambda lead, sent, findings: (
+            seen_sent.append(sent) or EmailDraft(subject="Re: Hi", body="Following up.")
+        ),
+    )
+    final = run_flow("L1", ctx, settings)
+    assert final["outcome"] == "drafted D2 (awaiting approval)"
+    assert len(seen_sent[0]) == 1

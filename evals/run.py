@@ -4,6 +4,8 @@
   uv run python evals/run.py --stage answers        # ~1 model call per question
   uv run python evals/run.py --stage answers --only q07b --repeat 5   # measure a flaky case
   uv run python evals/run.py --stage agent --repeat 3   # agent trajectories, ~4-6 model calls per run
+  uv run python evals/run.py --stage flow               # the same cases through the LangGraph flow (D5 M5)
+  uv run python evals/run.py --compare                  # latest agent vs flow result per case, side by side
 
 Each case appends one JSON line to runs/evals.jsonl (tagged with stage + PROMPT_VERSION).
 """
@@ -11,12 +13,15 @@ Each case appends one JSON line to runs/evals.jsonl (tagged with stage + PROMPT_
 import argparse
 import json
 import tempfile
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from research_assistant import flow
 from research_assistant.agent import (
     MaxStepsError,
     ResumeError,
@@ -24,10 +29,12 @@ from research_assistant.agent import (
     resume_agent,
     run_agent,
 )
+from research_assistant.config import get_settings
 from research_assistant.db import connect, fetch_lead
 from research_assistant.evaluate import (
     grade_agent_run,
     grade_answer,
+    grade_flow_run,
     load_agent_cases,
     load_cases,
     observations,
@@ -203,6 +210,24 @@ def _records_from_db(conn, run_id) -> list[dict]:
     ]
 
 
+@contextmanager
+def measured():
+    """Model calls / tokens / wall time while the block runs, read from the run-log lines it appends."""
+    log = get_settings().runs_dir / f"{datetime.now(UTC):%Y-%m-%d}.jsonl"  # (a case spanning midnight: undercounted)
+    start_size = log.stat().st_size if log.exists() else 0
+    start = time.perf_counter()
+    usage: dict = {}
+    yield usage
+    new = log.read_text(encoding="utf-8")[start_size:] if log.exists() else ""  # ASCII JSON: chars == bytes
+    calls = [r for r in map(json.loads, new.splitlines()) if r.get("kind") != "tool_call"]
+    usage.update(
+        model_calls=len(calls),
+        input_tokens=sum(r.get("input_tokens") or 0 for r in calls),
+        output_tokens=sum(r.get("output_tokens") or 0 for r in calls),
+        seconds=round(time.perf_counter() - start, 1),
+    )
+
+
 def run_agent_case(conn, case) -> dict:
     """One real agent run with a TEMP outbox and a scripted approver. Returns plain data for grading.
 
@@ -215,7 +240,7 @@ def run_agent_case(conn, case) -> dict:
     # (Found in M7: a real reply from L1 in the dev DB made a12/a15/a16 "fail" correctly.)
     # TRUNCATE is transactional in Postgres, so the rollback below restores everything.
     conn.execute(f"TRUNCATE {AGENT_TABLES} RESTART IDENTITY")
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, measured() as usage:
         # Setup emails go to their own outbox: `sent` counts only the task's emails.
         apply_setup(conn, case.setup, Path(tmp) / "setup-outbox")
         ctx = ToolContext(conn=conn, outbox_dir=Path(tmp) / "outbox")
@@ -255,6 +280,7 @@ def run_agent_case(conn, case) -> dict:
         "answer": answer,
         "error": error,
         "asked": len(asked),
+        "usage": usage,
     }
 
 
@@ -291,6 +317,7 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> Non
                     "drafts": run["drafts"],
                     "sent": run["sent"],
                     "asked": run["asked"],
+                    **run["usage"],
                 }
             )
     print(f"\n{'case':<6}{'pass':>8}   observed in drafts (not graded)")
@@ -302,11 +329,119 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> Non
     print(f"\n{sum(total)}/{len(total)} runs passed (prompt {AGENT_PROMPT_VERSION})")
 
 
+@contextmanager
+def crash_after(tool: str | None):
+    """The flow's version of an agent case's crash_after: die right after `tool` first returns."""
+    if tool is None:
+        yield
+        return
+    real, done = flow.call_tool, []
+
+    def call_tool(ctx, name, args):
+        out = real(ctx, name, args)
+        if name == tool and not done:
+            done.append(name)
+            raise KeyboardInterrupt  # a crash: not an Exception, so guarded() lets it through
+        return out
+
+    flow.call_tool = call_tool
+    try:
+        yield
+    finally:
+        flow.call_tool = real
+
+
+def run_flow_case(conn, case) -> dict:
+    """One real flow run for a case, same isolation as run_agent_case (TRUNCATE + rollback).
+
+    In-memory checkpointer: nothing commits. (Postgres checkpoints + a new process are covered by
+    tests/test_flow.py; here a crash is resumed in the same process.)"""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    spec = case.flow
+    conn.execute("SELECT 1")
+    conn.execute(f"TRUNCATE {AGENT_TABLES} RESTART IDENTITY")
+    saver = InMemorySaver()
+    outcome, error = None, None
+    with tempfile.TemporaryDirectory() as tmp, measured() as usage:
+        apply_setup(conn, case.setup, Path(tmp) / "setup-outbox")
+        ctx = ToolContext(conn=conn, outbox_dir=Path(tmp) / "outbox")
+        try:
+            try:
+                with crash_after(case.crash_after):
+                    final = flow.run_flow(spec.lead_id, ctx, checkpointer=saver)
+            except KeyboardInterrupt:
+                final = flow.resume_flow(ctx.run_id, ctx, saver)
+            draft_id = (final.get("draft") or {}).get("draft_id")
+            if spec.decide and draft_id and "approved" not in final:
+                final = flow.approve_flow(draft_id, spec.decide == "yes", ctx, saver)
+            outcome = final.get("outcome")
+        except Exception as e:  # noqa: BLE001 -- transient errors that survived retries: report, go on
+            error = f"{type(e).__name__}: {e}"
+        sent = sorted(f.name for f in ctx.outbox_dir.glob("*.eml")) if ctx.outbox_dir.exists() else []
+        drafts = [d.model_dump() for d in list_drafts(conn, ctx.run_id)] if ctx.run_id else []
+    conn.rollback()
+    return {"outcome": outcome, "error": error, "drafts": drafts, "sent": sent, "usage": usage}
+
+
+def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> None:
+    cases = [c for c in load_agent_cases(AGENT_CASES) if c.flow and (not only or c.id in only)]
+    tally: dict[str, list[bool]] = defaultdict(list)
+    for _ in range(repeat):
+        for case in cases:
+            run = run_flow_case(conn, case)
+            checks = grade_flow_run(case.flow.expect, run)
+            tally[case.id].append(checks["pass"])
+            failed = [n for n, ok in checks.items() if not ok and n != "pass"]
+            u = run["usage"]
+            print(
+                f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id}  {run['outcome'] or run['error']}"
+                f"  ({u['model_calls']} calls, {u['seconds']}s)  {', '.join(failed)}",
+                flush=True,
+            )
+            _write(
+                {
+                    "stage": "flow",
+                    "prompt_version": flow.FLOW_VERSION,
+                    "case": case.id,
+                    **checks,
+                    "outcome": run["outcome"],
+                    "error": run["error"],
+                    "drafts": run["drafts"],
+                    "sent": run["sent"],
+                    **u,
+                }
+            )
+    skipped = [c.id for c in load_agent_cases(AGENT_CASES) if not c.flow]
+    total = [ok for runs in tally.values() for ok in runs]
+    print(f"\n{sum(total)}/{len(total)} runs passed ({flow.FLOW_VERSION}); not expressible as a flow: {', '.join(skipped)}")
+
+
+def compare() -> None:
+    """Latest agent and flow record per case, side by side (no API calls)."""
+    latest: dict[tuple[str, str], dict] = {}
+    for line in OUT.read_text(encoding="utf-8").splitlines() if OUT.exists() else []:
+        r = json.loads(line)
+        if r.get("stage") in ("agent", "flow"):
+            latest[(r["stage"], r["case"])] = r
+
+    def cell(r: dict | None) -> str:
+        if r is None:
+            return f"{'-':<28}"
+        calls = r.get("model_calls", "?")
+        tokens = (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) if "input_tokens" in r else "?"
+        return f"{'PASS' if r['pass'] else 'FAIL'} {calls:>3} calls {tokens!s:>6} tok {r.get('seconds', '?')!s:>5}s"
+
+    print(f"{'case':<6}{'agent (loop)':<34}{'flow (graph)':<34}")
+    for case in load_agent_cases(AGENT_CASES):
+        print(f"{case.id:<6}{cell(latest.get(('agent', case.id))):<34}{cell(latest.get(('flow', case.id))):<34}")
+    print("(agent rows from before M5 have no calls/tokens: rerun --stage agent once)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--stage", choices=["retrieval", "answers", "agent"], required=True
-    )
+    parser.add_argument("--stage", choices=["retrieval", "answers", "agent", "flow"])
+    parser.add_argument("--compare", action="store_true", help="agent vs flow, from runs/evals.jsonl")
     parser.add_argument(
         "--only", nargs="*", help="case ids to run, e.g. --only q07 q07b"
     )
@@ -314,11 +449,17 @@ def main() -> None:
         "--repeat", type=int, default=1, help="run each case N times (flakiness)"
     )
     args = parser.parse_args()
+    if args.compare:
+        return compare()
+    if not args.stage:
+        parser.error("give --stage or --compare")
     with connect() as conn:
         if args.stage == "retrieval":
             run_retrieval(conn)
         elif args.stage == "agent":
             run_agent_evals(conn, only=args.only, repeat=args.repeat)
+        elif args.stage == "flow":
+            run_flow_evals(conn, only=args.only, repeat=args.repeat)
         else:
             run_answers(conn, only=args.only, repeat=args.repeat)
 

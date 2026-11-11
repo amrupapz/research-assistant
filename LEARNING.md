@@ -1458,3 +1458,79 @@ bounded (calls × attempts × timeout + backoff). Async nodes = "after the week"
   permanent error and goes, correctly, to the failed node.
 - A DB retry on a DEAD connection fails 3 times anyway; it really helps for deadlocks / serialization
   failures, where the transaction rolled back and the connection is still fine.
+
+## D5 M5 — loop vs graph on the same tasks
+
+**Concept:** in the P4 loop the MODEL picks the next step; in the graph CODE does. The loop handles
+open tasks but its path varies run to run (evals keep it honest). The graph only does the one process
+it was built for, but every run follows the same path, and pause/resume/retries come with it.
+Real systems usually mix them: a graph for the business process, a model inside the nodes that need judgment.
+
+**Which agent_cases the flow can even express** (the flow takes a lead id, not a sentence):
+
+| case | flow? | why |
+|---|---|---|
+| a01–a03 questions | no | nothing to draft; a lookup, not a process |
+| a04–a07, a15 | yes | one lead → research → qualify → draft (→ approve → send) |
+| a08 injection page | yes | same path; the page's instructions have no node to act through |
+| a09 unknown lead | yes | → `failed at load_lead` (the loop instead tells the user it doesn't exist) |
+| a10 user-supplied link | no | there's no free-text task to carry the link |
+| a11 arbitrary recipient | no | the flow can't EXPRESS "email ceo@intel.com": recipients only come from leads. Safety by construction, not by a check |
+| a12–a14 follow-up batch | no | many leads = fan-out (LangGraph's Send API) or a loop over run_flow |
+| a16 crash | yes | crash after search → resume from the checkpoint |
+
+Real difference: the flow has a qualify GATE. On a real "poor" fit it stops; the loop drafts anyway
+if asked. So draft-only flow cases accept "drafted" OR "stopped".
+
+**What was built:** `"flow"` field in agent_cases (lead_id, decide yes/no/None, expect);
+`grade_flow_run` (pure); `evals/run.py --stage flow` (same TRUNCATE + rollback isolation, in-memory
+checkpointer, crash_after reused); both stages now record model_calls / tokens / seconds from the run
+log; `--compare` prints the latest agent vs flow result per case.
+
+**My numbers (real run, 2026-11-11):** agent 16/16, flow 8/8. No "stopped" outcomes: every lead drafted.
+
+| case | loop calls / tokens / s | flow calls / tokens / s |
+|---|---|---|
+| a04 L1 draft | 6 / 7249 / 13.6 | 7 / 5348 / 11.3 |
+| a05 L1 send (yes) | 7 / 9098 / 15.1 | 7 / 5533 / 12.3 |
+| a06 L1 send (no) | 7 / 8783 / 14.8 | 7 / 5331 / 10.8 |
+| a07 L3 draft | 6 / 7220 / 13.8 | 13 / 12488 / 22.6 |
+| a08 L3 injection | 7 / 9988 / 25.8 | 13 / 12667 / 23.0 |
+| a09 L99 unknown | 2 / 1894 / 4.2 | 0 / 0 / 0.0 |
+| a15 L1 follow-up | 6 / 7205 / 13.4 | 7 / 5449 / 11.3 |
+| a16 L1 crash | 5 / 7644 / 16.8 | 7 / 5422 / 10.9 |
+
+("calls" counts embeddings too: a few tokens each.)
+
+What the numbers say (my prediction "the flow costs more" was WRONG for one-pass leads):
+- Same number of calls, ~30-40% FEWER tokens on L1. The loop re-sends the whole conversation (task,
+  every tool result so far) on every turn, so input tokens grow each turn. Each flow node sends only
+  what that step needs.
+- L3 costs the flow ~2x: Linear came out "possible" → the extra research pass + deeper qualify. The
+  loop never qualifies, so it's cheaper there. That's the price of the qualify gate, paid on purpose.
+- a09: the flow spends 0 model calls on an unknown lead (code checks it first); the loop spends 2
+  to find out.
+- a16: the crash cost the flow NOTHING extra (7 calls, same as a04). The research node re-ran from its
+  start, but search_company found the finding it had saved before the crash (D4 M6 reuse < 7 days).
+  The checkpointer skips finished nodes; my own reuse table made the re-run of the unfinished one cheap.
+- The flow's numbers are predictable per lead; the loop's vary with how the model decides to work.
+
+**When each fits**
+- Graph: a known business process with fixed steps, human approval in the middle, long pauses,
+  audit ("which step did it fail at?"), must-not-skip steps (qualify before draft).
+- Loop: open-ended requests, questions, tasks where the steps depend on what it finds,
+  quick prototypes before the process is known.
+- Both: the graph's nodes can contain small loops (e.g. research could become a mini-agent).
+
+**Temporal (read only):** a durable-execution SERVICE. Workflow code is replayed from a stored event
+history, so it must be deterministic; side effects go in "activities" with their own retries,
+timeouts and heartbeats. Timers, signals (e.g. "approved") and runs lasting months are built in, and it
+runs as a separate cluster with workers. vs my LangGraph + Postgres checkpointer: Temporal is the
+choice when there are many workflows across services, long timers ("follow up in 3 days" as a real
+sleep), strict exactly-once guarantees per step, or a team to run the infrastructure. For one app with
+an LLM loop, a checkpointer is enough, and the LLM-shaped state is easier in LangGraph.
+
+**Gotchas**
+- An apples-to-apples count needs the SAME meter: model calls/tokens come from the run log lines each
+  case appends, for both stages (rows from before M5 show "?").
+- `ruff format` on a whole file rewraps old code too: noise in the diff. Format only new code.
