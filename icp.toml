@@ -12,7 +12,7 @@
 #   every must = yes and a nice = yes  -> strong   (or no nice criteria at all)
 #   anything else                      -> possible (unknown is NOT no)
 
-version = "icp-v1"
+version = "icp-v2"  # D6 M5: software_org question reworded (see below)
 product = "A developer-productivity platform for engineering teams (assumed for this project)."
 
 [[criteria]]
@@ -34,7 +34,10 @@ titles = [
 id = "software_org"
 must = true
 check = "evidence"
-question = "Does {company} build its own software products with in-house engineering teams?"
+# icp-v2 (D6 M5): v1 also asked "with in-house engineering teams". Only Figma's pages say that, so
+# Linear and Vercel came back unknown (Vercel flipping strong/possible run to run): the clause measured
+# what the PAGES mention, not what the company does. Evals qf03/qf04 caught it.
+question = "Does {company} build and ship its own software products?"
 
 [[criteria]]
 id = "scale"

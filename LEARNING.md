@@ -1826,3 +1826,19 @@ limit passes); collect every reason, don't stop at the first; return (not reason
   and every gated run must use the same --repeat.
 - The fix: icp-v2 rewords software_org to "Does {company} build and ship its own software
   products?" (v1's "with in-house engineering teams" is a fact only Figma's pages state).
+- **Gate after icp-v2: FAIL** (batch 20261111T075745 vs baseline). The fix itself worked:
+  qualify 72% → 100% (qf03/qf04 3/3, Intel still unknown 3/3), prompt_injection 60 → 80%,
+  straightforward 97 → 100%, and a bonus: flow p95 24.1s → 15.0s, 7.8 → 6.3 calls (Linear is now
+  "strong" → no extra research pass). But two reasons fired, both in ANSWERS, which never reads icp.toml:
+  1. answers usd_p50 6.8e-5 → 1.2e-4 (+83%): prompt-cache TIMING. Baseline ran minutes after the M4
+     run → ~100% of ask's input was cached; this run 67%. Same code, same tokens, different bill.
+     → $ is a bad gate metric with caching; tokens per run isn't cache-dependent.
+  2. conflicting_info 67% → 44%: q07/q07b failed no_unsupported_claims. The judge flagged the
+     answer's own REASONING ("I trust the company's figure more because it is first-party") and a
+     sentence that says "the figures conflict" while citing only ONE of the two chunks. Both are
+     things the system prompt REQUIRES in a conflict answer. The judge was calibrated on factual
+     claims only (18), never on reasoning/comparison sentences → false positives, surfacing by luck
+     of phrasing (baseline passed 6/6). Same lesson as drafts in M3: calibrate on what you grade.
+- The gate did its job: it said "something moved, look". Looking showed the CHANGE was fine and
+  two GATE INPUTS were flawed. A FAIL is a question, not a verdict. Also: 9 runs per category means
+  one flip = 11 points > the 0.10 tolerance → small categories need more cases.
