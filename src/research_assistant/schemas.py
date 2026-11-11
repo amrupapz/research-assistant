@@ -97,3 +97,11 @@ class Qualification(BaseModel):
     fit: Fit
     criteria: list[CriterionResult]
     icp_version: str
+
+
+class EmailDraft(BaseModel):
+    """The model's structured output for the workflow's draft node. Still goes through draft_email's
+    validation (no links, no addresses, no invisible characters) before it's stored."""
+
+    subject: str = Field(description="One-line subject, under 100 characters.")
+    body: str = Field(description="Plain-text email body, under 150 words. No links, no email addresses.")

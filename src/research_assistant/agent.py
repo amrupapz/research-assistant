@@ -25,6 +25,7 @@ from research_assistant.llm import (
 from research_assistant.log import log_run
 from research_assistant.permissions import Decision, ToolCall, authorize
 from research_assistant.prompts import AGENT_PROMPT_VERSION
+from research_assistant.qualify import fit_warning
 from research_assistant.tools import (
     REGISTRY,
     ToolContext,
@@ -370,6 +371,14 @@ def _already_sent_note(ctx: ToolContext, args) -> str:
     )
 
 
+def _fit_warnings(ctx: ToolContext, draft) -> list[str]:
+    """D5 decision: a lead drafted on a POSSIBLE fit is flagged with its unknown criteria."""
+    if draft is None:
+        return []
+    warning = fit_warning(state.latest_qualification(ctx.conn, draft.lead_id))
+    return [warning] if warning else []
+
+
 def _ledger_warnings(ctx: ToolContext, draft) -> list[str]:
     """What the sends ledger says about this draft: approving must never look like it will send
     something that won't be sent (or might already have been)."""
@@ -390,7 +399,7 @@ def cli_approve(call: ToolCall, ctx: ToolContext, input_fn: Callable[[str], str]
     """Show what will REALLY happen (from our own store, not the model's words) and ask y/N."""
     print(f"\n=== APPROVAL NEEDED: {call.name} ===", file=sys.stderr)
     draft = state.get_draft(ctx.conn, call.args.draft_id) if call.name == "send_email" and call.args else None
-    for w in [*_ledger_warnings(ctx, draft), *ctx.warnings]:
+    for w in [*_ledger_warnings(ctx, draft), *_fit_warnings(ctx, draft), *ctx.warnings]:
         print(f"⚠ {w}", file=sys.stderr)
     if draft is not None:
         print(f"To: {draft.to}\nSubject: {draft.subject}\n\n{draft.body}\n", file=sys.stderr)

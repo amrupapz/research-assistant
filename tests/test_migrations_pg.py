@@ -19,7 +19,8 @@ MEMORY = {"replies"}
 def _tables(url: str) -> set[str]:
     with connect(url) as conn:
         rows = conn.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public'").fetchall()
-    return {r[0] for r in rows} - {"alembic_version"}
+    # LangGraph's checkpoint tables (D5 M2) live in the same DB but aren't Alembic's: ignore them.
+    return {r[0] for r in rows if not r[0].startswith("checkpoint")} - {"alembic_version"}
 
 
 def _revision(url: str) -> str | None:

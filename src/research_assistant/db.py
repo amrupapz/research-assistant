@@ -145,6 +145,10 @@ def main() -> None:
         total = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
     print(f"synced {len(chunks)} chunks, deleted {deleted} stale, embedded {embedded}; table now has {total}")
     print(f"seeded {len(SEED_LEADS)} leads")
+    from research_assistant.flow import setup_checkpointer
+
+    setup_checkpointer(settings.database_url)
+    print("checkpoint tables ready (LangGraph's own, not Alembic's)")
 
 
 if __name__ == "__main__":

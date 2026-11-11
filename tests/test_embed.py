@@ -96,3 +96,13 @@ def test_401_is_not_retried(tmp_path):
         embed(["a"], client=client, settings=_settings(tmp_path))
     assert client.embeddings.create.call_count == 1
     assert _log(tmp_path)[0]["status"] == "error"
+
+
+def test_ctrl_c_is_logged_as_interrupted_and_not_retried(tmp_path):
+    client = MagicMock()
+    client.embeddings.create.side_effect = KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        embed(["a"], client=client, settings=_settings(tmp_path))
+    assert client.embeddings.create.call_count == 1
+    [rec] = _log(tmp_path)
+    assert rec["status"] == "interrupted"

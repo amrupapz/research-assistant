@@ -116,6 +116,10 @@ class ToolContext:
     outbox_dir: Path = Path("outbox")  # "sending" = writing a .eml file here; never real email
     warnings: list[str] = field(default_factory=list)  # shown at approval time; rebuilt from run_steps on resume
     icp_path: Path = Path("icp.toml")
+    # Set by CODE (the D5 workflow), never by the model: a deeper, fresh qualification on the extra
+    # research pass. Defaults = the P4 behavior.
+    qualify_k: int = 4  # chunks retrieved per ICP criterion
+    reuse_qualification: bool = True  # reuse one < 7 days old (M6)
 
 
 def _lead_or_error(ctx: ToolContext, lead_id: str) -> Lead:
@@ -163,7 +167,9 @@ def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
     """Score a lead against icp.toml: title checked in code, evidence judged by the model, fit by code."""
     lead = _lead_or_error(ctx, args.lead_id)
     icp = load_icp(ctx.icp_path)
-    reused = state.reusable_qualification(ctx.conn, lead.lead_id, icp.version)  # M6: < 7 days, same ICP
+    reused = (
+        state.reusable_qualification(ctx.conn, lead.lead_id, icp.version) if ctx.reuse_qualification else None
+    )  # M6: < 7 days, same ICP
     if reused is not None:
         return {
             "lead_id": lead.lead_id,
@@ -176,7 +182,7 @@ def qualify_lead(args: QualifyLeadArgs, ctx: ToolContext) -> dict:
     criteria = icp.evidence_criteria()
     chunks = {}  # one search per criterion, deduped, in first-seen order
     for c in criteria:
-        for chunk, _ in hybrid_search(ctx.conn, c.question_for(lead.company), k=4):
+        for chunk, _ in hybrid_search(ctx.conn, c.question_for(lead.company), k=ctx.qualify_k):
             chunks.setdefault(chunk.chunk_id, chunk)
     judgment = judge_icp(lead.company, [(c.id, c.question_for(lead.company)) for c in criteria], list(chunks.values()))
     result = qualify(lead, icp, judgment.results, set(chunks))

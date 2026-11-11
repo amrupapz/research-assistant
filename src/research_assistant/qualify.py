@@ -116,3 +116,13 @@ def qualify(lead: Lead, icp: Icp, judged: list[CriterionResult], retrieved_ids: 
         criteria=results,
         icp_version=icp.version,
     )
+
+
+def fit_warning(qualification: dict | None) -> str | None:
+    """The approval-screen flag for a lead drafted on a POSSIBLE fit (D5 M1 decision), e.g.
+    "possible fit: scale=unknown, dev_tooling=unknown". None for strong/poor/no qualification."""
+    if not qualification or qualification.get("fit") != "possible":
+        return None
+    unknown = [c["id"] for c in qualification.get("criteria", []) if c.get("met") == "unknown"]
+    detail = ", ".join(f"{cid}=unknown" for cid in unknown) or "no criterion is unknown"
+    return f"possible fit: {detail}"
