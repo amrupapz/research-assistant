@@ -1842,3 +1842,38 @@ limit passes); collect every reason, don't stop at the first; return (not reason
 - The gate did its job: it said "something moved, look". Looking showed the CHANGE was fine and
   two GATE INPUTS were flawed. A FAIL is a question, not a verdict. Also: 9 runs per category means
   one flip = 11 points > the 0.10 tolerance → small categories need more cases.
+- **Fixing the gate's inputs** (after the override):
+  - gate on tokens_p50 per stage, not $ (total tokens incl. cached → cache timing can't move it);
+    $ stays in the report and snapshot for humans.
+  - an answer's cited sentence is judged against EVERY chunk the answer cites ("so the figures
+    conflict" needs both numbers); uncited sentences stay unjudged.
+  - judge-v4: the writer's reasoning/preference isn't checked, only facts inside it; dev j13–j15 =
+    the real false-alarm sentences, j16 = guard (wrong date inside reasoning must still fail).
+    Dev 16/16. k05 ("triple the customers", made up) came back partial once, then unsupported 3/3:
+    the JUDGE is non-deterministic too → one calibration pass can mislead; repeat suspicious items.
+- Validation = an A/A test: two full runs with NO change between them; run A = new baseline,
+  run B gated against it. A trustworthy gate must PASS when nothing changed.
+- **POLICY (my review of j13–j16, no label changes):** opinions/reasoning are unchecked, but every
+  factual premise inside them is checked (j16: wrong refresh month inside "I trust…" = unsupported).
+  Dev set is now 16/16 labels mine.
+- **A/A test: GATE PASS** (baseline 20261111T084244 vs 20261111T092002, nothing changed). tokens_p50
+  moved < 1% in every stage (the $ moved 83% last time); conflicting_info 67% = 67% (q07/q07b 6/6
+  under judge-v4; only q16 fails); freshness 77 → 73% and qualify p95 +19%: within tolerance.
+
+## Project 6 wrap-up (Day 6)
+
+**Built:** Langfuse tracing (one trace per run, seeded trace ids, runs.trace_id); 51 labelled cases
+in 7 categories + a qualify stage; a calibrated claim judge (judge-v4, dev 16/16 on my labels,
+unsupported fails answers, partial warns, drafts warn-only); a cost/latency report from traces
+(self-time split, human/grader excluded); a committed baseline + regression gate (regression_gate
+written by Claude at my request), validated by an A/A test; one real fix (icp-v2).
+**Biggest lessons:**
+- A label must come from the evidence, not world knowledge (Intel = unknown).
+- A failing eval can be a wrong label (a24), a flawed grader (judge on reasoning) or a flawed
+  metric ($ under caching) — investigate before believing it.
+- Tune on dev, measure on unseen holdout, run the holdout once; re-run the WHOLE dev set after
+  every prompt change (j08's rule moved j01).
+- Model time is 99%: optimise calls/tokens, not the DB.
+- A gate is validated by an A/A test: it must stay quiet when nothing changed.
+**Open (carried, see CLAUDE.md "After the week"):** 30% injection (source vetting), follow-up cap,
+small conflicting_info category, judge on drafts, holdout h01–h06 unreviewed, q15 flaky.

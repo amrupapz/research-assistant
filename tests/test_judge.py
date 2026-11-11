@@ -159,7 +159,8 @@ def test_calibration_claims_point_at_real_chunks():
 
 def test_judge_v3_carries_the_calibration_rules():
     """Changing the judge's rules = a new JUDGE_PROMPT_VERSION, so old calibration results stay comparable."""
-    assert JUDGE_PROMPT_VERSION == "judge-v3"
+    assert JUDGE_PROMPT_VERSION == "judge-v4"
+    assert "own reasoning or preference" in JUDGE_PROMPT  # v4 (M5: conflict answers)
     assert "rounded number counts as partial" in JUDGE_PROMPT  # v2 (j05)
     assert "whole claim is unsupported" in JUDGE_PROMPT  # v2 (j08: contradicted)
     assert "main point is not stated" in JUDGE_PROMPT  # v3 (j08: missing)

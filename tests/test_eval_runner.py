@@ -172,3 +172,22 @@ def test_records_carry_the_process_batch(monkeypatch, tmp_path):
     import json
 
     assert json.loads(out.read_text())["batch"] == eval_run.BATCH
+
+
+def test_a_cited_sentence_is_judged_against_every_chunk_the_answer_cites():
+    """M5 false alarm: 'so the figures conflict [profile#000]' judged against ONE chunk can't see the other number."""
+    from datetime import date
+
+    from research_assistant.evaluate import split_claims
+    from research_assistant.schemas import Chunk
+
+    def ch(cid):
+        return Chunk(chunk_id=cid, source_url="https://x", fetched_at=date(2026, 1, 1), title="t", text=cid)
+
+    chunks = [ch("figma-about#000"), ch("figma-company-profile#000"), ch("never-cited#000")]
+    answer = "Figma reports 2,140 [figma-about#000]. An estimate says 1,870, so they conflict [figma-company-profile#000]. Hello."
+    chunks_for = eval_run.answer_evidence(answer, chunks)
+    first, second, greeting = split_claims(answer)
+    assert [c.chunk_id for c in chunks_for(second)] == ["figma-about#000", "figma-company-profile#000"]
+    assert chunks_for(first) == chunks_for(second)  # never the uncited 'never-cited#000'
+    assert chunks_for(greeting) == []  # uncited: not judged

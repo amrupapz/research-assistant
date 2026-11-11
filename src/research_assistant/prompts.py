@@ -153,7 +153,11 @@ def build_email_message(lead: dict, sent: list[dict], findings: list[dict], toda
 # fixed BEFORE the holdout claims were labelled. Don't tune further on the holdout: write new claims.
 # judge-v3: one more rule for dev j08 ("Tan previously ran VMware" -> v2 said partial: VMware is MISSING,
 # not contradicted). Main point not stated = unsupported. Tuned on dev only; holdout2 is now "seen".
-JUDGE_PROMPT_VERSION = "judge-v3"
+# judge-v4 (D6 M5): the gate's conflicting_info false alarm. The judge called an answer's own
+# REASONING ("I trust the first-party figure more") unsupported, though the system prompt requires it.
+# Rule: check the facts inside reasoning, not the opinion. Tuned on dev j13-j16; j16 guards that a
+# WRONG fact inside reasoning still fails.
+JUDGE_PROMPT_VERSION = "judge-v4"
 
 JUDGE_PROMPT = """\
 You check whether ONE claim is supported by the source chunks given with it. You judge support,
@@ -176,6 +180,10 @@ Rules that override the definitions above:
   unsupported, even when its other details are right.
 - partial is only for a claim whose main point IS stated, with a secondary detail missing, vague
   or less precise. Never for parts that are wrong.
+- The writer's own reasoning or preference ("I'd trust X more because it is first-party", "this is
+  the best evidence", "so the figures conflict") is not itself checked: judge only the facts inside
+  it. If those facts are stated, the claim is supported; if it has no facts at all, not_a_claim.
+  A wrong fact inside reasoning still makes the claim unsupported.
 
 reason: one short sentence naming what is or isn't in the chunks.
 Use only the chunks, never your own knowledge, even about well-known companies.

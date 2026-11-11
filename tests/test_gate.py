@@ -7,7 +7,10 @@ from research_assistant.gate import DEFAULT_TOLERANCE, regression_gate, snapshot
 
 BASE = {
     "categories": {"freshness": 0.70, "prompt_injection": 0.60, "straightforward": 1.0},
-    "stages": {"agent": {"seconds_p95": 20.0, "usd_p50": 0.0010}, "answers": {"seconds_p95": 5.0, "usd_p50": 0.0003}},
+    "stages": {
+        "agent": {"seconds_p95": 20.0, "tokens_p50": 10_000, "usd_p50": 0.0010},
+        "answers": {"seconds_p95": 5.0, "tokens_p50": 3_000, "usd_p50": 0.0003},
+    },
 }
 
 
@@ -71,9 +74,14 @@ def test_p95_at_the_limit_passes():
     assert regression_gate(BASE, current(agent_seconds_p95=25.0))[0]
 
 
-def test_cost_rising_past_the_tolerance_fails():
-    ok, reasons = regression_gate(BASE, current(answers_usd_p50=0.00037))  # limit 0.0003 * 1.2 = 0.00036
-    assert not ok and _reasons_mention(reasons, "answers", "usd")
+def test_tokens_rising_past_the_tolerance_fails():
+    ok, reasons = regression_gate(BASE, current(answers_tokens_p50=3_601))  # limit 3000 * 1.2 = 3600
+    assert not ok and _reasons_mention(reasons, "answers", "tokens")
+
+
+def test_dollars_alone_never_fail_the_gate():
+    """Same tokens, 2x the bill = prompt-cache timing (M5's false alarm), not a regression."""
+    assert regression_gate(BASE, current(answers_usd_p50=0.0006)) == (True, [])
 
 
 def test_a_missing_stage_fails():
@@ -84,13 +92,13 @@ def test_a_missing_stage_fails():
 
 
 def test_a_zero_baseline_has_no_relative_limit():
-    base = {"categories": {}, "stages": {"flow": {"seconds_p95": 0.0, "usd_p50": None}}}
-    cur = {"categories": {}, "stages": {"flow": {"seconds_p95": 3.0, "usd_p50": 0.001}}}
+    base = {"categories": {}, "stages": {"flow": {"seconds_p95": 0.0, "tokens_p50": None}}}
+    cur = {"categories": {}, "stages": {"flow": {"seconds_p95": 3.0, "tokens_p50": 5_000}}}
     assert regression_gate(base, cur) == (True, [])
 
 
 def test_every_problem_is_reported_not_just_the_first():
-    ok, reasons = regression_gate(BASE, current(cat_freshness=0.1, agent_seconds_p95=99, agent_usd_p50=1.0))
+    ok, reasons = regression_gate(BASE, current(cat_freshness=0.1, agent_seconds_p95=99, agent_tokens_p50=99_999))
     assert not ok and len(reasons) == 3
 
 
@@ -105,13 +113,13 @@ def test_tolerance_is_a_parameter():
 
 def test_snapshot_from_an_all_record_and_its_report():
     rec = {"batch": "b1", "categories": [{"category": "freshness", "passed": 7, "total": 10}]}
-    rep = {"batch": "b1", "stages": {"agent": {"seconds_p95": 20.8, "usd_p50": 0.00065, "cases": 24}}}
+    rep = {"batch": "b1", "stages": {"agent": {"seconds_p95": 20.8, "tokens_p50": 9500, "usd_p50": 0.00065, "cases": 24}}}
     snap = snapshot(rec, rep, {"icp": "icp-v1"})
     assert snap == {
         "batch": "b1",
         "versions": {"icp": "icp-v1"},
         "categories": {"freshness": 0.7},
-        "stages": {"agent": {"seconds_p95": 20.8, "usd_p50": 0.00065}},
+        "stages": {"agent": {"seconds_p95": 20.8, "tokens_p50": 9500, "usd_p50": 0.00065}},
     }
 
 

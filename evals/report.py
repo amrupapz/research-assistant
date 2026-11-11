@@ -79,11 +79,11 @@ def _s(x: float | None) -> str:
 
 def format_report(rep: dict) -> str:
     lines = ["", "PER STAGE (app time = wall - human approval - grader; $ excludes the grader)"]
-    lines.append(f"{'stage':<9}{'cases':>6}{'s p50':>8}{'s p95':>8}{'$ p50':>10}{'$ p95':>10}{'$ total':>10}{'calls':>7}")
+    lines.append(f"{'stage':<9}{'cases':>6}{'s p50':>8}{'s p95':>8}{'$ p50':>10}{'$ p95':>10}{'$ total':>10}{'calls':>7}{'tok p50':>9}")
     for s, st in rep["stages"].items():
         lines.append(
             f"{s:<9}{st['cases']:>6}{_s(st['seconds_p50']):>8}{_s(st['seconds_p95']):>8}"
-            f"{st['usd_p50']:>10.5f}{st['usd_p95']:>10.5f}{st['usd_total']:>10.4f}{st['model_calls_avg']:>7.1f}"
+            f"{st['usd_p50']:>10.5f}{st['usd_p95']:>10.5f}{st['usd_total']:>10.4f}{st['model_calls_avg']:>7.1f}{st.get('tokens_p50') or 0:>9.0f}"
         )
     lines += ["", "WHERE THE TIME GOES (share of app time)"]
     lines.append(f"{'stage':<9}" + "".join(f"{b:>11}" for b in perf.BUCKETS) + f"{'human s':>9}")
@@ -123,7 +123,9 @@ def observations(trace_id: str) -> list[dict]:
     """From the cache, else Langfuse. Only COMPLETE trees are cached (a lagging one is re-fetched)."""
     cached = CACHE / f"{trace_id}.json"
     if cached.exists():
-        return json.loads(cached.read_text())
+        obs = json.loads(cached.read_text())
+        if all("tokens" in o for o in obs):  # caches from before M5 have no tokens: re-fetch those
+            return obs
     obs = tracing.fetch_observations(trace_id)
     if obs and all(o["end"] is not None for o in obs):
         CACHE.mkdir(parents=True, exist_ok=True)

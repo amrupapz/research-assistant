@@ -6,7 +6,8 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 6 — Project 6 (evals + Langfuse). P1–P5 done — see LEARNING.md wrap-ups.
+CURRENT STAGE: Day 7 — P7/P8 (FastAPI + Docker + GitHub Actions + README). P1–P6 done — see LEARNING.md wrap-ups.
+Day 7 milestones: not written yet (plan first). CI runs `evals/gate.py` (see P6).
 Carried: `agent approve` should show the draft before deciding (see P5 wrap-up "Open").
 M8 (Gmail MCP) dropped: Google's Gmail MCP server looks gated to Workspace preview accounts;
 MCP experience comes from the Day 7 server. M9 and the rest: "After the week" under Day 6.
@@ -50,16 +51,21 @@ src/research_assistant/
   permissions.py authorize(ToolCall) -> allow | deny | needs_approval (default-deny)
   agent.py      `agent "task"`: loop, gate (validate -> authorize -> approve -> execute), cli_approve
   flow.py       LangGraph workflow: nodes, route_after_qualify, checkpointer, interrupt approval, guarded/failed
-  tracing.py    ONLY file importing langfuse: run_trace/observe/start_generation; no-op unless TRACING_ENABLED
+  tracing.py    ONLY file importing langfuse: run_trace/observe/start_generation/eval_trace/fetch_observations
+  perf.py       pure cost/latency from trace trees: decompose (self-time split), percentile, summaries
+  gate.py       regression_gate(baseline, current, tolerance) -> (ok, reasons); snapshot()
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
-evals/questions.jsonl  evals/agent_cases.jsonl  evals/run.py   data/ (saved company pages; linear-customers.md = injection test page)
+evals/questions.jsonl agent_cases.jsonl qualify_cases.jsonl judge_labels.jsonl (every case has a category)
+evals/run.py  report.py (cost/latency from traces)  gate.py (vs baseline.json)   data/ (saved pages; linear-customers.md = injection test page)
 runs/ (one JSONL record per request)   outbox/ ("sent" .eml files, gitignored)
 ```
 
 Commands: `uv run python -m research_assistant.db` (load + embed data/),
 `uv run ask "question"`, `uv run agent "task"`,
 `uv run python -m research_assistant.flow L4 | --resume <run_id>`, `uv run agent approve D20 y|n`,
-`uv run python evals/run.py --stage retrieval|answers|agent|flow [--only ids] [--repeat N]`, `--compare`.
+`uv run python evals/run.py --stage retrieval|answers|qualify|agent|flow|judge [--only ids] [--repeat N] [--judge]`,
+`--compare`, `--all` (judges answers); then `evals/report.py` and `evals/gate.py [--save-baseline]` (exit 1 = regression).
+Baseline + every gated run: `--all --repeat 3` (same --repeat, or the comparison is meaningless).
 
 ## Rules for every model call
 
@@ -81,7 +87,7 @@ Commands: `uv run python -m research_assistant.db` (load + embed data/),
   evidence → say so, needs_sources=true.
 - Evaluate retrieval and answers SEPARATELY. Bump PROMPT_VERSION when prompt/schema changes.
 
-## Day 6 milestones (Project 6)
+## Day 6 milestones (Project 6) — DONE, see P6 under Done
 
 Goal (from the roadmap): a REPRODUCIBLE test suite + observability, not a dashboard. Run it before
 every change/deploy and after. Measure: qualification correct, citations support claims, right tools
@@ -119,6 +125,9 @@ M5 Baseline + regression gate: commit evals/baseline.json (pass rates per catego
 
 After the week: M9 LinkedIn hand-off; real email via the Gmail API (gmail.compose, drafts only);
 async node timeouts; multi-lead fan-out in the flow.
+From P6 (known failures in the baseline): source vetting for the injected "30%" (q16, a08 0/3);
+follow-up cap (a20 0/3); more conflicting_info cases (3 is too few for a 0.10 tolerance); calibrate
+the judge on DRAFT sentences before grading drafts; review holdout h01–h06 labels; q15 is flaky.
 
 ## Day 7 stretch (with P7/P8)
 
@@ -142,3 +151,8 @@ P5 (Day 5): LangGraph workflow — StateGraph with route_after_qualify (one extr
    checkpointer (thread_id = run_id, `flow --resume`), interrupt() approval (`agent approve`, runs
    'waiting', 0004), transient vs permanent errors (DB-only RetryPolicy, failed node), loop vs graph
    evals (flow 8/8, --compare), 415 tests. See LEARNING.md.
+P6 (Day 6): evals + Langfuse — tracing (one trace per run, trace_id seeded from run_id, 0005), 51
+   labelled cases in 7 categories + qualify stage, claim judge (judge-v4, calibrated on my labels:
+   dev 16/16, 0 unsupported missed; unsupported fails answers, partial warns), cost/latency report
+   (model = 99% of time), baseline + regression gate (tokens not $; A/A test PASS), icp-v2 fix
+   (qualify 72 -> 100%, flow p95 24 -> 15s), 503 tests. See LEARNING.md.

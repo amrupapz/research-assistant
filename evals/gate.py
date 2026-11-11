@@ -52,7 +52,7 @@ def side_by_side(base: dict, cur: dict) -> str:
         b, c = base["categories"].get(cat), cur["categories"].get(cat)
         lines.append(f"{cat:<24}{'-' if b is None else f'{b:.0%}':>10}{'-' if c is None else f'{c:.0%}':>10}")
     for stage in sorted(set(base["stages"]) | set(cur["stages"])):
-        for metric in ("seconds_p95", "usd_p50"):
+        for metric in ("seconds_p95", "tokens_p50", "usd_p50"):
             b, c = base["stages"].get(stage, {}).get(metric), cur["stages"].get(stage, {}).get(metric)
             lines.append(f"{stage + ' ' + metric:<24}{'-' if b is None else f'{b:.5g}':>10}{'-' if c is None else f'{c:.5g}':>10}")
     return "\n".join(lines)

@@ -60,6 +60,7 @@ def decompose(observations: list[dict]) -> dict:
         "human_ms": sum(_ms(o) for o in done if o["name"] in HUMAN_NAMES),
         "grader_ms": sum(_ms(o) for o in grader),
         "cost_usd": sum(o["cost"] for o in model),
+        "tokens": sum(o.get("tokens", 0) for o in model),  # what the gate watches: $ swings with cache timing
         "grader_cost_usd": sum(o["cost"] for o in grader),
         "model_calls": len(model) + len(grader),  # everything that wrote a run-log line (for the cross-check)
         "incomplete": incomplete,
@@ -83,6 +84,7 @@ def stage_summary(rows: list[dict]) -> dict:
         "usd_p50": percentile(cost, 50),
         "usd_p95": percentile(cost, 95),
         "usd_total": sum(cost),
+        "tokens_p50": percentile([r["tokens"] for r in rows], 50),
         "grader_usd_total": sum(r["grader_cost_usd"] for r in rows),
         "human_seconds_total": sum(r["human_ms"] for r in rows) / 1000,
         "model_calls_avg": sum(r["model_calls"] for r in rows) / len(rows) if rows else 0,

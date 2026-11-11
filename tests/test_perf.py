@@ -13,8 +13,9 @@ report = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report)
 
 
-def o(id, parent, type, name, start, end, cost=0.0):
-    return {"id": id, "parent_id": parent, "type": type, "name": name, "start": start, "end": end, "cost": cost}
+def o(id, parent, type, name, start, end, cost=0.0, tokens=0):
+    return {"id": id, "parent_id": parent, "type": type, "name": name, "start": start, "end": end, "cost": cost,
+            "tokens": tokens}  # fmt: skip
 
 
 # agent run, 10s: respond, search_company (retrieval + ask inside), send_email (a human says yes), respond
@@ -61,9 +62,10 @@ def test_the_judge_is_eval_cost_not_app_time_or_app_cost():
     d = decompose([
         o("root", None, "chain", "eval/answers/q06", 0, 10),
         o("a", "root", "generation", "ask", 1, 4, cost=0.002),
-        o("j", "root", "generation", "judge_claim", 5, 9, cost=0.01),
+        o("j", "root", "generation", "judge_claim", 5, 9, cost=0.01, tokens=900),
     ])  # fmt: skip
     assert (d["grader_ms"], d["app_ms"], d["model_ms"]) == pytest.approx((4_000, 6_000, 3_000))
+    assert d["tokens"] == 0  # the judge's tokens aren't the app's
     assert (d["cost_usd"], d["grader_cost_usd"]) == pytest.approx((0.002, 0.01))
     assert d["model_calls"] == 2  # both wrote a run-log line
 

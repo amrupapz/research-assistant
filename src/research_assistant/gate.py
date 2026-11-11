@@ -6,14 +6,17 @@ A SNAPSHOT (evals/baseline.json, and the "current" run) looks like:
       "batch": "20261111T070332",
       "versions": {"prompt": "v4", "agent": "agent-v5", "flow": "flow-v2", "judge": "judge-v3", "icp": "icp-v1"},
       "categories": {"freshness": 0.7, "prompt_injection": 0.6, ...},      # pass rate, 0.0 .. 1.0
-      "stages": {"agent": {"seconds_p95": 20.8, "usd_p50": 0.00065}, ...}  # from runs/report.json
+      "stages": {"agent": {"seconds_p95": 20.8, "tokens_p50": 9500, "usd_p50": 0.00065}, ...}  # runs/report.json
+
+    The gate checks tokens_p50, not usd_p50: the dollar cost of the same run swung +83% with prompt-cache
+    timing alone (M5). usd_p50 stays in the snapshot for humans.
     }
 """
 
 DEFAULT_TOLERANCE = {
     "pass_rate": 0.10,  # ABSOLUTE drop allowed per category: 0.90 -> 0.80 is ok, -> 0.79 is not
     "p95": 0.25,  # RELATIVE rise allowed in a stage's seconds_p95: 20s -> 25s ok, -> 25.1s not
-    "cost": 0.20,  # RELATIVE rise allowed in a stage's usd_p50
+    "cost": 0.20,  # RELATIVE rise allowed in a stage's tokens_p50 (the cost driver)
 }
 
 
@@ -29,7 +32,7 @@ def regression_gate(baseline: dict, current: dict, tolerance: dict = DEFAULT_TOL
       Speed and cost, for EVERY stage in baseline["stages"]:
         - missing from current["stages"]                         -> a reason
         - current seconds_p95 > baseline seconds_p95 * (1 + p95) -> a reason
-        - current usd_p50     > baseline usd_p50     * (1 + cost) -> a reason
+        - current tokens_p50  > baseline tokens_p50  * (1 + cost) -> a reason
         - a baseline value of 0 (or None) has no relative limit: skip that check
       Never a reason:
         - anything that got BETTER, or is exactly AT the limit (the comparisons are strict)
@@ -40,7 +43,7 @@ def regression_gate(baseline: dict, current: dict, tolerance: dict = DEFAULT_TOL
 
     Hints:
       - Collect reasons in a list; return (not reasons, reasons).
-      - Two small loops: one over categories, one over stages x [("seconds_p95", "p95"), ("usd_p50", "cost")].
+      - Two small loops: one over categories, one over stages x [("seconds_p95", "p95"), ("tokens_p50", "cost")].
       - .get() for the "missing" cases. Floating-point: compare with the computed limit, don't round.
       - ~20 lines. Run: uv run pytest tests/test_gate.py -v
     """
@@ -60,7 +63,7 @@ def regression_gate(baseline: dict, current: dict, tolerance: dict = DEFAULT_TOL
         if cur_metrics is None:
             reasons.append(f"{stage}: stage missing from the current run")
             continue
-        for metric, tol_key in (("seconds_p95", "p95"), ("usd_p50", "cost")):
+        for metric, tol_key in (("seconds_p95", "p95"), ("tokens_p50", "cost")):
             base_value = base_metrics.get(metric)
             if not base_value:
                 continue
@@ -84,6 +87,7 @@ def snapshot(all_record: dict, report: dict, versions: dict) -> dict:
         "versions": versions,
         "categories": {row["category"]: row["passed"] / row["total"] for row in all_record["categories"] if row["total"]},
         "stages": {
-            name: {"seconds_p95": st["seconds_p95"], "usd_p50": st["usd_p50"]} for name, st in report["stages"].items()
+            name: {"seconds_p95": st["seconds_p95"], "tokens_p50": st.get("tokens_p50"), "usd_p50": st["usd_p50"]}
+            for name, st in report["stages"].items()
         },
     }

@@ -252,7 +252,7 @@ def eval_trace(stage: str, case: str, category: str) -> Iterator[Any]:
 
 def fetch_observations(trace_id: str) -> list[dict]:
     """Every observation of a trace from the Langfuse API, as plain dicts (perf.py stays pure):
-    {id, parent_id, type (lowercase), name, start, end (epoch seconds; end None = unfinished), cost}."""
+    {id, parent_id, type (lowercase), name, start, end (epoch seconds; end None = unfinished), cost, tokens}."""
     lf = client()
     if lf is None:
         raise RuntimeError("tracing is off (TRACING_ENABLED / LANGFUSE_* keys): no traces to read")
@@ -269,6 +269,7 @@ def fetch_observations(trace_id: str) -> list[dict]:
                 "start": d["startTime"].timestamp(),
                 "end": d["endTime"].timestamp() if d.get("endTime") else None,
                 "cost": _cost(d.get("costDetails") or {}),
+                "tokens": _cost(d.get("usageDetails") or {}),  # total incl. cached: NOT cache-timing dependent (M5)
             })  # fmt: skip
         cursor = page.meta.cursor if page.data else None
         if not cursor:

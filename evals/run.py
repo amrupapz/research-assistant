@@ -210,6 +210,16 @@ def judged_claims(claims, chunks_for) -> list[dict]:
     return out
 
 
+def answer_evidence(answer: str, chunks):
+    """chunks_for() for an answer's claims: a CITED sentence is judged against EVERY chunk the answer
+    cites, not only its own [id]s. "...so the figures conflict" cites one chunk but compares two (M5:
+    judged alone it was a false 'unsupported'). An uncited sentence stays uncited: listed, not judged."""
+    by_id = {c.chunk_id: c for c in chunks}
+    cited = list(dict.fromkeys(i for cl in split_claims(answer) for i in cl.chunk_ids if i in by_id))
+    evidence = [by_id[i] for i in cited]
+    return lambda claim: evidence if claim.chunk_ids else []
+
+
 def _claims_line(claims: list[dict]) -> str:
     counts: dict[str, int] = defaultdict(int)
     for c in claims:
@@ -234,10 +244,7 @@ def run_answers(
                 error = f"{type(e).__name__}: {e}"
             claims = []
             if judge and result is not None:
-                by_id = {c.chunk_id: c for c in chunks}
-                claims = judged_claims(
-                    split_claims(result.answer), lambda cl, b=by_id: [b[i] for i in cl.chunk_ids if i in b]
-                )
+                claims = judged_claims(split_claims(result.answer), answer_evidence(result.answer, chunks))
         trace_ids = [root.trace_id] if root.trace_id else []
         checks = apply_claim_checks(grade_answer(case, result), claims, graded=True)  # unsupported fails (M3)
         passed += checks["pass"]
