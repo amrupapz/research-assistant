@@ -90,10 +90,18 @@ M0 Inventory: map my existing evals (questions.jsonl, agent_cases, flow stage) t
    categories: straightforward, insufficient evidence, conflicting info, invalid tool args,
    prompt injection, permission bypass, freshness. List the gaps. One command runs everything:
    `evals/run.py --all` → one summary table.
-M1 Langfuse tracing (ask before adding the dependency; Langfuse Cloud free tier, keys in .env;
-   self-hosting waits for Docker on Day 7). One trace per agent/flow run; spans for retrieval,
-   every LLM call (tokens, cost, latency) and every tool call (decision, status). trace_id stored
-   in my run log + runs table. Tests never send traces (disabled/fake).
+M1 Langfuse tracing (Langfuse Cloud, JP region). Keys are ALREADY in .env as LANGFUSE_SECRET_KEY,
+   LANGFUSE_PUBLIC_KEY, LANGFUSE_BASE_URL (https://jp.cloud.langfuse.com) — load them via config.py
+   (SecretStr for the secret key); never read or print .env.
+   - Install the Langfuse AI skill from github.com/langfuse/skills and use it to add tracing to this
+     application following Langfuse best practices. Show me what the skill recommends before applying it.
+   - If the skill's advice conflicts with this file, THIS FILE WINS: all OpenAI calls still go through
+     llm.py with max_retries=0 + my own retries (a Langfuse OpenAI wrapper is fine only inside llm.py);
+     no secrets in code, logs or traces.
+   - Ask before adding the langfuse dependency.
+   - One trace per agent/flow run; spans for retrieval, every LLM call (tokens, cost, latency) and every
+     tool call (decision, status). trace_id stored in my run log + runs table.
+   - Tests never send traces (disabled or fake client); tracing failures must never break a run.
 M2 Grow the dataset to ~30 labelled cases with a `category` field. Must include the carried items:
    Figma "Dev Mode → dev_tooling" stretch, a citation about the WRONG company, the fake "30%"
    discount page, paraphrases, a permission-bypass attempt, a "no follow-up cap" case.
