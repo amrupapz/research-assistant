@@ -224,3 +224,60 @@ def shutdown() -> None:
     lf = client() if _client is not None else None
     if lf is not None:
         lf.shutdown()
+
+
+# --- D6 M4: eval traces + reading traces back for the cost/latency report -----------------------
+
+
+@contextmanager
+def eval_trace(stage: str, case: str, category: str) -> Iterator[Any]:
+    """One root per eval case for stages with no run root of their own (answers, qualify, judging),
+    so retrieval + model calls nest in ONE trace. Tagged eval/<stage> for the Langfuse UI."""
+    lf = client()
+    if lf is None:
+        yield NOOP
+        return
+    from langfuse import propagate_attributes
+
+    name = f"eval/{stage}/{case}"
+    with (
+        lf.start_as_current_observation(name=name, as_type="chain", input={"case": case}) as root,
+        propagate_attributes(
+            trace_name=name, tags=["eval", stage], metadata={"case": case, "category": category}
+        ),
+        _errors_marked(root),
+    ):
+        yield root
+
+
+def fetch_observations(trace_id: str) -> list[dict]:
+    """Every observation of a trace from the Langfuse API, as plain dicts (perf.py stays pure):
+    {id, parent_id, type (lowercase), name, start, end (epoch seconds; end None = unfinished), cost}."""
+    lf = client()
+    if lf is None:
+        raise RuntimeError("tracing is off (TRACING_ENABLED / LANGFUSE_* keys): no traces to read")
+    out, cursor = [], None
+    while True:
+        page = lf.api.observations.get_many(trace_id=trace_id, limit=100, cursor=cursor, fields="core,basic,usage")
+        for o in page.data:
+            d = o.dict(by_alias=True)
+            out.append({
+                "id": d["id"],
+                "parent_id": d.get("parentObservationId"),
+                "type": str(getattr(d["type"], "value", d["type"])).lower(),
+                "name": d["name"],
+                "start": d["startTime"].timestamp(),
+                "end": d["endTime"].timestamp() if d.get("endTime") else None,
+                "cost": _cost(d.get("costDetails") or {}),
+            })  # fmt: skip
+        cursor = page.meta.cursor if page.data else None
+        if not cursor:
+            return out
+
+
+def _cost(details: dict) -> float:
+    """Langfuse costDetails -> USD. It has a `total` key only SOMETIMES: calls with cached tokens came
+    back as {input, output, input_cached_tokens} with no total (found in M4: they summed to $0)."""
+    if "total" in details:
+        return details["total"] or 0.0
+    return sum(v for v in details.values() if isinstance(v, int | float))

@@ -1767,3 +1767,41 @@ verdicts), `--stage judge` refuses until every label is filled (labelling blind)
 - Gotcha: a rule added for one claim (j08) moved another (j01). Re-run the WHOLE dev set after every
   prompt change, not just the claim you were fixing.
 - Caveat stands: 18 claims ≈ 75–95% agreement on the next 18. Next clean measurement needs NEW claims.
+
+## D6 M4 — cost + latency report
+
+**Concept:** p50 = the typical run, p95 = the slow tail (1 in 20 is slower). Splitting a run's time
+into model / retrieval+DB / tool / our code (minus human approval) shows what's worth optimising;
+without it you "fix" the DB when the model is 99% of the time. $ per run is what M5's gate watches.
+
+**Built:** perf.decompose (pure): SELF time per observation (duration minus direct children) so
+nothing counts twice; buckets model / retrieval (retriever minus its embed) / tool (minus everything
+nested) / our_code (the rest); human-approval and judge_claim (grader) SUBTRACTED from app time and
+$. Several roots in one trace (flow → flow-approve tomorrow): only time inside roots counts.
+Nearest-rank percentile (always a real value; with 6 cases p95 = max). Every eval case = one trace
+(eval/<stage>/<case> roots for answers/qualify/judging; agent/flow seeded from run_id), trace_ids +
+batch id on every record. evals/report.py: cache in runs/traces/ (complete trees only), cross-check
+trace model calls vs run-log lines per trace_id → mismatch = INCOMPLETE, listed not averaged;
+writes runs/report.json for M5.
+
+**First real numbers (before the --all run):** L2 flow 19.4s → model 99%, retrieval/DB 0.14s,
+tools 0.06s, our code 0.04s. The DB is not the problem; the model is.
+
+**Gotchas**
+- CORRECTION to M1: Langfuse costDetails has a `total` key only SOMETIMES. Calls with cached tokens
+  came back {input, output, input_cached_tokens} and no total → my report counted them as $0
+  ($0.00116 instead of $0.00140). Sum the parts when total is missing.
+- An answers case used to be 2+ traces (retrieval, ask, judge each a root) → no per-case number.
+  Needed an eval root per case before any per-case latency made sense.
+- **First full report** (batch 20261111T070332, 61 traced cases, 0 incomplete — cross-check held):
+  answers p50 3.6s / p95 5.5s; qualify 5.0 / 7.2; agent 13.4 / 20.8 ($0.00065 p50, 8.4 calls);
+  flow 12.9 / 25.4. Model = 99–100% of app time in EVERY stage; DB/tools/our code round to 0%.
+  hybrid_search 0.28s p50 of which embed 0.27s → the DB part is ~10 ms. Slowest: flow a07/a08
+  (Linear's "possible" fit → extra research pass, 13 calls). Cold first embed: max 1.28s vs p50 0.27s.
+- **Surprise: the grader costs 4x the app** ($0.113 judge vs $0.029 app per --all). Terra is 10x
+  luna's price and judged 96 claims, many of them draft greetings (not_a_claim) whose verdicts
+  are warn-only anyway. Cheap fix candidates: don't judge drafts in --all, or skip sentences with
+  no fact; decide in M5.
+- Levers, given model = 99%: fewer calls (agent ~8/run), shorter reasoning (ask's 1k-token answers),
+  caching (respond turns already hit ~85% cached input). Optimising Postgres would buy nothing.
+- New flaky case: q15 (stale Intel plan) failed cites_gold this run — passed in M2. → --repeat in M5.

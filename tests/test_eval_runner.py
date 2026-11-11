@@ -146,3 +146,29 @@ def test_calibration_only_judges_the_selected_claims(monkeypatch, tmp_path):
     assert eval_run.run_judge_calibration(conn=None, only=["a1"]) == (1, 1)  # k1's missing label doesn't block a1
     assert eval_run.run_judge_calibration(conn=None, only=["k1"]) == (0, 0)  # ...but blocks itself
     assert len(judged) == 1
+
+
+def test_each_answers_case_is_one_trace_and_records_its_id(monkeypatch, spans):
+    """M4: retrieval + ask + judge nest under eval/answers/<case>, and the record points at that trace."""
+    from research_assistant.schemas import ResearchAnswer
+
+    written = []
+    monkeypatch.setattr(eval_run, "hybrid_search", lambda conn, q, k: [])
+    monkeypatch.setattr(eval_run, "ask", lambda q, c: ResearchAnswer(
+        answer="The provided sources don't cover this.", confidence="low", assumptions=[], needs_sources=True,
+        citations=[]))  # fmt: skip
+    monkeypatch.setattr(eval_run, "_write", written.append)
+    eval_run.run_answers(None, only=["q01"])
+    (root,) = [s for s in spans() if s["parent"] is None]
+    assert root["name"] == "eval/answers/q01"
+    assert written[0]["trace_ids"] == [root["trace_id"]]
+    assert root["attrs"]["langfuse.trace.tags"] == ("eval", "answers")
+
+
+def test_records_carry_the_process_batch(monkeypatch, tmp_path):
+    out = tmp_path / "evals.jsonl"
+    monkeypatch.setattr(eval_run, "OUT", out)
+    eval_run._write({"stage": "x"})
+    import json
+
+    assert json.loads(out.read_text())["batch"] == eval_run.BATCH

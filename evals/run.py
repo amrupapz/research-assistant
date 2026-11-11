@@ -122,12 +122,15 @@ def category_table(rows: list[dict], stage_names: list[str]) -> str:
     return "\n".join(lines)
 
 
+BATCH = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")  # one per process: the report groups records by it (M4)
+
+
 def _write(record: dict) -> None:
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("a") as f:
         f.write(
             json.dumps(
-                {"ts": datetime.now(UTC).isoformat(timespec="seconds"), **record}
+                {"ts": datetime.now(UTC).isoformat(timespec="seconds"), "batch": BATCH, **record}
             )
             + "\n"
         )
@@ -222,16 +225,20 @@ def run_answers(
     cases = [c for c in load_cases(CASES) if not only or c.id in only] * repeat
     passed = 0
     for case in cases:
-        chunks = [c for c, _ in hybrid_search(conn, case.question, k)]
-        result, error = None, None
-        try:
-            result = ask(case.question, chunks)
-        except (IncompleteResponseError, ValidationError, UngroundedAnswerError) as e:
-            error = f"{type(e).__name__}: {e}"
-        claims = []
-        if judge and result is not None:
-            by_id = {c.chunk_id: c for c in chunks}
-            claims = judged_claims(split_claims(result.answer), lambda cl, b=by_id: [b[i] for i in cl.chunk_ids if i in b])
+        with tracing.eval_trace("answers", case.id, case.category) as root:  # retrieval + ask + judge: ONE trace
+            chunks = [c for c, _ in hybrid_search(conn, case.question, k)]
+            result, error = None, None
+            try:
+                result = ask(case.question, chunks)
+            except (IncompleteResponseError, ValidationError, UngroundedAnswerError) as e:
+                error = f"{type(e).__name__}: {e}"
+            claims = []
+            if judge and result is not None:
+                by_id = {c.chunk_id: c for c in chunks}
+                claims = judged_claims(
+                    split_claims(result.answer), lambda cl, b=by_id: [b[i] for i in cl.chunk_ids if i in b]
+                )
+        trace_ids = [root.trace_id] if root.trace_id else []
         checks = apply_claim_checks(grade_answer(case, result), claims, graded=True)  # unsupported fails (M3)
         passed += checks["pass"]
         _graded("answers", case.category, checks["pass"])
@@ -249,6 +256,7 @@ def run_answers(
                 "prompt_version": PROMPT_VERSION,
                 "case": case.id,
                 "category": case.category,
+                "trace_ids": trace_ids,
                 "expect": case.expect,
                 **checks,
                 "error": error,
@@ -391,6 +399,7 @@ def run_agent_case(conn, case) -> dict:
         "asked": len(asked),
         "usage": usage,
         "research_ids": research_ids,  # chunks the run's search_company answers cited (drafts are judged against these)
+        "trace_ids": [t for t in [tracing.trace_id_for(ctx.run_id) if ctx.run_id else None] if t],
     }
 
 
@@ -418,8 +427,10 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1, judge:
             claims = []
             if judge and run["drafts"]:
                 research = fetch_chunks(conn, run["research_ids"])  # drafts carry no citations: check vs the research
-                for d in run["drafts"]:
-                    claims += judged_claims(split_claims(d["body"]), lambda _cl, r=research: r)
+                with tracing.eval_trace("judge", case.id, case.category) as jroot:  # grader cost: its own trace
+                    for d in run["drafts"]:
+                        claims += judged_claims(split_claims(d["body"]), lambda _cl, r=research: r)
+                run["trace_ids"] += [jroot.trace_id] if jroot.trace_id else []
                 print(_claims_line(claims))
             _write(
                 {
@@ -427,6 +438,7 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1, judge:
                     "prompt_version": AGENT_PROMPT_VERSION,
                     "case": case.id,
                     "category": case.category,
+                    "trace_ids": run["trace_ids"],
                     **checks,
                     "observed": obs,
                     "trail": trail,
@@ -522,12 +534,13 @@ def run_qualify_case(conn, case) -> dict:
             email = f"{case.lead_id.lower()}@example.com"
             seed_leads(conn, [Lead(lead_id=case.lead_id, email=email, **case.lead.model_dump())])
         ctx = ToolContext(conn=conn, reuse_qualification=False)
-        try:
-            result = qualify_lead(QualifyLeadArgs(lead_id=case.lead_id), ctx)
-        except Exception as e:  # noqa: BLE001 -- report it as a failed case, go on
-            error = f"{type(e).__name__}: {e}"
+        with tracing.eval_trace("qualify", case.id, case.category) as root:
+            try:
+                result = qualify_lead(QualifyLeadArgs(lead_id=case.lead_id), ctx)
+            except Exception as e:  # noqa: BLE001 -- report it as a failed case, go on
+                error = f"{type(e).__name__}: {e}"
     conn.rollback()  # also removes the synthetic lead
-    return {"result": result, "error": error, "usage": usage}
+    return {"result": result, "error": error, "usage": usage, "trace_ids": [root.trace_id] if root.trace_id else []}
 
 
 def run_qualify_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
@@ -554,6 +567,7 @@ def run_qualify_evals(conn, only: list[str] | None = None, repeat: int = 1) -> t
                 "stage": "qualify",
                 "case": case.id,
                 "category": case.category,
+                "trace_ids": run["trace_ids"],
                 **checks,
                 "error": run["error"],
                 "fit": q.get("fit"),
@@ -617,7 +631,8 @@ def run_flow_case(conn, case) -> dict:
         sent = sorted(f.name for f in ctx.outbox_dir.glob("*.eml")) if ctx.outbox_dir.exists() else []
         drafts = [d.model_dump() for d in list_drafts(conn, ctx.run_id)] if ctx.run_id else []
     conn.rollback()
-    return {"outcome": outcome, "error": error, "drafts": drafts, "sent": sent, "usage": usage}
+    trace_ids = [t for t in [tracing.trace_id_for(ctx.run_id) if ctx.run_id else None] if t]
+    return {"outcome": outcome, "error": error, "drafts": drafts, "sent": sent, "usage": usage, "trace_ids": trace_ids}
 
 
 def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
@@ -642,6 +657,7 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tupl
                     "prompt_version": flow.FLOW_VERSION,
                     "case": case.id,
                     "category": case.category,
+                    "trace_ids": run["trace_ids"],
                     **checks,
                     "outcome": run["outcome"],
                     "error": run["error"],
