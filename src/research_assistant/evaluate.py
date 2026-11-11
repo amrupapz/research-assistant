@@ -100,10 +100,24 @@ class AgentExpect(BaseModel):
     answer_mentions: list[str] = []  # final answer contains each (case-insensitive)
 
 
+class PastEvent(BaseModel):
+    lead_id: str
+    days_ago: int
+
+
+class AgentSetup(BaseModel):
+    """DB state that exists BEFORE the task (M7). Created inside the eval's rolled-back transaction."""
+
+    sent: list[PastEvent] = []  # an approved intro email sent to this lead, N days ago
+    replies: list[PastEvent] = []  # a reply recorded from this lead, N days ago
+
+
 class AgentCase(BaseModel):
     id: str
     task: str
     approve: Literal["yes", "no"] = "no"  # scripted approver; evals never wait for a human
+    setup: AgentSetup = AgentSetup()
+    crash_after: str | None = None  # M7: crash right after this tool's step commits, then --resume
     expect: AgentExpect
     observe: list[str] = []  # strings to REPORT if they appear in a draft (not graded), e.g. "30%"
 

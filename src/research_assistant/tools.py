@@ -5,6 +5,7 @@ from it (the shape the model sees) + a function. REGISTRY is the whitelist: noth
 """
 
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +34,14 @@ ONE_LINE = r"^[^\r\n]*$"  # header values: a newline would let the model inject 
 # "evil[.]example" -- those still face the human approval step.
 LINK = re.compile(r"https?://|www\.|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+/", re.IGNORECASE)
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _invisible(ch: str) -> bool:
+    """Characters a reader can't see. Found live in M6: the model's own citation markup
+    ("\\ue200cite\\ue202figma-about#000\\ue201") leaked into its text. Co = private use,
+    Cf = format (zero-width space/joiner, bidi overrides), Cc = control (except newline and tab), Cs = surrogates."""
+    cat = unicodedata.category(ch)
+    return cat in ("Co", "Cf", "Cs") or (cat == "Cc" and ch not in "\n\t")
 
 
 class SearchCompanyArgs(BaseModel):
@@ -81,6 +90,8 @@ class DraftEmailArgs(BaseModel):
             raise ValueError("drafts may not contain links")
         if EMAIL.search(value):
             raise ValueError("drafts may not contain email addresses")
+        if any(_invisible(ch) for ch in value):
+            raise ValueError("drafts may not contain invisible or private-use characters")
         return value
 
 

@@ -17,8 +17,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from research_assistant.agent import MaxStepsError, run_agent
-from research_assistant.db import connect
+from research_assistant.agent import (
+    MaxStepsError,
+    ResumeError,
+    SimulatedCrash,
+    resume_agent,
+    run_agent,
+)
+from research_assistant.db import connect, fetch_lead
 from research_assistant.evaluate import (
     grade_agent_run,
     grade_answer,
@@ -35,7 +41,14 @@ from research_assistant.llm import (
 )
 from research_assistant.prompts import AGENT_PROMPT_VERSION, PROMPT_VERSION
 from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
-from research_assistant.state import list_drafts
+from research_assistant.sending import send_once
+from research_assistant.state import (
+    get_steps,
+    insert_draft,
+    list_drafts,
+    record_approval,
+    record_reply,
+)
 from research_assistant.tools import ToolContext
 
 ROOT = Path(__file__).parent.parent
@@ -48,7 +61,12 @@ KS = (1, 3, 5)
 def _write(record: dict) -> None:
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("a") as f:
-        f.write(json.dumps({"ts": datetime.now(UTC).isoformat(timespec="seconds"), **record}) + "\n")
+        f.write(
+            json.dumps(
+                {"ts": datetime.now(UTC).isoformat(timespec="seconds"), **record}
+            )
+            + "\n"
+        )
 
 
 def memo_embed():
@@ -74,7 +92,9 @@ def run_retrieval(conn) -> None:
     }
     cases = [c for c in load_cases(CASES) if c.gold_sources]
     hits = {(m, k): 0 for m in modes for k in KS}
-    print(f"{'case':<6}" + "".join(f"{m + '@' + str(k):>11}" for m in modes for k in KS))
+    print(
+        f"{'case':<6}" + "".join(f"{m + '@' + str(k):>11}" for m in modes for k in KS)
+    )
     for case in cases:
         row = f"{case.id:<6}"
         for mode, search in modes.items():
@@ -83,14 +103,29 @@ def run_retrieval(conn) -> None:
                 s = retrieval_scores(case, chunks[:k])
                 hits[(mode, k)] += s["hit"]
                 row += f"{'✅' if s['hit'] else f'f{s["file_recall"]:.1f}/x{s["fact_recall"]:.1f}':>11}"
-                _write({"stage": "retrieval", "case": case.id, "mode": mode, "k": k, **s,
-                        "retrieved_ids": [c.chunk_id for c in chunks[:k]]})
+                _write(
+                    {
+                        "stage": "retrieval",
+                        "case": case.id,
+                        "mode": mode,
+                        "k": k,
+                        **s,
+                        "retrieved_ids": [c.chunk_id for c in chunks[:k]],
+                    }
+                )
         print(row)
-    print(f"{'hit%':<6}" + "".join(f"{hits[(m, k)] / len(cases):>11.0%}" for m in modes for k in KS))
-    print("\n✅ = all gold files and facts in top-k; otherwise f=file_recall x=fact_recall")
+    print(
+        f"{'hit%':<6}"
+        + "".join(f"{hits[(m, k)] / len(cases):>11.0%}" for m in modes for k in KS)
+    )
+    print(
+        "\n✅ = all gold files and facts in top-k; otherwise f=file_recall x=fact_recall"
+    )
 
 
-def run_answers(conn, k: int = 5, only: list[str] | None = None, repeat: int = 1) -> None:
+def run_answers(
+    conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
+) -> None:
     cases = [c for c in load_cases(CASES) if not only or c.id in only] * repeat
     passed = 0
     for case in cases:
@@ -103,22 +138,86 @@ def run_answers(conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
         checks = grade_answer(case, result)
         passed += checks["pass"]
         failed = [name for name, ok in checks.items() if not ok and name != "pass"]
-        print(f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id:<5} {case.expect:<8} {', '.join(failed)}")
+        print(
+            f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id:<5} {case.expect:<8} {', '.join(failed)}"
+        )
         if not checks["pass"]:
             print(f"      ↳ {(result.answer if result else error)[:160]}")
-        _write({"stage": "answers", "prompt_version": PROMPT_VERSION, "case": case.id, "expect": case.expect,
-                **checks, "error": error, "answer": result.answer if result else None,
+        _write(
+            {
+                "stage": "answers",
+                "prompt_version": PROMPT_VERSION,
+                "case": case.id,
+                "expect": case.expect,
+                **checks,
+                "error": error,
+                "answer": result.answer if result else None,
                 "needs_sources": result.needs_sources if result else None,
                 "cited_ids": [c.chunk_id for c in result.citations] if result else [],
-                "retrieved_ids": [c.chunk_id for c in chunks]})
+                "retrieved_ids": [c.chunk_id for c in chunks],
+            }
+        )
     print(f"\n{passed}/{len(cases)} passed (prompt {PROMPT_VERSION})")
 
 
+AGENT_TABLES = "runs, run_steps, drafts, approvals, sends, qualifications, research_findings, finding_citations, replies"
+
+
+def apply_setup(conn, setup, outbox: Path) -> None:
+    """Past events for a case: emails sent N days ago (approved + send_once, then backdated), replies."""
+    for e in setup.sent:
+        draft = insert_draft(
+            conn,
+            fetch_lead(conn, e.lead_id),
+            "Quick introduction",
+            "Hello, a short intro.",
+            None,
+        )
+        record_approval(conn, draft.draft_id, True, None)
+        send_once(conn, draft, outbox)
+        conn.execute(
+            "UPDATE sends SET sent_at = now() - make_interval(days => %s) WHERE draft_id = %s",
+            [e.days_ago, int(draft.draft_id[1:])],
+        )
+    for e in setup.replies:
+        record_reply(conn, e.lead_id, "eval setup")
+        conn.execute(
+            "UPDATE replies SET received_at = now() - make_interval(days => %s) "
+            "WHERE reply_id = (SELECT max(reply_id) FROM replies)",
+            [e.days_ago],
+        )
+
+
+def _records_from_db(conn, run_id) -> list[dict]:
+    """Tool-call records for the WHOLE run (both halves of a crash + resume), from run_steps."""
+    return [
+        {
+            "step": s["turn"],
+            "tool": s["tool"],
+            "status": s["status"],
+            "decision": s["decision"],
+            "validated_args": (s["payload"] or {}).get("validated_args"),
+        }
+        for s in get_steps(conn, run_id)
+        if s["kind"] == "tool_call"
+    ]
+
+
 def run_agent_case(conn, case) -> dict:
-    """One real agent run with a TEMP outbox and a scripted approver. Returns plain data for grading."""
+    """One real agent run with a TEMP outbox and a scripted approver. Returns plain data for grading.
+
+    Everything (setup, run, resume) happens inside one outer transaction that is rolled back.
+    """
     asked = []
-    conn.execute("SELECT 1")  # open an outer transaction: the run's steps become savepoints, rolled back below
+    # Open an outer transaction: the run's steps become savepoints, rolled back below.
+    conn.execute("SELECT 1")
+    # A clean slate: the case sees leads + chunks + its own setup, never my real runs/sends/replies.
+    # (Found in M7: a real reply from L1 in the dev DB made a12/a15/a16 "fail" correctly.)
+    # TRUNCATE is transactional in Postgres, so the rollback below restores everything.
+    conn.execute(f"TRUNCATE {AGENT_TABLES} RESTART IDENTITY")
     with tempfile.TemporaryDirectory() as tmp:
+        # Setup emails go to their own outbox: `sent` counts only the task's emails.
+        apply_setup(conn, case.setup, Path(tmp) / "setup-outbox")
         ctx = ToolContext(conn=conn, outbox_dir=Path(tmp) / "outbox")
 
         def approver(call, _ctx):
@@ -127,13 +226,28 @@ def run_agent_case(conn, case) -> dict:
 
         answer, error, tool_calls = None, None, []
         try:
-            result = run_agent(case.task, ctx, approve_fn=approver)
-            answer, tool_calls = result.answer, result.tool_calls
-        except (MaxStepsError, IncompleteResponseError) as e:
+            try:
+                result = run_agent(
+                    case.task, ctx, approve_fn=approver, crash_after=case.crash_after
+                )
+            except SimulatedCrash:
+                fresh = ToolContext(
+                    conn=conn, outbox_dir=ctx.outbox_dir
+                )  # "a new process"
+                result = resume_agent(ctx.run_id, fresh, approve_fn=approver)
+            answer = result.answer
+        except (MaxStepsError, IncompleteResponseError, ResumeError) as e:
             error = f"{type(e).__name__}: {e}"
-        sent = sorted(f.name for f in ctx.outbox_dir.glob("*.eml")) if ctx.outbox_dir.exists() else []
-    drafts = [d.model_dump() for d in list_drafts(conn, ctx.run_id)] if ctx.run_id else []
-    conn.rollback()  # evals leave no runs, drafts or approvals behind in the dev DB
+        tool_calls = _records_from_db(conn, ctx.run_id) if ctx.run_id else []
+        sent = (
+            sorted(f.name for f in ctx.outbox_dir.glob("*.eml"))
+            if ctx.outbox_dir.exists()
+            else []
+        )
+    drafts = (
+        [d.model_dump() for d in list_drafts(conn, ctx.run_id)] if ctx.run_id else []
+    )
+    conn.rollback()  # evals leave no runs, drafts, sends or replies behind in the dev DB
     return {
         "tool_calls": tool_calls,
         "drafts": drafts,
@@ -158,12 +272,27 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> Non
                 seen[case.id][o] += 1
             failed = [n for n, ok in checks.items() if not ok and n != "pass"]
             trail = " → ".join(f"{c['tool']}[{c['status']}]" for c in run["tool_calls"])
-            print(f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id}  {trail}  {', '.join(failed)}", flush=True)
+            print(
+                f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id}  {trail}  {', '.join(failed)}",
+                flush=True,
+            )
             if run["error"]:
                 print(f"      ↳ {run['error'][:160]}")
-            _write({"stage": "agent", "prompt_version": AGENT_PROMPT_VERSION, "case": case.id, **checks,
-                    "observed": obs, "trail": trail, "error": run["error"], "answer": run["answer"],
-                    "drafts": run["drafts"], "sent": run["sent"], "asked": run["asked"]})
+            _write(
+                {
+                    "stage": "agent",
+                    "prompt_version": AGENT_PROMPT_VERSION,
+                    "case": case.id,
+                    **checks,
+                    "observed": obs,
+                    "trail": trail,
+                    "error": run["error"],
+                    "answer": run["answer"],
+                    "drafts": run["drafts"],
+                    "sent": run["sent"],
+                    "asked": run["asked"],
+                }
+            )
     print(f"\n{'case':<6}{'pass':>8}   observed in drafts (not graded)")
     for case in cases:
         runs = tally[case.id]
@@ -175,9 +304,15 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["retrieval", "answers", "agent"], required=True)
-    parser.add_argument("--only", nargs="*", help="case ids to run, e.g. --only q07 q07b")
-    parser.add_argument("--repeat", type=int, default=1, help="run each case N times (flakiness)")
+    parser.add_argument(
+        "--stage", choices=["retrieval", "answers", "agent"], required=True
+    )
+    parser.add_argument(
+        "--only", nargs="*", help="case ids to run, e.g. --only q07 q07b"
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="run each case N times (flakiness)"
+    )
     args = parser.parse_args()
     with connect() as conn:
         if args.stage == "retrieval":

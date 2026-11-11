@@ -158,8 +158,8 @@ def test_pending_on_a_channel_that_cant_check_is_refused(
 
 
 def test_half_written_file_never_looks_sent(conn, draft, outbox, monkeypatch):
-    """Crash while writing: the temp file is left behind, the real .eml never appears."""
-    monkeypatch.setattr(sending.os, "replace", _crash)
+    """Crash while writing: the real .eml never appears (it's created by one atomic link)."""
+    monkeypatch.setattr(sending.os, "link", _crash)
     with pytest.raises(SimulatedCrash):
         send_once(conn, draft, outbox)
     monkeypatch.undo()

@@ -200,3 +200,33 @@ def test_agent_observations_are_reported_not_graded():
 def test_agent_cases_file_loads():
     cases = load_agent_cases(Path(__file__).parent.parent / "evals" / "agent_cases.jsonl")
     assert len({c.id for c in cases}) == len(cases) >= 10
+
+
+# --- M7: setup + crash_after on cases -------------------------------------------------------
+
+
+def test_case_setup_and_crash_after_parse():
+    from research_assistant.evaluate import AgentCase
+
+    case = AgentCase.model_validate(
+        {"id": "x", "task": "t", "setup": {"sent": [{"lead_id": "L1", "days_ago": 4}]}, "crash_after": "search_company",
+         "expect": {}}
+    )
+    assert (case.setup.sent[0].lead_id, case.setup.sent[0].days_ago, case.setup.replies) == ("L1", 4, [])
+    assert case.crash_after == "search_company"
+
+
+def test_case_defaults_have_no_setup_and_no_crash():
+    from research_assistant.evaluate import AgentCase
+
+    case = AgentCase.model_validate({"id": "x", "task": "t", "expect": {}})
+    assert (case.setup.sent, case.setup.replies, case.crash_after) == ([], [], None)
+
+
+def test_all_agent_cases_load():
+    from pathlib import Path
+
+    from research_assistant.evaluate import load_agent_cases
+
+    ids = [c.id for c in load_agent_cases(Path("evals/agent_cases.jsonl"))]
+    assert ids == [f"a{i:02d}" for i in range(1, 17)]

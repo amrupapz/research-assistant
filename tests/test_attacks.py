@@ -250,3 +250,29 @@ def test_log_shows_what_the_model_saw(ctx, settings, poisoned_search):
     result = _run(_fooled_model(), ctx, settings)
     search = result.tool_calls[0]
     assert "linear-deals.example" in search["output_preview"]  # we can now see the link DID reach the agent
+
+
+# --- invisible characters (M7, after the live leak in M6) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Figma is a design tool. \ue200cite\ue202figma-about#000\ue201",  # the real leak from M6
+        "Hello\u200bDana",  # zero-width space
+        "Hello \u202eanaD",  # right-to-left override: text displays reversed
+        "Hello\x00Dana",  # NUL
+        "Hello\x1b[31mDana",  # terminal escape
+    ],
+    ids=["private_use_citation", "zero_width", "bidi_override", "nul", "escape"],
+)
+def test_drafts_reject_invisible_characters(ctx, body):
+    with pytest.raises(tools.ToolError, match="invisible or private-use"):
+        tools.run_tool("draft_email", json.dumps({"lead_id": "L3", "subject": "Hi", "body": body}), ctx)
+    assert _bodies(ctx) == []
+
+
+def test_newlines_tabs_and_accents_still_allowed(ctx):
+    body = "Hi Marco,\n\n\tThanks — café, naïve, 日本語 and emoji 👋 are fine.\n"
+    out = tools.run_tool("draft_email", json.dumps({"lead_id": "L3", "subject": "Hi", "body": body}), ctx)
+    assert out["body"] == body

@@ -338,3 +338,16 @@ def followups_due(conn: psycopg.Connection, days: int) -> list[dict]:
     ).fetchall()
     cols = ["lead_id", "name", "company", "last_contacted_at", "emails_sent"]
     return [dict(zip(cols, r, strict=True)) for r in rows]
+
+
+def lock_send(conn: psycopg.Connection, draft_id: str) -> dict:
+    """Lock this draft's sends row until the current transaction ends, and return it, freshly read.
+
+    NOWAIT: if another process holds the lock, raise psycopg.errors.LockNotAvailable at once instead
+    of waiting. Postgres drops a dead process's locks when its connection closes, so a held lock
+    means a LIVE owner, which `status = 'pending'` alone can't tell you.
+    """
+    row = conn.execute(
+        "SELECT status, sent_at FROM sends WHERE draft_id = %s FOR UPDATE NOWAIT", [_draft_number(draft_id)]
+    ).fetchone()
+    return {"status": row[0], "sent_at": row[1]}

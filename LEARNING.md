@@ -970,3 +970,64 @@ SQL/code, not model judgment.
   control characters, like the link check (the model gets an error and rewrites).
 
 **My answer:** _(fill in after check questions)_
+
+## D4 M7 — tests + evals (and the two holes M6 exposed)
+
+**Concept:** unit tests script the model, so they prove the CODE behaves, not that the real model
+USES the memory tools or recovers after a resume. Agent evals run the real model on fixed scenarios
+(with prepared DB state) and grade the trajectory. Run them with --repeat: the same task takes different paths.
+
+**1. Concurrent sends (the race I spotted in M6), fixed**
+- send_once: after the claim, EVERY path (first send, retry, recovery) runs in one transaction
+  that starts with `SELECT ... FOR UPDATE NOWAIT` and decides from a fresh read under the lock.
+  A loser gets "another process is sending draft D1 right now; try again shortly".
+- Postgres releases a dead process's locks with its connection → "locked" = "a live owner".
+- deliver: temp file + `os.link` (atomic create-if-absent: complete file or nothing, never overwrites).
+  Replaces exists-check + os.replace (check-then-act).
+- Non-outbox channels: only the process that CLAIMED the row may deliver; a pending row it didn't claim → refuse.
+- Tests (test_send_race_pg.py): two committed autocommit connections + forced interleaving with
+  threading.Event (A paused inside deliver; B refused; A finishes; one .eml). A killed mid-send
+  via `pg_terminate_backend(pid, 5000)` → lock released → B recovers without re-sending.
+
+**2. Invisible characters in drafts, fixed**
+- DraftEmailArgs rejects Unicode categories Co (private use: the leaked `cite...`), Cf (zero-width,
+  bidi overrides), Cs, and Cc except newline/tab. Accents, CJK, plain emoji still pass.
+  Trade-off: ZWJ emoji sequences (👨‍👩‍👧) contain Cf → rejected. Fine for sales email.
+
+**3. Eval harness**
+- AgentCase gains `setup` ({"sent": [{lead_id, days_ago}], "replies": [...]}, built with the real
+  send_once + backdating, in the rolled-back transaction, setup emails in a separate outbox) and
+  `crash_after` (crash, resume in a "new process", grade the combined run).
+- Tool-call records are now read from run_steps, so both halves of a crash + resume are graded.
+- New cases: a12 follow-up due, a13 replied → no draft, a14 not due yet, a15 asked for an intro but
+  already emailed → lead_status before drafting (follow-up wording observed, not graded),
+  a16 crash after search → search proposed at most once overall, 1 draft.
+
+**Gotchas**
+- A "hang" in the test run that wasn't one: pytest said 7.68 s, `time` said 5427 s. The Mac slept.
+  pytest uses a monotonic clock that stops during sleep on macOS; wall-clock time doesn't.
+  Check pg_stat_activity before blaming locks: nothing was blocked.
+- Race tests can't use the rolled-back fixture: two connections only see COMMITTED data. They commit and clean up.
+- `pg_terminate_backend(pid, timeout)` waits until the backend is gone. Without the timeout, B's NOWAIT could still hit the dying lock (flaky).
+- Graded vs observed: "is the draft a follow-up?" is wording → observed. "lead_status before
+  draft_email", "0 drafts when they replied" are trajectory/state → graded.
+
+**First eval run: 6/15. The model was right; the harness was wrong.**
+- a12, a15, a16 failed 0/3. Cause: my REAL reply from L1 (recorded during the M6 demo) was in the
+  dev DB and newer than the setup's "emailed 4 days ago", so list_followups correctly returned
+  nobody and lead_status correctly showed "replied" → agent-v5 says don't draft. The model obeyed.
+- a13/a14 "passed" partly by luck (they'd pass even if list_followups were broken).
+- **Fix:** each case starts with `TRUNCATE <agent tables> RESTART IDENTITY` inside its rolled-back
+  transaction → sees only leads + chunks + its own setup. Verified: inside a12 due = [L1]; dev data
+  (1 reply, 5 drafts, 1 send) identical after.
+- **Lesson:** an eval must not depend on whatever happens to be in the database. Before blaming
+  the model, check what the TOOLS returned (the trail showed list_followups → nothing).
+
+**After the fix:** new cases 15/15 (--repeat 3); full suite 16/16 under agent-v5.
+- Every drafting case (a04–a08, a10) now calls lead_status before draft_email: the v5 rule holds.
+- a12/a15 drafts read as follow-ups ("follow" observed every time); a15 overrides the literal
+  "intro" request because memory says already emailed. A policy choice (could ask instead).
+- a16: resume after the crash ran pending calls with no model call (half-done turn) 2 of 3 times.
+- a08: the fake "30%" partner discount still reaches a draft. The P3 open item (source vetting) is unchanged.
+
+**My answer:** _(fill in after check questions)_
