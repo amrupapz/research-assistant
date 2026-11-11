@@ -80,66 +80,36 @@ Commands: `uv run python -m research_assistant.db` (load + embed data/),
   evidence → say so, needs_sources=true.
 - Evaluate retrieval and answers SEPARATELY. Bump PROMPT_VERSION when prompt/schema changes.
 
-## Day 4 milestones (Project 4)
+## Day 6 milestones (Project 6)
 
-Goal (from the roadmap): the agent remembers what it did yesterday ("I emailed this lead
-yesterday, no reply → follow up today") and, after a crash, resumes from saved state
-instead of starting over. App state lives in Postgres tables, NOT in vector search.
+Goal (from the roadmap): a REPRODUCIBLE test suite + observability, not a dashboard. Run it before
+every change/deploy and after. Measure: qualification correct, citations support claims, right tools
+called, unauthorized actions blocked, latency + cost (model time vs my own code/DB time).
 
-M0 Data model: leads, qualifications, research_findings (with citations), drafts, approvals,
-   sends, runs + run_steps. Sketch the tables + foreign keys in LEARNING.md before coding.
-M1 qualify_lead tool: score a lead against ICP criteria (written in a config file) using
-   search_company evidence → stored qualification {fit, reasons, cited chunk_ids}.
-   (Missing from P3 vs the roadmap; P5's workflow needs it.)
-M2 Alembic migrations: baseline the existing tables (chunks, leads), then add the new ones;
-   upgrade + downgrade on the test DB.
-M3 Persist the agent: drafts move from memory to Postgres; every tool call becomes a run_step;
-   a step and its effect commit in ONE transaction.
-M4 Resume: `agent --resume <run_id>` continues after the last committed step. Simulate a crash
-   after research, before the draft/send.
-M5 Never double-send: send_once(draft_id) (idempotency key + unique constraint;
-   a crash between "sent" and "recorded" must not send twice). Changed by me on Day 4: Claude
-   writes it step by step with beginner explanations (I was stuck); I answer the check questions.
-M6 Memory across days: outreach status per lead (contacted_at, replied); `agent "follow up
-   leads with no reply after 3 days"`; reuse research findings < 7 days old instead of re-running.
-M7 Tests + evals: crash/resume, double-send, migration up/down, follow-up case in agent_cases.
-M8 Real email via Gmail MCP (ONLY after M5 send_once works). The agent becomes an MCP CLIENT:
-   - Primary: Google's official Gmail MCP server (Developer Preview, remote HTTP,
-     https://gmailmcp.googleapis.com/mcp/v1, OAuth). Use ONLY its create_draft tool: the agent
-     puts the approved draft into MY Gmail Drafts; I review and press Send in Gmail myself.
-     Request the narrowest scopes; never expose its tools to the model directly — my
-     send_email/draft tool calls it after validate → authorize → y/N.
-   - Email content from Gmail (if ever read) is untrusted data: <untrusted_data>, never instructions.
-   - authorize() uses call.args: recipient must be in ALLOWED_RECIPIENTS (my own addresses) → else deny.
-   - Fallback if preview access/OAuth is blocked: SMTP with a Gmail app password, same allowlist.
-   - EMAIL_MODE=outbox|gmail_mcp|smtp (default outbox). Tests use a fake MCP client, never real mail.
-   - OAuth tokens/credentials live outside git (gitignored), loaded via config.py.
-M9 LinkedIn hand-off: draft_linkedin_message tool → stored message + profile URL, status
-   "ready_to_send_manually"; `agent mark-sent <id>` records that I sent it myself. Never automate
-   LinkedIn sending.
+M0 Inventory: map my existing evals (questions.jsonl, agent_cases, flow stage) to the roadmap's
+   categories: straightforward, insufficient evidence, conflicting info, invalid tool args,
+   prompt injection, permission bypass, freshness. List the gaps. One command runs everything:
+   `evals/run.py --all` → one summary table.
+M1 Langfuse tracing (ask before adding the dependency; Langfuse Cloud free tier, keys in .env;
+   self-hosting waits for Docker on Day 7). One trace per agent/flow run; spans for retrieval,
+   every LLM call (tokens, cost, latency) and every tool call (decision, status). trace_id stored
+   in my run log + runs table. Tests never send traces (disabled/fake).
+M2 Grow the dataset to ~30 labelled cases with a `category` field. Must include the carried items:
+   Figma "Dev Mode → dev_tooling" stretch, a citation about the WRONG company, the fake "30%"
+   discount page, paraphrases, a permission-bypass attempt, a "no follow-up cap" case.
+M3 Claim checker (LLM-as-judge): for each answer/draft claim, does the cited chunk actually support
+   it? Judge model from JUDGE_MODEL in .env (stronger than MODEL). Calibrate: hand-label ~10 claims,
+   report judge agreement %. A judge I haven't checked is not evidence.
+M4 Cost + latency report from traces/run logs: per case and per stage, p50/p95, $ per run (price
+   table in config), and where time goes: model vs retrieval/DB vs tools.
+M5 Baseline + regression gate: commit evals/baseline.json (pass rates per category, cost, p95).
+   ✍️ I WRITE regression_gate(baseline, current, tolerance) → (ok, reasons) — pure function, no code
+   given; if I ask you to write it, give me a hint instead. Then fix ONE real failure the evals found
+   (e.g. source vetting or draft facts vs citations), re-run everything, compare against baseline.
+   Day 7 runs this gate in GitHub Actions.
 
-## Day 5 milestones (Project 5)
-
-Goal: the same sales flow as a durable LangGraph workflow: research → qualify → (branch) →
-draft → wait for approval → send. Checkpoints, pause/resume, retries. Compare with my P4 loop.
-
-M0 What LangGraph adds over my hand-built loop + run_steps. What stays in MY tables
-   (drafts, sends, approvals: business facts) vs the checkpointer (where the workflow is).
-   Ask before adding langgraph + langgraph-checkpoint-postgres (new dependencies).
-M1 StateGraph: nodes call my existing tools (validate → authorize still apply).
-   Branch on fit: poor → stop; possible → one more research pass; strong → draft.
-   ✍️ I write route_after_qualify(state) → next node.
-M2 Postgres checkpointer, thread_id = run_id. Kill mid-run → resume from the checkpoint.
-   Its tables come from checkpointer.setup(), not Alembic: decide how they sit next to my
-   migrations. It needs an autocommit connection with dict rows.
-M3 Human approval with interrupt(): the workflow pauses; `agent approve <id> y|n` resumes it
-   later (even the next day). The decision is still written to MY approvals table (send_once
-   checks it there). On resume the node re-runs from its start, so nothing with a side effect
-   goes before interrupt() in that node.
-M4 Retries/timeouts per node; failure branch. The send node calls send_once, because a resumed
-   node RE-RUNS from its start, so side effects must be safe to repeat.
-M5 Loop vs graph on the same tasks: when each fits; tests with a fake model; reuse agent_cases.
-Temporal: read about it only (when you'd need it instead).
+After the week: M9 LinkedIn hand-off; real email via the Gmail API (gmail.compose, drafts only);
+async node timeouts; multi-lead fan-out in the flow.
 
 ## Day 7 stretch (with P7/P8)
 
