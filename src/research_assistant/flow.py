@@ -21,6 +21,8 @@ M2: a Postgres checkpointer saves the state after every node, keyed by thread_id
 invoke(None) on that thread: finished nodes are skipped, the node that crashed runs again FROM ITS START.
 M3: approve calls interrupt(): the run is saved and the process exits ('waiting'). `agent approve`
 resumes it with Command(resume=True|False); approve re-runs from its start and interrupt() returns that.
+M4: errors are TRANSIENT (might work later: re-raised → run 'failed', `--resume` later) or PERMANENT
+(won't: caught by guarded() → the `failed` node → run 'failed' with a reason, nothing to resume).
 """
 
 import argparse
@@ -30,12 +32,13 @@ from typing import Literal, TypedDict
 from uuid import UUID
 
 import psycopg
-from langgraph.types import Command, interrupt
+from langgraph.errors import GraphBubbleUp
+from langgraph.types import Command, RetryPolicy, interrupt
 from psycopg.rows import dict_row
 
 from research_assistant import state
 from research_assistant.config import Settings, get_settings
-from research_assistant.llm import write_email
+from research_assistant.llm import is_retryable, write_email
 from research_assistant.permissions import ToolCall, authorize
 from research_assistant.qualify import fit_warning, load_icp
 from research_assistant.tools import ToolContext, ToolError, execute, validate_call
@@ -55,6 +58,7 @@ class FlowState(TypedDict, total=False):
     draft: dict  # draft_email output
     warnings: list[str]  # shown at approval time, e.g. "possible fit: scale=unknown"
     approved: bool  # the human's decision at approve (also in MY approvals table)
+    error: dict  # set by guarded() on a PERMANENT failure: {"node", "type", "message"} → the failed node
     sent: dict  # send_email output
     outcome: str  # how the run ended, in words
 
@@ -113,6 +117,44 @@ def call_tool(ctx: ToolContext, name: str, args: dict) -> dict:
 
 
 # --- nodes: each takes the state, returns ONLY the fields it changes -----------------------
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Might work if tried again later: a DB blip (deadlock, serialization failure, lost connection)
+    or an OpenAI error llm.py already retried (timeout, 429, 5xx). Everything else is permanent."""
+    return isinstance(exc, psycopg.OperationalError) or is_retryable(exc)
+
+
+# Node-level retry: ONLY for DB blips. OpenAI errors are retried inside llm.py (with_retries);
+# retrying them here too would multiply: 3 node attempts × 3 call attempts = 9 calls.
+DB_RETRY = RetryPolicy(max_attempts=3, retry_on=psycopg.OperationalError)
+
+
+def guarded(name: str, fn):
+    """Wrap a node: permanent errors become state["error"] (→ the failed node) instead of a crash.
+    Transient errors are re-raised (RetryPolicy / --resume deal with them)."""
+
+    def node(s: FlowState) -> FlowState:
+        try:
+            return fn(s)
+        except GraphBubbleUp:  # interrupt() works by RAISING this: it's a pause, not a failure
+            raise
+        except Exception as e:
+            if is_transient(e):
+                raise
+            return {"error": {"node": name, "type": type(e).__name__, "message": str(e)[:300]}}
+
+    return node
+
+
+def unless_failed(route):
+    """Edges check for an error FIRST, so routers (like route_after_qualify) never see a failed state."""
+
+    def check(s: FlowState):
+        return "failed" if s.get("error") else route(s)
+
+    check.__name__ = getattr(route, "__name__", "route")
+    return check
 
 
 def checkpointer_conn(url: str) -> psycopg.Connection:
@@ -215,19 +257,27 @@ def build_graph(ctx: ToolContext, checkpointer=None):
             return {"outcome": f"error: send failed ({e})"}
         return {"sent": out, "outcome": f"{out['status']}: {d['draft_id']} to {d['to']}"}
 
+    def failed(s: FlowState) -> FlowState:
+        e = s["error"]
+        return {"outcome": f"failed at {e['node']}: {e['type']}: {e['message']}"}
+
     g = StateGraph(FlowState)
-    nodes = [("load_lead", load_lead), ("research", research), ("qualify", qualify), ("stop", stop),
-             ("draft", draft), ("approve", approve), ("send", send)]  # fmt: skip
-    for name, fn in nodes:
+    # read/draft nodes: guarded + DB retry. send: guarded, NO retry (send_once's "check manually"
+    # must reach a human). approve: neither (interrupt() lives there). stop/failed can't fail.
+    for name, fn in [("load_lead", load_lead), ("research", research), ("qualify", qualify), ("draft", draft)]:
+        g.add_node(name, guarded(name, fn), retry_policy=DB_RETRY)
+    g.add_node("send", guarded("send", send))
+    for name, fn in [("approve", approve), ("stop", stop), ("failed", failed)]:
         g.add_node(name, fn)
     g.add_edge(START, "load_lead")
-    g.add_conditional_edges("load_lead", after_load, ["research", END])
-    g.add_edge("research", "qualify")
-    g.add_conditional_edges("qualify", route_after_qualify, ["research", "draft", "stop"])
+    g.add_conditional_edges("load_lead", unless_failed(after_load), ["research", END, "failed"])
+    g.add_conditional_edges("research", unless_failed(lambda s: "qualify"), ["qualify", "failed"])
+    g.add_conditional_edges("qualify", unless_failed(route_after_qualify), ["research", "draft", "stop", "failed"])
     g.add_edge("stop", END)
-    g.add_conditional_edges("draft", after_draft, ["approve", END])
+    g.add_conditional_edges("draft", unless_failed(after_draft), ["approve", END, "failed"])
     g.add_conditional_edges("approve", after_approve, ["send", END])
-    g.add_edge("send", END)
+    g.add_conditional_edges("send", unless_failed(lambda s: END), [END, "failed"])
+    g.add_edge("failed", END)
     return g.compile(checkpointer=checkpointer)
 
 
@@ -249,8 +299,8 @@ def _invoke(ctx: ToolContext, checkpointer, graph_input) -> FlowState:
     with ctx.conn.transaction():
         if paused:
             state.wait_run(ctx.conn, ctx.run_id, final.get("outcome"))
-        else:
-            state.finish_run(ctx.conn, ctx.run_id, "done", final.get("outcome"))
+        else:  # reached END: through the failed node (permanent error) or normally
+            state.finish_run(ctx.conn, ctx.run_id, "failed" if final.get("error") else "done", final.get("outcome"))
     return final
 
 
@@ -284,6 +334,8 @@ def resume_flow(run_id: UUID, ctx: ToolContext, checkpointer) -> FlowState:
         raise FlowError(f"run {run_id} is waiting for approval: uv run agent approve <draft_id> y|n")
     if checkpointer.get_tuple(_config(run_id)) is None:
         raise FlowError(f"run {run_id} has no checkpoint to resume from")
+    if not build_graph(ctx, checkpointer).get_state(_config(run_id)).next:  # reached END (failed node)
+        raise FlowError(f"run {run_id} already finished ({run['status']}: a permanent error; resuming won't help)")
     ctx.run_id = run_id
     with ctx.conn.transaction():
         state.mark_running(ctx.conn, run_id)
@@ -329,6 +381,8 @@ def main() -> None:
             print(f"flow crashed; resume with: uv run python -m research_assistant.flow --resume {ctx.run_id}", file=sys.stderr)
             raise
     print(final.get("outcome"))
+    if final.get("error"):
+        sys.exit(f"(run {ctx.run_id} failed; not resumable: fix the cause and start a new run)")
     print(f"(run {ctx.run_id}, research passes: {final.get('research_passes', 0)})", file=sys.stderr)
     q = final.get("qualification") or {}
     if q:
@@ -362,6 +416,8 @@ def approve_main(argv: list[str]) -> None:
             raise
     print(final.get("outcome"))
     print(f"(run {ctx.run_id})", file=sys.stderr)
+    if final.get("error"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

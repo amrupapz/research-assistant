@@ -1425,3 +1425,36 @@ before interrupt() in that node.
   decision again: two identical rows, harmless (send_once reads the latest).
 - The ledger (send_once) is what makes the re-run send node safe, not LangGraph: LangGraph
   re-runs the node; it can't know the email already left.
+
+## D5 M4 — retries per node, timeouts, failure branch
+
+**Concept:** two retry layers. Call-level (with_retries in llm.py) repeats ONE OpenAI call on a
+transient error; node-level (LangGraph RetryPolicy) re-runs a WHOLE node. Each error gets ONE layer,
+or they multiply (3 node attempts × 3 call attempts = 9 calls). Errors split in two:
+TRANSIENT (might work later) → re-raise → run 'failed' → `--resume` later from the checkpoint;
+PERMANENT (would fail the same way again) → the `failed` node → run 'failed' with a reason, not resumable.
+
+**What was built**
+- `is_transient(exc)`: psycopg.OperationalError (deadlock, serialization failure, lost connection,
+  lock timeout) or llm.is_retryable (timeout, 429, 5xx). Everything else is permanent.
+- `DB_RETRY = RetryPolicy(max_attempts=3, retry_on=psycopg.OperationalError)` on load_lead, research,
+  qualify, draft. OpenAI errors are NOT in it: llm.py already retried them.
+- `guarded(name, fn)`: permanent error → `{"error": {node, type, message}}`; transient → re-raise.
+  It re-raises GraphBubbleUp first: interrupt() works by RAISING GraphInterrupt (an Exception!),
+  so a naive `except Exception` would turn every approval pause into a "failure".
+- `unless_failed(route)`: every edge out of a guarded node checks `error` first → `failed` node →
+  END. route_after_qualify is unchanged and never sees a failed state.
+- send: guarded but NO retry (a "check manually" from send_once must reach a human; a transient
+  error → run 'failed' → resumable, and send_once makes the re-run safe). approve: neither.
+- `--resume` refuses a run that reached END through `failed` ("resuming won't help").
+  CLI exits non-zero on a failed outcome.
+
+**Timeouts:** LangGraph's per-node `timeout` only works for async nodes; mine are sync. Not needed:
+every model call has a client timeout + bounded retries, so each node's worst case is already
+bounded (calls × attempts × timeout + backoff). Async nodes = "after the week".
+
+**Gotchas**
+- A fake crash must be a BaseException (KeyboardInterrupt), not RuntimeError: RuntimeError is now a
+  permanent error and goes, correctly, to the failed node.
+- A DB retry on a DEAD connection fails 3 times anyway; it really helps for deadlocks / serialization
+  failures, where the transaction rolled back and the connection is still fine.

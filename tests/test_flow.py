@@ -21,6 +21,7 @@ from research_assistant.flow import (
     route_after_qualify,
     run_flow,
 )
+from research_assistant.llm import IncompleteResponseError
 from research_assistant.permissions import ToolCall
 from research_assistant.qualify import fit_warning
 from research_assistant.schemas import (
@@ -329,7 +330,7 @@ def _crash_once_in(monkeypatch, tool_name: str):
     def call_tool(ctx, name, args):
         if name == tool_name and not crashed:
             crashed.append(name)
-            raise RuntimeError("simulated crash")
+            raise KeyboardInterrupt  # a crash: not an Exception, so guarded() can't catch it
         return real(ctx, name, args)
 
     monkeypatch.setattr(flow, "call_tool", call_tool)
@@ -338,7 +339,7 @@ def _crash_once_in(monkeypatch, tool_name: str):
 def test_crash_in_qualify_then_resume_skips_finished_nodes(ctx, settings, fake, saver, monkeypatch):
     fake["verdicts"].append(STRONG)
     _crash_once_in(monkeypatch, "qualify_lead")
-    with pytest.raises(RuntimeError, match="simulated crash"):
+    with pytest.raises(KeyboardInterrupt):
         run_flow("L1", ctx, settings, checkpointer=saver)
     run_id = ctx.run_id
     saver.threads.append(str(run_id))
@@ -497,6 +498,99 @@ def test_the_pause_survives_a_new_process(ctx, settings, fake, saver, test_db_ur
 def test_send_refuses_if_authorize_denies(ctx, settings, fake, saver, monkeypatch):
     _pause_at_approve(ctx, settings, fake, saver)
     monkeypatch.setattr(flow, "authorize", lambda call: "deny")
-    with pytest.raises(FlowError, match="decision=deny"):
-        approve_flow("D1", True, ctx, saver)
+    final = approve_flow("D1", True, ctx, saver)
+    assert final["outcome"] == "failed at send: FlowError: send_email is not allowed here (decision=deny)"
     assert _sends(ctx) == []
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
+
+
+
+# --- D5 M4: retries per node, transient vs permanent, the failure branch -------------------
+
+
+def _fail_tool(monkeypatch, tool_name: str, exc: BaseException, times: int = 10**6) -> list:
+    """Make `tool_name` raise `exc` the first `times` calls. Returns the call log."""
+    real, calls = flow.call_tool, []
+
+    def call_tool(c, name, args):
+        if name == tool_name:
+            calls.append(name)
+            if len(calls) <= times:
+                raise exc
+        return real(c, name, args)
+
+    monkeypatch.setattr(flow, "call_tool", call_tool)
+    return calls
+
+
+def _timeout():
+    import httpx2
+    import openai
+
+    return openai.APITimeoutError(request=httpx2.Request("POST", "https://api.openai.com/v1/responses"))
+
+
+def test_a_db_blip_in_a_node_is_retried_by_the_node(ctx, settings, fake, monkeypatch):
+    import psycopg
+
+    fake["verdicts"].append(STRONG)
+    calls = _fail_tool(monkeypatch, "qualify_lead", psycopg.errors.DeadlockDetected("deadlock"), times=1)
+    final = run_flow("L1", ctx, settings)
+    assert len(calls) == 2  # node attempt 1 hit the deadlock, attempt 2 worked
+    assert final["outcome"] == "drafted D1 (awaiting approval)"
+
+
+def test_an_openai_error_is_not_retried_by_the_node_and_the_run_is_resumable(
+    ctx, settings, fake, saver, monkeypatch
+):
+    fake["verdicts"].append(STRONG)
+    calls = _fail_tool(monkeypatch, "search_company", _timeout(), times=1)  # OpenAI down, then back
+    with pytest.raises(Exception, match="timed out"):
+        run_flow("L1", ctx, settings, checkpointer=saver)
+    saver.threads.append(str(ctx.run_id))
+    assert len(calls) == 1  # llm.py already retried it; the node does NOT multiply that
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
+
+    final = resume_flow(ctx.run_id, ctx, saver)  # transient → resumable from the checkpoint
+    assert len(calls) == 2
+    assert final["outcome"] == "drafted D1 (awaiting approval)"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        IncompleteResponseError("status='incomplete'"),
+        ValueError("off-schema answer"),
+    ],
+    ids=["incomplete", "bug"],
+)
+def test_a_permanent_error_goes_to_the_failed_node(ctx, settings, fake, saver, monkeypatch, exc):
+    calls = _fail_tool(monkeypatch, "search_company", exc)
+    final = run_flow("L1", ctx, settings, checkpointer=saver)
+    saver.threads.append(str(ctx.run_id))
+    assert len(calls) == 1  # not retried: it would fail the same way again
+    assert final["outcome"].startswith(f"failed at research: {type(exc).__name__}: ")
+    assert fake["judged"] == 0  # never reached qualify: route_after_qualify never saw the error
+    assert _drafts(ctx) == []
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
+    with pytest.raises(FlowError, match="resuming won't help"):
+        resume_flow(ctx.run_id, ctx, saver)
+
+
+def test_send_is_not_retried_even_for_a_db_blip(ctx, settings, fake, saver, monkeypatch):
+    import psycopg
+
+    _pause_at_approve(ctx, settings, fake, saver)
+    real, calls = flow.execute, []
+
+    def execute(name, args, c):
+        if name == "send_email":
+            calls.append(name)
+            raise psycopg.errors.DeadlockDetected("deadlock")
+        return real(name, args, c)
+
+    monkeypatch.setattr(flow, "execute", execute)
+    with pytest.raises(psycopg.errors.DeadlockDetected):
+        approve_flow("D1", True, ctx, saver)
+    assert len(calls) == 1
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"  # resumable: send_once makes it safe
