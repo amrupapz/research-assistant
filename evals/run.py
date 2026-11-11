@@ -672,14 +672,16 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tupl
     return sum(total), len(total)
 
 
-def stages(conn, only: list[str] | None = None, repeat: int = 1, judge: bool = False) -> dict:
+def stages(
+    conn, only: list[str] | None = None, repeat: int = 1, judge: bool = False, judge_drafts: bool | None = None
+) -> dict:
     """Every stage, in order: cheap and deterministic first, so a broken retrieval shows up before
     you pay for ~170 agent/flow calls. Each returns (passed, total)."""
     return {
         "retrieval": lambda: run_retrieval(conn),  # hybrid@5; --only/--repeat don't apply
         "answers": lambda: run_answers(conn, only=only, repeat=repeat, judge=judge),
         "qualify": lambda: run_qualify_evals(conn, only=only, repeat=repeat),
-        "agent": lambda: run_agent_evals(conn, only=only, repeat=repeat, judge=judge),
+        "agent": lambda: run_agent_evals(conn, only=only, repeat=repeat, judge=judge if judge_drafts is None else judge_drafts),
         "flow": lambda: run_flow_evals(conn, only=only, repeat=repeat),
     }
 
@@ -752,7 +754,9 @@ def main() -> None:
         return compare()
     if args.all:
         with connect() as conn:
-            rows = run_all(stages(conn, only=args.only, repeat=args.repeat, judge=True))  # the full run always judges
+            # The full run always judges ANSWERS (graded). Drafts only with --judge: their verdicts are
+            # warn-only and were ~70% of the judge's cost in M4 ($0.08 of $0.11 per --all).
+            rows = run_all(stages(conn, only=args.only, repeat=args.repeat, judge=True, judge_drafts=args.judge))
         print("\n" + summary_table(rows))
         cats = _print_categories()
         _write({"stage": "all", "rows": rows, "categories": cats})
