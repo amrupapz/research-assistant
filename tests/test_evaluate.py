@@ -1,18 +1,25 @@
 """Scoring functions for evals, plus sanity checks on the eval set itself. No DB, no API."""
 
+from collections import Counter
 from datetime import date
 from pathlib import Path
+from typing import get_args
 
 import pytest
+from pydantic import ValidationError
 
 from research_assistant.evaluate import (
     AgentCase,
     AgentExpect,
+    Category,
     EvalCase,
+    QualifyCase,
     grade_agent_run,
     grade_answer,
+    grade_qualification,
     load_agent_cases,
     load_cases,
+    load_qualify_cases,
     observations,
     retrieval_scores,
 )
@@ -21,11 +28,11 @@ from research_assistant.schemas import Chunk, Citation, ResearchAnswer
 
 ROOT = Path(__file__).parent.parent
 FIGMA = EvalCase(
-    id="t", question="q", kind="k", expect="conflict",
+    id="t", category="conflicting_info", question="q", kind="k", expect="conflict",
     gold_sources=["figma-about.md", "figma-company-profile.md"], gold_facts=["2,140", "1,870"],
 )
-INTEL = EvalCase(id="t", question="q", kind="k", expect="answer", gold_sources=["intel.md"], gold_facts=["Lip-Bu Tan"])
-ABSTAIN = EvalCase(id="t", question="q", kind="k", expect="abstain")
+INTEL = EvalCase(id="t", category="straightforward", question="q", kind="k", expect="answer", gold_sources=["intel.md"], gold_facts=["Lip-Bu Tan"])
+ABSTAIN = EvalCase(id="t", category="insufficient_evidence", question="q", kind="k", expect="abstain")
 
 
 def _chunk(cid: str, text: str) -> Chunk:
@@ -109,7 +116,7 @@ def test_eval_set_is_consistent_with_data():
         assert retrieval_scores(case, gold_chunks)["hit"], f"{case.id}: gold facts not found in gold files"
 
 
-@pytest.mark.parametrize("expect", ["answer", "conflict", "abstain"])
+@pytest.mark.parametrize("expect", ["answer", "conflict", "abstain", "stale"])
 def test_every_expect_type_is_used(expect):
     assert any(c.expect == expect for c in load_cases(ROOT / "evals" / "questions.jsonl"))
 
@@ -191,7 +198,7 @@ def test_agent_drafts_sent_asked_answer():
 
 
 def test_agent_observations_are_reported_not_graded():
-    case = AgentCase(id="x", task="t", expect=AgentExpect(), observe=["30%", "21,400"])
+    case = AgentCase(id="x", category="prompt_injection", task="t", expect=AgentExpect(), observe=["30%", "21,400"])
     run = _arun(drafts=[_d("Partners get 30% off")])
     assert observations(case, run) == ["30%"]
     assert grade_agent_run(case.expect, run)["pass"]
@@ -209,7 +216,7 @@ def test_case_setup_and_crash_after_parse():
     from research_assistant.evaluate import AgentCase
 
     case = AgentCase.model_validate(
-        {"id": "x", "task": "t", "setup": {"sent": [{"lead_id": "L1", "days_ago": 4}]}, "crash_after": "search_company",
+        {"id": "x", "category": "freshness", "task": "t", "setup": {"sent": [{"lead_id": "L1", "days_ago": 4}]}, "crash_after": "search_company",
          "expect": {}}
     )
     assert (case.setup.sent[0].lead_id, case.setup.sent[0].days_ago, case.setup.replies) == ("L1", 4, [])
@@ -219,7 +226,7 @@ def test_case_setup_and_crash_after_parse():
 def test_case_defaults_have_no_setup_and_no_crash():
     from research_assistant.evaluate import AgentCase
 
-    case = AgentCase.model_validate({"id": "x", "task": "t", "expect": {}})
+    case = AgentCase.model_validate({"id": "x", "category": "straightforward", "task": "t", "expect": {}})
     assert (case.setup.sent, case.setup.replies, case.crash_after) == ([], [], None)
 
 
@@ -229,7 +236,7 @@ def test_all_agent_cases_load():
     from research_assistant.evaluate import load_agent_cases
 
     ids = [c.id for c in load_agent_cases(Path("evals/agent_cases.jsonl"))]
-    assert ids == [f"a{i:02d}" for i in range(1, 17)]
+    assert ids == [f"a{i:02d}" for i in range(1, 25)]
 
 
 # --- D5 M5: the same cases through the flow ------------------------------------------------
@@ -281,9 +288,96 @@ def test_which_cases_the_flow_can_express():
         "a09",
         "a15",
         "a16",
+        "a20",
+        "a23",
     ]
     assert all(
         cases[i].flow.decide is None for i in ["a04", "a07", "a09", "a15", "a16"]
     )  # draft-only: never approve
     assert (cases["a05"].flow.decide, cases["a06"].flow.decide) == ("yes", "no")
     assert cases["a16"].crash_after == "search_company"  # reused for the flow's crash
+
+
+# --- D6 M2: categories, the "stale" expect, qualification grading ------------------------------
+
+CATEGORIES = set(get_args(Category))
+
+
+def test_category_is_required():
+    with pytest.raises(ValidationError):
+        EvalCase.model_validate({"id": "x", "question": "q", "kind": "k", "expect": "abstain"})
+    with pytest.raises(ValidationError):
+        AgentCase.model_validate({"id": "x", "task": "t", "expect": {}})
+
+
+def test_every_case_file_uses_known_categories_and_covers_all_seven():
+    cases = [
+        *load_cases(ROOT / "evals" / "questions.jsonl"),
+        *load_agent_cases(ROOT / "evals" / "agent_cases.jsonl"),
+        *load_qualify_cases(ROOT / "evals" / "qualify_cases.jsonl"),
+    ]
+    used = Counter(c.category for c in cases)
+    assert set(used) == CATEGORIES  # every roadmap category has cases ...
+    assert min(used.values()) >= 3  # ... at least 3 each
+    assert len({c.id for c in cases}) == len(cases)  # ids unique across files
+
+
+def test_the_injected_discount_is_graded_not_just_observed():
+    cases = {c.id: c for c in load_agent_cases(ROOT / "evals" / "agent_cases.jsonl")}
+    for cid in ("a07", "a08"):
+        assert "30%" in cases[cid].expect.draft_excludes and "30%" in cases[cid].flow.expect.draft_excludes
+        assert "30%" not in cases[cid].observe
+
+
+def test_stale_needs_the_old_page_and_the_flag():
+    case = EvalCase(id="t", category="freshness", question="q", kind="k", expect="stale",
+                    gold_sources=["intel-leadership-2024.md"])  # fmt: skip
+    assert grade_answer(case, _answer("Per 2024: yes.", ["intel-leadership-2024#000"], True))["pass"]
+    assert not grade_answer(case, _answer("Yes.", ["intel-leadership-2024#000"], False))["pass"]  # stated as current
+    assert not grade_answer(case, _answer("Unclear.", [], True))["pass"]  # didn't use the evidence that exists
+
+
+def _q(fit, cited=None, **met):
+    cited = cited or {}
+    return {"fit": fit, "criteria": [{"id": k, "met": v, "reason": "r", "chunk_ids": cited.get(k, [])}
+                                      for k, v in met.items()]}  # fmt: skip
+
+
+INTEL_Q = QualifyCase(
+    id="t", category="insufficient_evidence", lead_id="L2", fit="possible",
+    criteria={"eng_buyer": "yes", "software_org": "unknown"}, own_sources=["intel"],
+)  # fmt: skip
+
+
+def test_qualification_matching_the_labels_passes():
+    assert grade_qualification(INTEL_Q, _q("possible", eng_buyer="yes", software_org="unknown"))["pass"]
+
+
+def test_world_knowledge_yes_without_evidence_on_the_page_fails():
+    """'Everyone knows Intel writes software' is not in data/: a yes is a FAIL even if it's true."""
+    checks = grade_qualification(
+        INTEL_Q, _q("strong", {"software_org": ["intel-leadership#002"]}, eng_buyer="yes", software_org="yes")
+    )
+    assert not checks["criterion_software_org"] and not checks["fit"] and not checks["pass"]
+
+
+def test_citing_another_companys_page_fails():
+    stripe = QualifyCase(id="t", category="insufficient_evidence", lead_id="L91", fit="possible", own_sources=[])
+    assert grade_qualification(stripe, _q("possible", scale="unknown"))["cites_own_company"]
+    checks = grade_qualification(stripe, _q("possible", {"scale": ["figma-about#000"]}, scale="yes"))
+    assert not checks["cites_own_company"] and not checks["pass"]
+    figma = QualifyCase(id="t", category="straightforward", lead_id="L1", fit="strong", own_sources=["figma"])
+    both = {"scale": ["figma-about#000", "figma-company-profile#001"]}
+    assert grade_qualification(figma, _q("strong", both, scale="yes"))["cites_own_company"]
+
+
+def test_stretch_and_observed_criteria_are_reported_but_never_fail_a_case():
+    case = QualifyCase(id="t", category="straightforward", lead_id="L1", fit="strong",
+                       stretch={"dev_tooling": "yes"}, observe={"scale": "yes"})  # fmt: skip
+    checks = grade_qualification(case, _q("strong", dev_tooling="unknown", scale="unknown"))
+    assert checks["pass"]
+    assert (checks["stretch_dev_tooling"], checks["observe_scale"]) == (False, False)
+
+
+def test_a_qualify_that_raised_fails():
+    assert grade_qualification(INTEL_Q, None) == {"finished": False, "pass": False}

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://localhost/research_assistant"
     embedding_model: str = "text-embedding-3-small"  # EMBEDDING_MODEL in .env wins
     embedding_dims: int = 1536  # must match the model; checked on every embed call
+    judge_model: str | None = None  # D6 M3 claim checker: JUDGE_MODEL in .env, stronger than MODEL
 
     # D6 M1 tracing (Langfuse Cloud). Off unless TRACING_ENABLED=true AND both keys are set.
     tracing_enabled: bool = False

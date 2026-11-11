@@ -99,6 +99,16 @@ class Qualification(BaseModel):
     icp_version: str
 
 
+Verdict = Literal["supported", "partial", "unsupported", "not_a_claim"]
+
+
+class ClaimVerdict(BaseModel):
+    """The judge's structured output (D6 M3): does the cited text SUPPORT the claim? (Not: is it true.)"""
+
+    verdict: Verdict = Field(description="supported / partial / unsupported / not_a_claim.")
+    reason: str = Field(description="One short sentence: what the chunks do or don't say.")
+
+
 class EmailDraft(BaseModel):
     """The model's structured output for the workflow's draft node. Still goes through draft_email's
     validation (no links, no addresses, no invisible characters) before it's stored."""

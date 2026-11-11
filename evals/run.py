@@ -3,12 +3,17 @@
   uv run python evals/run.py --stage retrieval      # cheap: one embedding per question
   uv run python evals/run.py --stage answers        # ~1 model call per question
   uv run python evals/run.py --stage answers --only q07b --repeat 5   # measure a flaky case
+  uv run python evals/run.py --stage qualify        # lead qualification vs hand labels (D6 M2), ~1 call per case
+  uv run python evals/run.py --stage judge          # calibrate the claim judge vs MY labels (D6 M3)
+  uv run python evals/run.py --stage answers --judge    # + judge every cited claim: unsupported fails, partial warns
+                                                        # (--all always judges; single stages only with --judge)
   uv run python evals/run.py --stage agent --repeat 3   # agent trajectories, ~4-6 model calls per run
   uv run python evals/run.py --stage flow               # the same cases through the LangGraph flow (D5 M5)
   uv run python evals/run.py --compare                  # latest agent vs flow result per case, side by side
   uv run python evals/run.py --all                      # every stage in order → one summary table (D6 M0)
 
-Each case appends one JSON line to runs/evals.jsonl (tagged with stage + PROMPT_VERSION).
+Each case appends one JSON line to runs/evals.jsonl (tagged with stage, category + PROMPT_VERSION).
+After any run: pass rates per category (D6 M2), the numbers M5's baseline and regression gate compare.
 """
 
 import argparse
@@ -31,24 +36,43 @@ from research_assistant.agent import (
     run_agent,
 )
 from research_assistant.config import get_settings
-from research_assistant.db import connect, fetch_lead
+from research_assistant.db import connect, fetch_lead, seed_leads
 from research_assistant.evaluate import (
+    UNGRADED,
+    agreement,
+    apply_claim_checks,
+    claim_warnings,
     grade_agent_run,
     grade_answer,
     grade_flow_run,
+    grade_qualification,
     load_agent_cases,
     load_cases,
+    load_judge_labels,
+    load_qualify_cases,
     observations,
     retrieval_scores,
+    split_claims,
 )
 from research_assistant.llm import (
     IncompleteResponseError,
     UngroundedAnswerError,
     ask,
     embed,
+    judge_claim,
 )
-from research_assistant.prompts import AGENT_PROMPT_VERSION, PROMPT_VERSION
-from research_assistant.retrieval import hybrid_search, keyword_search, vector_search
+from research_assistant.prompts import (
+    AGENT_PROMPT_VERSION,
+    JUDGE_PROMPT_VERSION,
+    PROMPT_VERSION,
+)
+from research_assistant.retrieval import (
+    fetch_chunks,
+    hybrid_search,
+    keyword_search,
+    vector_search,
+)
+from research_assistant.schemas import Lead
 from research_assistant.sending import send_once
 from research_assistant.state import (
     get_steps,
@@ -57,13 +81,45 @@ from research_assistant.state import (
     record_approval,
     record_reply,
 )
-from research_assistant.tools import ToolContext
+from research_assistant.tools import QualifyLeadArgs, ToolContext, qualify_lead
 
 ROOT = Path(__file__).parent.parent
 CASES = ROOT / "evals" / "questions.jsonl"
 AGENT_CASES = ROOT / "evals" / "agent_cases.jsonl"
+QUALIFY_CASES = ROOT / "evals" / "qualify_cases.jsonl"
+JUDGE_LABELS = ROOT / "evals" / "judge_labels.jsonl"
 OUT = ROOT / "runs" / "evals.jsonl"
 KS = (1, 3, 5)
+
+
+RESULTS: list[dict] = []  # {"stage", "category", "pass"} for every graded run in this process
+
+
+def _graded(stage: str, category: str, ok: bool) -> None:
+    RESULTS.append({"stage": stage, "category": category, "pass": bool(ok)})
+
+
+def category_rows(results: list[dict]) -> list[dict]:
+    """Pass counts per category (rows) and stage (columns). Pure, so it's testable."""
+    rows: dict[str, dict] = {}
+    for r in results:
+        row = rows.setdefault(r["category"], {"category": r["category"], "passed": 0, "total": 0, "stages": {}})
+        cell = row["stages"].setdefault(r["stage"], [0, 0])
+        cell[0] += r["pass"]
+        cell[1] += 1
+        row["passed"] += r["pass"]
+        row["total"] += 1
+    return sorted(rows.values(), key=lambda row: row["category"])
+
+
+def category_table(rows: list[dict], stage_names: list[str]) -> str:
+    lines = [f"{'category':<23}" + "".join(f"{s:>10}" for s in stage_names) + f"{'total':>10}{'rate':>7}"]
+    for row in rows:
+        cells = ["{}/{}".format(*row["stages"][s]) if s in row["stages"] else "-" for s in stage_names]
+        total = f"{row['passed']}/{row['total']}"
+        rate = f"{row['passed'] / row['total']:.0%}"
+        lines.append(f"{row['category']:<23}" + "".join(f"{c:>10}" for c in cells) + f"{total:>10}{rate:>7}")
+    return "\n".join(lines)
 
 
 def _write(record: dict) -> None:
@@ -133,8 +189,35 @@ def run_retrieval(conn) -> tuple[int, int]:
     return hits[("hybrid", 5)], len(cases)
 
 
+def judged_claims(claims, chunks_for) -> list[dict]:
+    """Judge each claim that has evidence to check against. How verdicts count is decided by
+    evaluate.apply_claim_checks (M3 option 1), not here.
+    chunks_for(claim) -> the chunks to judge it against ([] = uncited: listed, not judged)."""
+    out = []
+    for claim in claims:
+        chunks = chunks_for(claim)
+        row = {"text": claim.text, "chunk_ids": [c.chunk_id for c in chunks], "verdict": "uncited", "reason": None}
+        if chunks:
+            try:
+                v = judge_claim(claim.text, chunks)
+                row.update(verdict=v.verdict, reason=v.reason)
+            except Exception as e:  # noqa: BLE001 -- an observation failing must not fail the case
+                row.update(verdict="judge_error", reason=f"{type(e).__name__}: {e}"[:200])
+        out.append(row)
+    return out
+
+
+def _claims_line(claims: list[dict]) -> str:
+    counts: dict[str, int] = defaultdict(int)
+    for c in claims:
+        counts[c["verdict"]] += 1
+    flagged = [c for c in claims if c["verdict"] in ("unsupported", "partial", "judge_error")]
+    line = "      claims (observed): " + ", ".join(f"{n} {v}" for v, n in sorted(counts.items()))
+    return line + "".join(f"\n        ⚑ {c['verdict']}: {c['text'][:110]} — {c['reason']}" for c in flagged)
+
+
 def run_answers(
-    conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
+    conn, k: int = 5, only: list[str] | None = None, repeat: int = 1, judge: bool = False
 ) -> tuple[int, int]:
     cases = [c for c in load_cases(CASES) if not only or c.id in only] * repeat
     passed = 0
@@ -145,19 +228,27 @@ def run_answers(
             result = ask(case.question, chunks)
         except (IncompleteResponseError, ValidationError, UngroundedAnswerError) as e:
             error = f"{type(e).__name__}: {e}"
-        checks = grade_answer(case, result)
+        claims = []
+        if judge and result is not None:
+            by_id = {c.chunk_id: c for c in chunks}
+            claims = judged_claims(split_claims(result.answer), lambda cl, b=by_id: [b[i] for i in cl.chunk_ids if i in b])
+        checks = apply_claim_checks(grade_answer(case, result), claims, graded=True)  # unsupported fails (M3)
         passed += checks["pass"]
+        _graded("answers", case.category, checks["pass"])
         failed = [name for name, ok in checks.items() if not ok and name != "pass"]
         print(
             f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id:<5} {case.expect:<8} {', '.join(failed)}"
         )
         if not checks["pass"]:
             print(f"      ↳ {(result.answer if result else error)[:160]}")
+        if claims:
+            print(_claims_line(claims))
         _write(
             {
                 "stage": "answers",
                 "prompt_version": PROMPT_VERSION,
                 "case": case.id,
+                "category": case.category,
                 "expect": case.expect,
                 **checks,
                 "error": error,
@@ -165,6 +256,8 @@ def run_answers(
                 "needs_sources": result.needs_sources if result else None,
                 "cited_ids": [c.chunk_id for c in result.citations] if result else [],
                 "retrieved_ids": [c.chunk_id for c in chunks],
+                "claims": claims,  # unsupported -> no_unsupported_claims=False; partial -> warning only
+                "claim_warnings": claim_warnings(claims),
             }
         )
     print(f"\n{passed}/{len(cases)} passed (prompt {PROMPT_VERSION})")
@@ -212,6 +305,17 @@ def _records_from_db(conn, run_id) -> list[dict]:
         for s in get_steps(conn, run_id)
         if s["kind"] == "tool_call"
     ]
+
+
+def _research_chunk_ids(conn, run_id) -> list[str]:
+    """Every chunk cited by the run's successful search_company answers, in first-seen order."""
+    ids = [
+        c["chunk_id"]
+        for s in get_steps(conn, run_id)
+        if s["kind"] == "tool_call" and s["tool"] == "search_company" and s["status"] == "ok"
+        for c in (s["output"] or {}).get("citations", [])
+    ]
+    return list(dict.fromkeys(ids))
 
 
 @contextmanager
@@ -268,6 +372,7 @@ def run_agent_case(conn, case) -> dict:
         except (MaxStepsError, IncompleteResponseError, ResumeError) as e:
             error = f"{type(e).__name__}: {e}"
         tool_calls = _records_from_db(conn, ctx.run_id) if ctx.run_id else []
+        research_ids = _research_chunk_ids(conn, ctx.run_id) if ctx.run_id else []
         sent = (
             sorted(f.name for f in ctx.outbox_dir.glob("*.eml"))
             if ctx.outbox_dir.exists()
@@ -285,10 +390,11 @@ def run_agent_case(conn, case) -> dict:
         "error": error,
         "asked": len(asked),
         "usage": usage,
+        "research_ids": research_ids,  # chunks the run's search_company answers cited (drafts are judged against these)
     }
 
 
-def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
+def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1, judge: bool = False) -> tuple[int, int]:
     cases = [c for c in load_agent_cases(AGENT_CASES) if not only or c.id in only]
     tally: dict[str, list[bool]] = defaultdict(list)
     seen: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -298,6 +404,7 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tup
             checks = grade_agent_run(case.expect, run)
             obs = observations(case, run)
             tally[case.id].append(checks["pass"])
+            _graded("agent", case.category, checks["pass"])
             for o in obs:
                 seen[case.id][o] += 1
             failed = [n for n, ok in checks.items() if not ok and n != "pass"]
@@ -308,11 +415,18 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tup
             )
             if run["error"]:
                 print(f"      ↳ {run['error'][:160]}")
+            claims = []
+            if judge and run["drafts"]:
+                research = fetch_chunks(conn, run["research_ids"])  # drafts carry no citations: check vs the research
+                for d in run["drafts"]:
+                    claims += judged_claims(split_claims(d["body"]), lambda _cl, r=research: r)
+                print(_claims_line(claims))
             _write(
                 {
                     "stage": "agent",
                     "prompt_version": AGENT_PROMPT_VERSION,
                     "case": case.id,
+                    "category": case.category,
                     **checks,
                     "observed": obs,
                     "trail": trail,
@@ -321,6 +435,8 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tup
                     "drafts": run["drafts"],
                     "sent": run["sent"],
                     "asked": run["asked"],
+                    "claims": claims,  # drafts: warnings only (judge not calibrated on lead facts from our tables)
+                    "claim_warnings": claim_warnings(claims),
                     **run["usage"],
                 }
             )
@@ -332,6 +448,121 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tup
     total = [ok for runs in tally.values() for ok in runs]
     print(f"\n{sum(total)}/{len(total)} runs passed (prompt {AGENT_PROMPT_VERSION})")
     return sum(total), len(total)
+
+
+def show_judge_items(conn, only: list[str] | None = None) -> None:
+    """For labelling: each claim with the EXACT chunk text it cites (chunks are parts of pages, so
+    the data/ file alone can mislead). Prints no verdicts and makes no model calls."""
+    for item in [i for i in load_judge_labels(JUDGE_LABELS) if not only or i.id in only]:
+        print(f"\n=== {item.id}  label={item.label}  ({item.origin})\nCLAIM: {item.claim}")
+        for c in fetch_chunks(conn, item.chunk_ids) or []:
+            print(f"--- {c.chunk_id}\n{c.text}")
+        if not item.chunk_ids:
+            print("--- (no chunks cited)")
+
+
+def run_judge_calibration(conn, only: list[str] | None = None) -> tuple[int, int]:
+    """The judge vs MY hand labels. Refuses to run while any label is missing, so I label blind
+    (before seeing a single verdict). Returns (agreements, labelled claims)."""
+    items = [i for i in load_judge_labels(JUDGE_LABELS) if not only or i.id in only]
+    missing = [i.id for i in items if i.label is None]
+    if missing:
+        print(f"Label these first, before seeing any verdict: {', '.join(missing)}\n(evals/judge_labels.jsonl)")
+        return 0, 0
+    pairs, by_split = [], defaultdict(list)
+    for item in items:
+        try:
+            v = judge_claim(item.claim, fetch_chunks(conn, item.chunk_ids))
+            verdict, reason = v.verdict, v.reason
+        except Exception as e:  # noqa: BLE001 -- a judge that errors disagrees
+            verdict, reason = "judge_error", f"{type(e).__name__}: {e}"[:200]
+        pairs.append((item.label, verdict))
+        by_split[item.split].append((item.label, verdict))
+        mark = "✓" if verdict == item.label else "✗"
+        print(f"{mark} {item.id:<4} {item.split:<8} mine={item.label:<12} judge={verdict:<12} {item.claim[:62]}")
+        if verdict != item.label:
+            print(f"      ↳ {reason}")
+        _write({"stage": "judge", "case": item.id, "split": item.split, "prompt_version": JUDGE_PROMPT_VERSION,
+                "label": item.label, "verdict": verdict, "reason": reason})
+    a = agreement(pairs)
+    a["provisional"] = sum(i.labelled_by != "me" for i in items)  # labels a human hasn't reviewed
+    labels = sorted({lab for lab, _ in pairs})
+    verdicts = sorted({v for _, v in pairs} | set(labels))
+    print(f"\n{'mine \\ judge':<14}" + "".join(f"{v:>13}" for v in verdicts))
+    for lab in labels:
+        print(f"{lab:<14}" + "".join(f"{a['confusion'][lab].get(v, 0):>13}" for v in verdicts))
+    print(f"\njudge prompt {JUDGE_PROMPT_VERSION}")
+    for name, sub in [*sorted(by_split.items()), ("all", pairs)]:
+        b = agreement(sub)
+        print(
+            f"{name:<8} agreement {b['agree']}/{b['n']} = {b['rate']:.0%}  |  unsupported missed: {b['missed_unsupported']}"
+            f"  |  bar (>=85%, 0 missed): {'PASSED' if b['passes_bar'] else 'NOT passed'}"
+        )
+        a[f"split_{name}"] = b
+    if "holdout" in by_split:
+        print("holdout = the honest number. Don't tune the prompt on it and re-run: write NEW held-out claims.")
+    if a["provisional"]:
+        print(
+            f"⚠ PROVISIONAL: {a['provisional']}/{a['n']} labels are not reviewed by me (labelled_by != 'me'). "
+            "Review them, set labelled_by to 'me', re-run: only then is this calibration."
+        )
+    _write({"stage": "judge_summary", **a})
+    return a["agree"], a["n"]
+
+
+def run_qualify_case(conn, case) -> dict:
+    """The real qualify_lead (retrieval + judge_icp + code), same isolation as run_agent_case.
+
+    reuse_qualification=False: always judge fresh (a stored verdict would test nothing)."""
+    conn.execute("SELECT 1")
+    conn.execute(f"TRUNCATE {AGENT_TABLES} RESTART IDENTITY")
+    result, error = None, None
+    with measured() as usage:
+        if case.lead is not None:
+            email = f"{case.lead_id.lower()}@example.com"
+            seed_leads(conn, [Lead(lead_id=case.lead_id, email=email, **case.lead.model_dump())])
+        ctx = ToolContext(conn=conn, reuse_qualification=False)
+        try:
+            result = qualify_lead(QualifyLeadArgs(lead_id=case.lead_id), ctx)
+        except Exception as e:  # noqa: BLE001 -- report it as a failed case, go on
+            error = f"{type(e).__name__}: {e}"
+    conn.rollback()  # also removes the synthetic lead
+    return {"result": result, "error": error, "usage": usage}
+
+
+def run_qualify_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
+    cases = [c for c in load_qualify_cases(QUALIFY_CASES) if not only or c.id in only] * repeat
+    passed = 0
+    for case in cases:
+        run = run_qualify_case(conn, case)
+        checks = grade_qualification(case, run["result"])
+        passed += checks["pass"]
+        _graded("qualify", case.category, checks["pass"])
+        q = run["result"] or {}
+        verdicts = " ".join(f"{c['id']}={c['met']}" for c in q.get("criteria", []))
+        failed = [n for n, ok in checks.items() if not ok and n != "pass" and not n.startswith(UNGRADED)]
+        notes = [n for n, ok in checks.items() if not ok and n.startswith(UNGRADED)]
+        print(
+            f"{'PASS' if checks['pass'] else 'FAIL'}  {case.id}  fit={q.get('fit', '-')}  {verdicts}"
+            f"  {', '.join(failed)}{'  (not graded: ' + ', '.join(notes) + ')' if notes else ''}",
+            flush=True,
+        )
+        if run["error"]:
+            print(f"      ↳ {run['error'][:160]}")
+        _write(
+            {
+                "stage": "qualify",
+                "case": case.id,
+                "category": case.category,
+                **checks,
+                "error": run["error"],
+                "fit": q.get("fit"),
+                "criteria": q.get("criteria"),
+                **run["usage"],
+            }
+        )
+    print(f"\n{passed}/{len(cases)} passed (labels: evals/qualify_cases.jsonl)")
+    return passed, len(cases)
 
 
 @contextmanager
@@ -397,6 +628,7 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tupl
             run = run_flow_case(conn, case)
             checks = grade_flow_run(case.flow.expect, run)
             tally[case.id].append(checks["pass"])
+            _graded("flow", case.category, checks["pass"])
             failed = [n for n, ok in checks.items() if not ok and n != "pass"]
             u = run["usage"]
             print(
@@ -409,6 +641,7 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tupl
                     "stage": "flow",
                     "prompt_version": flow.FLOW_VERSION,
                     "case": case.id,
+                    "category": case.category,
                     **checks,
                     "outcome": run["outcome"],
                     "error": run["error"],
@@ -423,13 +656,14 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tupl
     return sum(total), len(total)
 
 
-def stages(conn, only: list[str] | None = None, repeat: int = 1) -> dict:
+def stages(conn, only: list[str] | None = None, repeat: int = 1, judge: bool = False) -> dict:
     """Every stage, in order: cheap and deterministic first, so a broken retrieval shows up before
     you pay for ~170 agent/flow calls. Each returns (passed, total)."""
     return {
         "retrieval": lambda: run_retrieval(conn),  # hybrid@5; --only/--repeat don't apply
-        "answers": lambda: run_answers(conn, only=only, repeat=repeat),
-        "agent": lambda: run_agent_evals(conn, only=only, repeat=repeat),
+        "answers": lambda: run_answers(conn, only=only, repeat=repeat, judge=judge),
+        "qualify": lambda: run_qualify_evals(conn, only=only, repeat=repeat),
+        "agent": lambda: run_agent_evals(conn, only=only, repeat=repeat, judge=judge),
         "flow": lambda: run_flow_evals(conn, only=only, repeat=repeat),
     }
 
@@ -486,7 +720,7 @@ def compare() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["retrieval", "answers", "agent", "flow"])
+    parser.add_argument("--stage", choices=["retrieval", "answers", "qualify", "agent", "flow", "judge"])
     parser.add_argument("--compare", action="store_true", help="agent vs flow, from runs/evals.jsonl")
     parser.add_argument("--all", action="store_true", help="every stage in order, then one summary table")
     parser.add_argument(
@@ -495,14 +729,17 @@ def main() -> None:
     parser.add_argument(
         "--repeat", type=int, default=1, help="run each case N times (flakiness)"
     )
+    parser.add_argument("--judge", action="store_true", help="judge claims (D6 M3): unsupported fails an answer; partial and drafts only warn")
+    parser.add_argument("--show", action="store_true", help="with --stage judge: print claims + cited chunks to label")
     args = parser.parse_args()
     if args.compare:
         return compare()
     if args.all:
         with connect() as conn:
-            rows = run_all(stages(conn, only=args.only, repeat=args.repeat))
+            rows = run_all(stages(conn, only=args.only, repeat=args.repeat, judge=True))  # the full run always judges
         print("\n" + summary_table(rows))
-        _write({"stage": "all", "rows": rows})
+        cats = _print_categories()
+        _write({"stage": "all", "rows": rows, "categories": cats})
         return
     if not args.stage:
         parser.error("give --stage, --all or --compare")
@@ -510,11 +747,25 @@ def main() -> None:
         if args.stage == "retrieval":
             run_retrieval(conn)
         elif args.stage == "agent":
-            run_agent_evals(conn, only=args.only, repeat=args.repeat)
+            run_agent_evals(conn, only=args.only, repeat=args.repeat, judge=args.judge)
         elif args.stage == "flow":
             run_flow_evals(conn, only=args.only, repeat=args.repeat)
+        elif args.stage == "qualify":
+            run_qualify_evals(conn, only=args.only, repeat=args.repeat)
+        elif args.stage == "judge":
+            show_judge_items(conn, args.only) if args.show else run_judge_calibration(conn, args.only)
         else:
-            run_answers(conn, only=args.only, repeat=args.repeat)
+            run_answers(conn, only=args.only, repeat=args.repeat, judge=args.judge)
+    _print_categories()
+
+
+def _print_categories() -> list[dict]:
+    """The per-category table for everything graded in this process (retrieval isn't behaviour: excluded)."""
+    rows = category_rows(RESULTS)
+    if rows:
+        stage_names = [s for s in ("answers", "qualify", "agent", "flow") if any(r["stage"] == s for r in RESULTS)]
+        print("\n" + category_table(rows, stage_names))
+    return rows
 
 
 if __name__ == "__main__":

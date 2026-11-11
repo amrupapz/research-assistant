@@ -140,3 +140,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def fetch_chunks(conn: psycopg.Connection, chunk_ids: list[str]) -> list[Chunk]:
+    """Chunks by id, in the order asked; unknown ids are skipped (citations are snapshots)."""
+    if not chunk_ids:
+        return []
+    rows = conn.execute(
+        "SELECT chunk_id, source_url, fetched_at, title, text FROM chunks WHERE chunk_id = ANY(%s)", [chunk_ids]
+    ).fetchall()
+    by_id = {r[0]: Chunk(chunk_id=r[0], source_url=r[1], fetched_at=r[2], title=r[3], text=r[4]) for r in rows}
+    return [by_id[c] for c in chunk_ids if c in by_id]
