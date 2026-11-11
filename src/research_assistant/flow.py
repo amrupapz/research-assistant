@@ -36,7 +36,7 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.types import Command, RetryPolicy, interrupt
 from psycopg.rows import dict_row
 
-from research_assistant import state
+from research_assistant import state, tracing
 from research_assistant.config import Settings, get_settings
 from research_assistant.llm import is_retryable, write_email
 from research_assistant.permissions import ToolCall, authorize
@@ -108,12 +108,16 @@ def call_tool(ctx: ToolContext, name: str, args: dict) -> dict:
     Only "allow" runs here. needs_approval (send_email) is NOT handled by this helper: that's the
     approval node's job (M3), so the workflow can never send by accident.
     """
-    parsed = validate_call(name, json.dumps(args))
-    decision = authorize(ToolCall(name, parsed))
-    if decision != "allow":
-        raise FlowError(f"{name} is not allowed here (decision={decision})")
-    with ctx.conn.transaction():
-        return execute(name, parsed, ctx)
+    with tracing.observe(name, as_type="tool", input=args) as span:
+        parsed = validate_call(name, json.dumps(args))
+        decision = authorize(ToolCall(name, parsed))
+        span.update(metadata={"decision": decision})
+        if decision != "allow":
+            raise FlowError(f"{name} is not allowed here (decision={decision})")
+        with ctx.conn.transaction():
+            output = execute(name, parsed, ctx)
+        span.update(output=output)
+        return output
 
 
 # --- nodes: each takes the state, returns ONLY the fields it changes -----------------------
@@ -143,6 +147,20 @@ def guarded(name: str, fn):
             if is_transient(e):
                 raise
             return {"error": {"node": name, "type": type(e).__name__, "message": str(e)[:300]}}
+
+    return node
+
+
+def traced(name: str, fn):
+    """One chain observation per node run. interrupt() (GraphBubbleUp) is a pause, not an error."""
+
+    def node(s: FlowState) -> FlowState:
+        with tracing.observe(name, as_type="chain", not_errors=(GraphBubbleUp,)) as span:
+            update = fn(s)
+            span.update(output=update)
+            if update.get("error"):  # guarded() caught a permanent error: the node failed
+                span.update(level="ERROR", status_message=update["error"]["message"])
+            return update
 
     return node
 
@@ -249,12 +267,16 @@ def build_graph(ctx: ToolContext, checkpointer=None):
         d = s["draft"]
         parsed = validate_call("send_email", json.dumps({"draft_id": d["draft_id"]}))
         decision = authorize(ToolCall("send_email", parsed))
-        if decision != "needs_approval":  # deny → never; "allow" would mean the rules changed under us
-            raise FlowError(f"send_email is not allowed here (decision={decision})")
-        try:  # NOT inside a transaction: send_once commits its own claim/send steps (D4 M5)
-            out = execute("send_email", parsed, ctx)
-        except ToolError as e:
-            return {"outcome": f"error: send failed ({e})"}
+        with tracing.observe("send_email", as_type="tool", input={"draft_id": d["draft_id"]}) as span:
+            span.update(metadata={"decision": decision, "approved": s.get("approved")})
+            if decision != "needs_approval":  # deny → never; "allow" would mean the rules changed under us
+                raise FlowError(f"send_email is not allowed here (decision={decision})")
+            try:  # NOT inside a transaction: send_once commits its own claim/send steps (D4 M5)
+                out = execute("send_email", parsed, ctx)
+            except ToolError as e:
+                span.update(level="ERROR", status_message=str(e))
+                return {"outcome": f"error: send failed ({e})"}
+            span.update(output=out)
         return {"sent": out, "outcome": f"{out['status']}: {d['draft_id']} to {d['to']}"}
 
     def failed(s: FlowState) -> FlowState:
@@ -265,10 +287,10 @@ def build_graph(ctx: ToolContext, checkpointer=None):
     # read/draft nodes: guarded + DB retry. send: guarded, NO retry (send_once's "check manually"
     # must reach a human). approve: neither (interrupt() lives there). stop/failed can't fail.
     for name, fn in [("load_lead", load_lead), ("research", research), ("qualify", qualify), ("draft", draft)]:
-        g.add_node(name, guarded(name, fn), retry_policy=DB_RETRY)
-    g.add_node("send", guarded("send", send))
+        g.add_node(name, traced(name, guarded(name, fn)), retry_policy=DB_RETRY)
+    g.add_node("send", traced("send", guarded("send", send)))
     for name, fn in [("approve", approve), ("stop", stop), ("failed", failed)]:
-        g.add_node(name, fn)
+        g.add_node(name, traced(name, fn))
     g.add_edge(START, "load_lead")
     g.add_conditional_edges("load_lead", unless_failed(after_load), ["research", END, "failed"])
     g.add_conditional_edges("research", unless_failed(lambda s: "qualify"), ["qualify", "failed"])
@@ -285,22 +307,34 @@ def _config(run_id: UUID) -> dict:
     return {"configurable": {"thread_id": str(run_id)}}
 
 
-def _invoke(ctx: ToolContext, checkpointer, graph_input) -> FlowState:
+def _invoke(ctx: ToolContext, checkpointer, graph_input, trace_name: str, trace_input: dict) -> FlowState:
     """Run (or continue) the graph on thread run_id; keep the runs row's status in step:
-    paused at interrupt() → 'waiting', reached END → 'done', raised → 'failed'."""
-    graph = build_graph(ctx, checkpointer)
-    try:
-        final = graph.invoke(graph_input, _config(ctx.run_id))
-    except BaseException:  # BaseException: Ctrl+C (KeyboardInterrupt) is NOT an Exception
-        with ctx.conn.transaction():
-            state.finish_run(ctx.conn, ctx.run_id, "failed")
-        raise
-    paused = bool(graph.get_state(_config(ctx.run_id)).next)  # nodes still to run = stopped at interrupt()
+    paused at interrupt() → 'waiting', reached END → 'done', raised → 'failed'.
+
+    Each invocation is one root observation in the run's trace (same trace_id every time), so a
+    flow that pauses at approve and is approved tomorrow is ONE trace: flow ... flow-approve."""
     with ctx.conn.transaction():
-        if paused:
-            state.wait_run(ctx.conn, ctx.run_id, final.get("outcome"))
-        else:  # reached END: through the failed node (permanent error) or normally
-            state.finish_run(ctx.conn, ctx.run_id, "failed" if final.get("error") else "done", final.get("outcome"))
+        state.set_trace_id(ctx.conn, ctx.run_id, tracing.trace_id_for(ctx.run_id))
+    graph = build_graph(ctx, checkpointer)
+    meta = {"flow_version": FLOW_VERSION}
+    with tracing.run_trace(ctx.run_id, trace_name, as_type="chain", input=trace_input, metadata=meta) as root:
+        try:
+            final = graph.invoke(graph_input, _config(ctx.run_id))
+        except BaseException:  # BaseException: Ctrl+C (KeyboardInterrupt) is NOT an Exception
+            with ctx.conn.transaction():
+                state.finish_run(ctx.conn, ctx.run_id, "failed")
+            raise
+        paused = bool(graph.get_state(_config(ctx.run_id)).next)  # nodes still to run = stopped at interrupt()
+        status = "waiting" if paused else "failed" if final.get("error") else "done"
+        with ctx.conn.transaction():
+            if paused:
+                state.wait_run(ctx.conn, ctx.run_id, final.get("outcome"))
+            else:  # reached END: through the failed node (permanent error) or normally
+                state.finish_run(ctx.conn, ctx.run_id, status, final.get("outcome"))
+        root.update(
+            output={"outcome": final.get("outcome"), "status": status},
+            level="ERROR" if status == "failed" else "DEFAULT",
+        )
     return final
 
 
@@ -314,7 +348,7 @@ def run_flow(lead_id: str, ctx: ToolContext, settings: Settings | None = None, c
     checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
     with ctx.conn.transaction():
         ctx.run_id = state.start_run(ctx.conn, f"flow {lead_id}", settings.model, FLOW_VERSION)
-    return _invoke(ctx, checkpointer, {"lead_id": lead_id})
+    return _invoke(ctx, checkpointer, {"lead_id": lead_id}, "flow", {"lead_id": lead_id})
 
 
 def _flow_run(ctx: ToolContext, run_id: UUID) -> dict:
@@ -339,7 +373,7 @@ def resume_flow(run_id: UUID, ctx: ToolContext, checkpointer) -> FlowState:
     ctx.run_id = run_id
     with ctx.conn.transaction():
         state.mark_running(ctx.conn, run_id)
-    return _invoke(ctx, checkpointer, None)  # None = "no new input: continue from the checkpoint"
+    return _invoke(ctx, checkpointer, None, "flow-resume", {"run_id": str(run_id)})  # None = "no new input: continue from the checkpoint"
 
 
 def approve_flow(draft_id: str, approved: bool, ctx: ToolContext, checkpointer) -> FlowState:
@@ -355,10 +389,17 @@ def approve_flow(draft_id: str, approved: bool, ctx: ToolContext, checkpointer) 
     ctx.run_id = run_id
     with ctx.conn.transaction():
         state.mark_running(ctx.conn, run_id)
-    return _invoke(ctx, checkpointer, Command(resume=approved))
+    return _invoke(ctx, checkpointer, Command(resume=approved), "flow-approve", {"draft_id": draft_id, "approved": approved})
 
 
 def main() -> None:
+    try:
+        _main()
+    finally:
+        tracing.shutdown()  # a short-lived CLI: send queued spans before the process exits
+
+
+def _main() -> None:
     from langgraph.checkpoint.postgres import PostgresSaver
 
     from research_assistant.db import connect

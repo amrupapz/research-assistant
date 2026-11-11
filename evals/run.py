@@ -22,7 +22,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from research_assistant import flow
+from research_assistant import flow, tracing
 from research_assistant.agent import (
     MaxStepsError,
     ResumeError,
@@ -518,4 +518,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        tracing.shutdown()  # D6 M1: eval runs are traced too when TRACING_ENABLED; send before exit

@@ -5,6 +5,7 @@ from typing import Literal
 
 import psycopg
 
+from research_assistant import tracing
 from research_assistant.db import EmbedFn, to_pgvector
 from research_assistant.schemas import Chunk
 
@@ -99,10 +100,15 @@ def hybrid_search(
     embed: EmbedFn | None = None,
     rrf_k: int = 60,
 ) -> list[Result]:
-    """Keyword (any-word) + vector, top `candidates` from each, fused with RRF -> top k."""
-    keyword = keyword_search(conn, query, candidates, match="any")
-    vector = vector_search(conn, query, candidates, embed=embed)
-    return rrf_merge([keyword, vector], k=rrf_k, top_k=k)
+    """Keyword (any-word) + vector, top `candidates` from each, fused with RRF -> top k.
+
+    Traced as a retriever; its child embed observation is the model part, the rest is DB time (M4)."""
+    with tracing.observe("hybrid_search", as_type="retriever", input={"query": query, "k": k}) as span:
+        keyword = keyword_search(conn, query, candidates, match="any")
+        vector = vector_search(conn, query, candidates, embed=embed)
+        results = rrf_merge([keyword, vector], k=rrf_k, top_k=k)
+        span.update(output=[{"chunk_id": c.chunk_id, "score": round(s, 4)} for c, s in results])
+        return results
 
 
 def main() -> None:

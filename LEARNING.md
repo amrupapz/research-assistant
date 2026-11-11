@@ -1630,3 +1630,51 @@ Stages now return (passed, total); retrieval's number is hybrid@5, the setting t
 A crashing stage is reported in the table and the rest still run. Tests: fake stages + fake meter.
 
 **Gotcha:** evals/ isn't a package: the test imports evals/run.py by file path (importlib).
+
+## D6 M1 — Langfuse tracing
+
+**Concept:** a trace is one tree per run: a root (the agent run or flow invocation) with timed child
+observations (retrieval, every model call with tokens + cost, every tool call with the gate's
+decision). My JSONL logs had the numbers but flat: no "which step belongs to which run, which call
+waited on which". Without the tree, M4 can't split model time from DB time, and debugging a failed
+flow is grepping runs/*.jsonl.
+
+**Skill vs CLAUDE.md** (installed langfuse/skills @ f0bcb13 into .claude/skills/langfuse):
+- skill: use the `langfuse.openai` drop-in + LangGraph CallbackHandler → me: manual, in llm.py and a
+  `traced()` node wrapper. Drop-in's Responses-API + max_retries pass-through undocumented; my retries.
+- skill: SDK reads LANGFUSE_* from env → me: keys in Settings (SecretStr), passed explicitly.
+- skill: move prompts / datasets / judges / CI gate into Langfuse → me: no. Langfuse = observability;
+  evals stay local + reproducible (prompts.py, *.jsonl, my regression_gate, evals/run.py in Actions).
+- skill: agent fetches traces with npx langfuse-cli → me: tests never send; I check traces in the UI.
+
+**Built:** `tracing.py` (only file importing langfuse; no-op unless TRACING_ENABLED=true + both
+keys). trace_id = `create_trace_id(seed=run_id)` → stored in runs.trace_id (migration 0005) and on
+every run-log line. Observation types: agent / chain (flow nodes) / tool / retriever / generation /
+embedding, plus a `human-approval` span. Cost from a price table in config (`PRICES`), also written
+to the run log as cost_usd. Emails masked before export. CLIs + evals call `tracing.shutdown()`.
+Tests: real SDK + OpenTelemetry InMemorySpanExporter → assert the real tree, nothing leaves the process.
+
+**Gotchas**
+- OpenAI input_tokens INCLUDES cached tokens; Langfuse usage buckets must not overlap → send
+  input = uncached, input_cached_tokens = cached, or cost is double-counted.
+- Langfuse can't price a model it doesn't know (gpt-6-luna) → no cost unless I send cost_details.
+- A flow paused at interrupt() and approved tomorrow = 2 invocations. Same seeded trace_id → ONE trace
+  with roots `flow` + `flow-approve`. interrupt() raises GraphBubbleUp: must NOT mark the span ERROR.
+- human approval inside the tool span would make "tool latency" include me reading an email →
+  separate span so M4 can subtract it.
+- Langfuse singleton: a 2nd `Langfuse(...)` with the same public key reuses the 1st one's setup.
+- `LANGFUSE_TRACING_ENABLED=false` in the env overrides `tracing_enabled=True` in code.
+- pydantic-settings reads .env but does NOT export to os.environ → the SDK wouldn't see the keys anyway.
+- **Found in the first REAL trace, not by tests:** the paused `approve` node showed level=ERROR. I
+  only set Langfuse's level attribute, but the GraphBubbleUp exception still passed THROUGH the span,
+  so OpenTelemetry set status=ERROR and the server displays that as ERROR. Fix: catch the pause
+  inside the span, close it normally, re-raise after. The test fixture now reads level the way the
+  server does (attribute, else OTel status) — the old test passed while the UI was red.
+- Langfuse's costDetails already includes `total`: summing every key double-counts.
+- First real runs: agent L2 = 13 observations, ~$0.0014; search_company 14s of which ask = 12.1s
+  (1051 output tokens, mostly reasoning). Flow L4 reused research + qualification (< 7 days): only
+  write_email hit the model.
+- Fix confirmed live (flow L2, trace d7f0adaa…): paused `approve` = DEFAULT. 33 observations, $0.0015,
+  19.4s. First embed of a process 1.85s, later ones ~0.26s: a cold HTTPS connection, not the model
+  (M4: report first-call vs warm). Extra pass: 3 searches + deeper qualify, still "possible" with
+  software_org=unknown for INTEL — a qualification-correctness question for M2.

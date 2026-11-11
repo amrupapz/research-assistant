@@ -7,7 +7,9 @@ import os
 
 import psycopg
 import pytest
+from opentelemetry.trace import StatusCode
 
+from research_assistant import tracing
 from research_assistant.db import connect, migrate, seed_leads
 
 TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/research_assistant_test")
@@ -55,3 +57,68 @@ def state_db(db):
     db.execute(f"TRUNCATE {AGENT_TABLES} RESTART IDENTITY")
     seed_leads(db)
     return db
+
+
+# --- tracing (D6 M1): tests NEVER send traces ---------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def tracing_off():
+    """Every test starts and ends with tracing off, whatever .env says. Tests that check spans
+    opt in with the `spans` fixture (real SDK, in-memory exporter: nothing leaves the process)."""
+    tracing.use(None)
+    yield
+    tracing.use(None)
+
+
+@pytest.fixture(scope="session")
+def _memory_langfuse():
+    from langfuse import Langfuse
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    exporter = InMemorySpanExporter()
+    lf = Langfuse(
+        public_key="pk-lf-test",
+        secret_key="sk-lf-test",
+        base_url="http://127.0.0.1:9",  # nothing listens there; the exporter below replaces the network one
+        span_exporter=exporter,
+        mask=tracing.mask,
+    )
+    yield lf, exporter
+    lf.shutdown()
+
+
+@pytest.fixture
+def spans(_memory_langfuse):
+    """Turn tracing on for this test; call the result to get the finished observations as dicts:
+    {name, type, parent (name or None), trace_id, level, metadata, attrs}."""
+    lf, exporter = _memory_langfuse
+    exporter.clear()
+    tracing.use(lf)
+
+    def finished() -> list[dict]:
+        lf.flush()
+        raw = exporter.get_finished_spans()
+        names = {s.context.span_id: s.name for s in raw}
+        out = []
+        for s in raw:
+            a = dict(s.attributes)
+            prefix = "langfuse.observation.metadata."
+            out.append({
+                "name": s.name,
+                "type": a.get("langfuse.observation.type"),
+                "parent": names.get(s.parent.span_id) if s.parent else None,
+                "trace_id": format(s.context.trace_id, "032x"),
+                # Like the Langfuse server: no explicit level + OpenTelemetry status ERROR -> ERROR.
+                # (Checking only the attribute missed every paused approve showing ERROR live.)
+                "level": a.get(
+                    "langfuse.observation.level", "ERROR" if s.status.status_code == StatusCode.ERROR else "DEFAULT"
+                ),
+                "metadata": {k.removeprefix(prefix): v for k, v in a.items() if k.startswith(prefix)},
+                "attrs": a,
+            })
+        return out
+
+    return finished

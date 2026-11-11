@@ -23,6 +23,12 @@ def _tables(url: str) -> set[str]:
     return {r[0] for r in rows if not r[0].startswith("checkpoint")} - {"alembic_version"}
 
 
+def _columns(url: str, table: str) -> set[str]:
+    with connect(url) as conn:
+        rows = conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", [table]).fetchall()
+    return {r[0] for r in rows}
+
+
 def _revision(url: str) -> str | None:
     with connect(url) as conn:
         row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
@@ -38,7 +44,12 @@ def at_head_afterwards(test_db_url):
 def test_up_and_down_step_by_step(at_head_afterwards):
     url, cfg = at_head_afterwards, alembic_config(at_head_afterwards, TEST_DIMS)
     assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
+    assert _revision(url) == "0005"
+    assert "trace_id" in _columns(url, "runs")
+
+    command.downgrade(cfg, "-1")  # 0005 only adds runs.trace_id: same tables
     assert _revision(url) == "0004"
+    assert "trace_id" not in _columns(url, "runs")
 
     command.downgrade(cfg, "-1")  # 0004 only changes a CHECK: same tables
     assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
@@ -63,7 +74,7 @@ def test_up_and_down_step_by_step(at_head_afterwards):
 def test_upgrade_is_a_no_op_at_head(at_head_afterwards):
     migrate(at_head_afterwards, dims=TEST_DIMS)
     migrate(at_head_afterwards, dims=TEST_DIMS)
-    assert _revision(at_head_afterwards) == "0004"
+    assert _revision(at_head_afterwards) == "0005"
 
 
 def test_baseline_uses_the_configured_dims(at_head_afterwards):

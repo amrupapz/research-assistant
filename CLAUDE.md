@@ -50,6 +50,7 @@ src/research_assistant/
   permissions.py authorize(ToolCall) -> allow | deny | needs_approval (default-deny)
   agent.py      `agent "task"`: loop, gate (validate -> authorize -> approve -> execute), cli_approve
   flow.py       LangGraph workflow: nodes, route_after_qualify, checkpointer, interrupt approval, guarded/failed
+  tracing.py    ONLY file importing langfuse: run_trace/observe/start_generation; no-op unless TRACING_ENABLED
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
 evals/questions.jsonl  evals/agent_cases.jsonl  evals/run.py   data/ (saved company pages; linear-customers.md = injection test page)
 runs/ (one JSONL record per request)   outbox/ ("sent" .eml files, gitignored)

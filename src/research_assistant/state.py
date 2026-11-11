@@ -28,6 +28,17 @@ def start_run(conn: psycopg.Connection, task: str, model: str, agent_prompt_vers
     ).fetchone()[0]
 
 
+def set_trace_id(conn: psycopg.Connection, run_id: UUID, trace_id: str | None) -> None:
+    """Link the run to its Langfuse trace (D6 M1). No-op when tracing is off (trace_id None)."""
+    if trace_id is not None:
+        conn.execute("UPDATE runs SET trace_id = %s WHERE run_id = %s", [trace_id, run_id])
+
+
+def get_trace_id(conn: psycopg.Connection, run_id: UUID) -> str | None:
+    row = conn.execute("SELECT trace_id FROM runs WHERE run_id = %s", [run_id]).fetchone()
+    return row[0] if row else None
+
+
 def get_run(conn: psycopg.Connection, run_id: UUID) -> dict | None:
     row = conn.execute(
         "SELECT task, status, model, agent_prompt_version FROM runs WHERE run_id = %s", [run_id]

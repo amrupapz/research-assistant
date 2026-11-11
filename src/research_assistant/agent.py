@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
-from research_assistant import state
+from research_assistant import state, tracing
 from research_assistant.config import Settings, get_settings
 from research_assistant.llm import (
     IncompleteResponseError,
@@ -118,21 +118,28 @@ def handle_call(
         "arguments": call.get("arguments", "")[:500],
     }
     start = time.perf_counter()
-    try:
-        args, output = _decide(name, call.get("arguments", ""), ctx, authorize_fn, approve_fn, record)
-        _save_approval(ctx, record)  # its own commit: send_once checks for it (M5)
-        external = args is not None and REGISTRY[name].external
-        if external:  # e.g. send_email: commits its own ledger steps, so it can't sit inside ours
-            output = _execute(name, args, ctx, record, savepoint=False)
-        with ctx.conn.transaction():
-            if args is not None and not external:
-                output = _execute(name, args, ctx, record)
-            _save_step(ctx, call, step, record, output)
-        record["output_preview"] = json.dumps(output, default=str)[:500]  # what the MODEL saw back
-        return output, record
-    finally:
-        record["latency_ms"] = round((time.perf_counter() - start) * 1000)
-        log_run(record, settings.runs_dir)
+    with tracing.observe(name, as_type="tool", input={"arguments": record["arguments"]}) as span:
+        try:
+            args, output = _decide(name, call.get("arguments", ""), ctx, authorize_fn, approve_fn, record)
+            _save_approval(ctx, record)  # its own commit: send_once checks for it (M5)
+            external = args is not None and REGISTRY[name].external
+            if external:  # e.g. send_email: commits its own ledger steps, so it can't sit inside ours
+                output = _execute(name, args, ctx, record, savepoint=False)
+            with ctx.conn.transaction():
+                if args is not None and not external:
+                    output = _execute(name, args, ctx, record)
+                _save_step(ctx, call, step, record, output)
+            record["output_preview"] = json.dumps(output, default=str)[:500]  # what the MODEL saw back
+            span.update(output=record["output_preview"])
+            return output, record
+        finally:
+            record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+            span.update(
+                level=tracing.tool_level(record.get("status")),
+                status_message=record.get("error"),
+                metadata={k: record.get(k) for k in ("step", "decision", "approved", "status")},
+            )
+            log_run(record, settings.runs_dir)
 
 
 def _decide(
@@ -153,7 +160,10 @@ def _decide(
     if decision == "allow":
         return args, None
     if decision == "needs_approval":
-        approved = approve_fn(tool_call, ctx) is True  # only a literal True counts
+        # Its own span: time spent waiting for a person is not tool latency (M4).
+        with tracing.observe("human-approval", input={"tool": name}) as span:
+            approved = approve_fn(tool_call, ctx) is True  # only a literal True counts
+            span.update(output={"approved": approved})
         record["approved"] = approved
         if approved:
             return args, None
@@ -223,8 +233,16 @@ def run_agent(
     settings = settings or get_settings()
     with ctx.conn.transaction():
         ctx.run_id = state.start_run(ctx.conn, task, settings.model, AGENT_PROMPT_VERSION)
+        state.set_trace_id(ctx.conn, ctx.run_id, tracing.trace_id_for(ctx.run_id))
     loop = _Loop(ctx, max_steps, _respond_fn(respond_fn, settings), authorize_fn, approve_fn, settings, crash_after)
-    return loop.drive([{"role": "user", "content": task}], first_turn=1)
+    with tracing.run_trace(ctx.run_id, "agent", as_type="agent", input={"task": task}, metadata=_trace_meta(settings)) as root:
+        result = loop.drive([{"role": "user", "content": task}], first_turn=1)
+        root.update(output=result.answer)
+        return result
+
+
+def _trace_meta(settings: Settings) -> dict:
+    return {"model": settings.model, "agent_prompt_version": AGENT_PROMPT_VERSION}
 
 
 def resume_agent(
@@ -257,10 +275,16 @@ def resume_agent(
     ctx.warnings = warnings_from_steps(steps)
     with ctx.conn.transaction():
         state.mark_running(ctx.conn, run_id)
+        state.set_trace_id(ctx.conn, run_id, tracing.trace_id_for(run_id))  # same id: joins the run's trace
     loop = _Loop(ctx, max_steps, _respond_fn(respond_fn, settings), authorize_fn, approve_fn, settings, crash_after)
-    if answer is not None:  # crashed after the final answer was saved, before finish_run
-        return loop.finish(AgentResult(answer=answer, steps=last_turn, tool_calls=[], run_id=run_id))
-    return loop.drive(items, first_turn=last_turn + 1, pending=pending)
+    meta = {**_trace_meta(settings), "resumed_after_turn": last_turn}
+    with tracing.run_trace(run_id, "agent-resume", as_type="agent", input={"task": run["task"]}, metadata=meta) as root:
+        if answer is not None:  # crashed after the final answer was saved, before finish_run
+            result = loop.finish(AgentResult(answer=answer, steps=last_turn, tool_calls=[], run_id=run_id))
+        else:
+            result = loop.drive(items, first_turn=last_turn + 1, pending=pending)
+        root.update(output=result.answer)
+        return result
 
 
 def rebuild(task: str, steps: list[dict]) -> tuple[list[dict], int, list[dict], str | None]:
@@ -413,6 +437,13 @@ def cli_approve(call: ToolCall, ctx: ToolContext, input_fn: Callable[[str], str]
 
 
 def main() -> None:
+    try:
+        _main()
+    finally:
+        tracing.shutdown()  # a short-lived CLI: send queued spans before the process exits
+
+
+def _main() -> None:
     from research_assistant.db import connect
 
     if sys.argv[1:2] == ["approve"]:  # `agent approve D20 y|n` resumes a paused workflow (D5 M3)

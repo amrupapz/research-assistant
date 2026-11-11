@@ -11,6 +11,7 @@ from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from openai.lib._parsing._responses import type_to_text_format_param
 from pydantic import ValidationError
 
+from research_assistant import tracing
 from research_assistant.config import Settings, get_settings
 from research_assistant.log import log_run
 from research_assistant.prompts import (
@@ -127,6 +128,7 @@ def ask(
         "retrieved_ids": [c.chunk_id for c in chunks],
     }
     start = time.perf_counter()
+    gen = tracing.start_generation("ask", settings.model, {"question": question, "chunk_ids": record["retrieved_ids"]})
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
@@ -160,6 +162,7 @@ def ask(
         record["confidence"] = result.confidence
         record["needs_sources"] = result.needs_sources
         record["cited_ids"] = [c.chunk_id for c in result.citations]
+        gen.update(output=result.model_dump(mode="json"))
         check_grounding(result, chunks)  # raises UngroundedAnswerError
         return result
     except KeyboardInterrupt:  # Ctrl+C is NOT an Exception: log it as interrupted, then stop
@@ -176,6 +179,7 @@ def ask(
         raise
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
         log_run(record, settings.runs_dir)
 
 
@@ -203,6 +207,11 @@ def judge_icp(
         "retrieved_ids": [c.chunk_id for c in chunks],
     }
     start = time.perf_counter()
+    gen = tracing.start_generation(
+        "judge_icp",
+        settings.model,
+        {"company": company, "criteria": [cid for cid, _ in criteria], "chunk_ids": record["retrieved_ids"]},
+    )
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
@@ -229,6 +238,7 @@ def judge_icp(
         record.update(_usage(body))
         judgment = IcpJudgment.model_validate_json(extract_output_text(body))  # raises on incomplete / off-schema
         record["results"] = [{"id": r.id, "met": r.met, "chunk_ids": r.chunk_ids} for r in judgment.results]
+        gen.update(output=judgment.model_dump(mode="json"))
         return judgment
     except KeyboardInterrupt:  # Ctrl+C is NOT an Exception: log it as interrupted, then stop
         record["status"] = "interrupted"
@@ -242,6 +252,7 @@ def judge_icp(
         raise
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
         log_run(record, settings.runs_dir)
 
 
@@ -269,6 +280,11 @@ def write_email(
         "followup": bool(sent),
     }
     start = time.perf_counter()
+    gen = tracing.start_generation(
+        "write_email",
+        settings.model,
+        {"lead_id": record["lead_id"], "followup": record["followup"], "questions": [f.get("question") for f in findings]},
+    )
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
@@ -293,7 +309,9 @@ def write_email(
         record["response_id"] = body.get("id")
         record["status"] = body.get("status")
         record.update(_usage(body))
-        return EmailDraft.model_validate_json(extract_output_text(body))  # raises on incomplete / off-schema
+        email = EmailDraft.model_validate_json(extract_output_text(body))  # raises on incomplete / off-schema
+        gen.update(output=email.model_dump(mode="json"))
+        return email
     except KeyboardInterrupt:  # Ctrl+C is NOT an Exception: log it as interrupted, then stop
         record["status"] = "interrupted"
         raise
@@ -306,6 +324,7 @@ def write_email(
         raise
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
         log_run(record, settings.runs_dir)
 
 
@@ -333,6 +352,10 @@ def respond(
         "tools_offered": [t["name"] for t in tools],
     }
     start = time.perf_counter()
+    # Only the NEWEST input item: earlier ones are already in the previous turns' observations.
+    gen = tracing.start_generation(
+        "respond", settings.model, {"n_items": len(input_items), "last": str(input_items[-1])[:2000] if input_items else None}
+    )
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
@@ -358,6 +381,7 @@ def respond(
         record["status"] = body.get("status")
         record.update(_usage(body))
         record["tool_calls"] = [c["name"] for c in extract_function_calls(body)]
+        gen.update(output=[i for i in body.get("output", []) if i.get("type") in ("function_call", "message")])
         if body.get("status") != "completed":
             reason = (body.get("incomplete_details") or {}).get("reason", "unknown")
             raise IncompleteResponseError(f"Response status={body.get('status')!r}, reason={reason!r}")
@@ -372,6 +396,7 @@ def respond(
         raise
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
         log_run(record, settings.runs_dir)
 
 
@@ -402,6 +427,7 @@ def embed(
 
     record: dict = {"kind": "embedding", "model": settings.embedding_model, "n_texts": len(texts), "retries": 0}
     start = time.perf_counter()
+    gen = tracing.start_generation("embed", settings.embedding_model, {"n_texts": len(texts)}, as_type="embedding")
 
     def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
         record["retries"] += 1
@@ -435,6 +461,7 @@ def embed(
         raise
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
+        tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
         log_run(record, settings.runs_dir)
 
 

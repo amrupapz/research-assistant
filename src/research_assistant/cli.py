@@ -5,6 +5,7 @@ import sys
 
 from pydantic import ValidationError
 
+from research_assistant import tracing
 from research_assistant.llm import IncompleteResponseError, UngroundedAnswerError, ask
 from research_assistant.schemas import Chunk, ResearchAnswer
 
@@ -36,12 +37,16 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        with connect() as conn:
-            chunks = [chunk for chunk, _ in hybrid_search(conn, args.question, k=args.k)]
-        result = ask(args.question, chunks)
+        with tracing.observe("ask", as_type="chain", input={"question": args.question, "k": args.k}) as span:
+            with connect() as conn:
+                chunks = [chunk for chunk, _ in hybrid_search(conn, args.question, k=args.k)]
+            result = ask(args.question, chunks)
+            span.update(output=result.answer)
     except (IncompleteResponseError, ValidationError, UngroundedAnswerError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        tracing.shutdown()
 
     print(result.model_dump_json(indent=2) if args.json else format_answer(result, chunks))
 

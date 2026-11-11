@@ -1,0 +1,1 @@
+source: https://github.com/langfuse/skills @ f0bcb13 (plugin v1.12.0), skills/langfuse, copied 2026-11-11
