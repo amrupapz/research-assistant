@@ -1534,3 +1534,55 @@ an LLM loop, a checkpointer is enough, and the LLM-shaped state is easier in Lan
 - An apples-to-apples count needs the SAME meter: model calls/tokens come from the run log lines each
   case appends, for both stages (rows from before M5 show "?").
 - `ruff format` on a whole file rewraps old code too: noise in the diff. Format only new code.
+
+## Project 5 wrap-up (Day 5)
+
+The sales process is now a durable LangGraph workflow next to the P4 loop:
+`flow L4` → load_lead → research → qualify → (route) → draft → approve ⏸ → send.
+- **M0:** what LangGraph adds over my loop + run_steps; business facts (drafts, approvals, sends) stay in
+  MY tables, the checkpointer only knows WHERE the workflow is. Added langgraph + checkpoint-postgres.
+- **M1 StateGraph:** nodes call my tools through the same gate (validate → authorize → execute, call_tool).
+  route_after_qualify: poor → stop, strong → draft, possible → exactly one extra (real, deeper) research
+  pass → draft flagged ⚠. Anything unexpected → stop (fail closed). email-v1 writer (llm.write_email).
+- **M2 checkpointer:** PostgresSaver on its OWN autocommit + dict_row connection, thread_id = run_id.
+  Tables from setup() (LangGraph's, not Alembic's; migration tests ignore checkpoint*). `flow --resume`.
+- **M3 interrupt():** approve pauses the run ('waiting', migration 0004); `agent approve D20 y|n` resumes it
+  in a new process, even the next day. The decision goes to MY approvals table AFTER interrupt();
+  send = send_email → send_once, so a re-run send node can't send twice. flow-v2.
+- **M4 errors:** transient (DB blip, OpenAI timeout/429/5xx) vs permanent. DB blips → node RetryPolicy;
+  OpenAI errors → only llm.py retries (no 3×3=9); transient after retries → 'failed', resumable;
+  permanent → `failed` node with a reason, not resumable. guarded() must let GraphBubbleUp
+  (interrupt) through. No node timeouts (sync nodes; every call already has a timeout).
+- **M5 loop vs graph:** `--stage flow` on the 8 agent_cases the flow can express, `--compare`.
+  **415 tests. Agent evals 16/16 (agent-v5), flow evals 8/8 (flow-v2).**
+
+**Functions:** route_after_qualify was mine to write; I asked Claude to write it and explain it line by
+line. No core function written by me this project either.
+
+**Versions:** flow-v1 (M1/M2) → flow-v2 (approve + send nodes). email-v1 for write_email.
+
+**Lessons that came from live runs, not plans:**
+- L1 "did nothing": it had replied on Day 4. load_lead stopping was correct, not a bug.
+- Ctrl+C is a BaseException: `except Exception` missed it twice (flow status stayed 'running'; run
+  logs said status=None). Now 'failed' / 'interrupted'.
+- An interrupted request still reached OpenAI: the resumed call showed cached=2261. Ctrl+C stops MY
+  side, not theirs (it may still be billed; for a send it could mean it went out → send_once).
+- The extra pass earned its keep: Vercel went possible → strong once the deeper search found evidence.
+- My prediction was wrong: the flow uses ~30-40% FEWER tokens than the loop on one-pass leads (the loop
+  re-sends the growing conversation every turn), ~2x more on "possible" leads (the gate's price).
+- The a16 crash cost the flow nothing extra: the re-run research node hit my own < 7-day finding reuse.
+
+**Open, carry forward:**
+- **`agent approve D20 y` doesn't show the draft again.** Approving "tomorrow" means approving
+  something you saw yesterday. It should show the same screen as cli_approve (warnings, To, body) and ask.
+- No sender identity: emails end "Best," and come from sales-agent@example.com (SENDER_NAME in settings).
+- A crash inside the draft node after draft_email committed → resume writes a SECOND draft (needs an
+  idempotency key like send_once, e.g. one draft per run).
+- D18/D19 (flow-v1) can't be approved through the flow; old waiting runs need cleanup if the graph changes
+  again (a checkpoint from an older graph version).
+- Multi-lead follow-ups (a12–a14) aren't a flow: fan-out (Send API) or a loop over run_flow.
+- Node timeouts need async nodes: after the week.
+- Still open from P4: M9 LinkedIn hand-off, source vetting (fake "30%"), Figma Dev Mode eval case (→ Day 6),
+  draft facts not checked against citations, no follow-up cap.
+- My answers to the M1, M2 and M4 check questions: skipped.
+

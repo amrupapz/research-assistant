@@ -6,8 +6,9 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 5 — Project 5 (LangGraph workflow). P1–P4 done — see LEARNING.md wrap-ups.
-Carried from Day 4: M9 (LinkedIn hand-off), not started. M8 (Gmail MCP) dropped: Google's Gmail
+CURRENT STAGE: Day 6 — Project 6 (evals + Langfuse). P1–P5 done — see LEARNING.md wrap-ups.
+Day 6 milestones: not written yet (plan first). Carried: M9 (LinkedIn hand-off), not started;
+`agent approve` should show the draft before deciding; Figma Dev Mode eval case (see P5 wrap-up "Open"). M8 (Gmail MCP) dropped: Google's Gmail
 MCP server looks gated to Workspace preview accounts; MCP experience comes from the Day 7 server.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
@@ -48,6 +49,7 @@ src/research_assistant/
   tools.py      tool registry: Pydantic args -> strict schemas; validate_call / execute
   permissions.py authorize(ToolCall) -> allow | deny | needs_approval (default-deny)
   agent.py      `agent "task"`: loop, gate (validate -> authorize -> approve -> execute), cli_approve
+  flow.py       LangGraph workflow: nodes, route_after_qualify, checkpointer, interrupt approval, guarded/failed
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
 evals/questions.jsonl  evals/agent_cases.jsonl  evals/run.py   data/ (saved company pages; linear-customers.md = injection test page)
 runs/ (one JSONL record per request)   outbox/ ("sent" .eml files, gitignored)
@@ -55,7 +57,8 @@ runs/ (one JSONL record per request)   outbox/ ("sent" .eml files, gitignored)
 
 Commands: `uv run python -m research_assistant.db` (load + embed data/),
 `uv run ask "question"`, `uv run agent "task"`,
-`uv run python evals/run.py --stage retrieval|answers|agent [--only ids] [--repeat N]`.
+`uv run python -m research_assistant.flow L4 | --resume <run_id>`, `uv run agent approve D20 y|n`,
+`uv run python evals/run.py --stage retrieval|answers|agent|flow [--only ids] [--repeat N]`, `--compare`.
 
 ## Rules for every model call
 
@@ -156,3 +159,7 @@ P4 (Day 4): Postgres state + resume — Alembic (0001–0003), runs/run_steps (s
    transaction), qualify_lead (icp.toml), `agent --resume`, send_once (ledger + idempotency key +
    row lock), memory across days (lead_status, list_followups, reuse < 7 days), isolated evals with
    setup/crash_after (agent-v5, 16/16), 361 tests. M8 dropped, M9 carried. See LEARNING.md.
+P5 (Day 5): LangGraph workflow — StateGraph with route_after_qualify (one extra research pass), Postgres
+   checkpointer (thread_id = run_id, `flow --resume`), interrupt() approval (`agent approve`, runs
+   'waiting', 0004), transient vs permanent errors (DB-only RetryPolicy, failed node), loop vs graph
+   evals (flow 8/8, --compare), 415 tests. See LEARNING.md.
