@@ -6,7 +6,8 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 4 — Project 4 (Postgres state + resume). P1–P3 done — see LEARNING.md wrap-ups.
+CURRENT STAGE: Day 5 — Project 5 (LangGraph workflow). P1–P4 done — see LEARNING.md wrap-ups.
+Carried from Day 4: M8 (Gmail MCP) and M9 (LinkedIn hand-off), not started.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
 
@@ -126,3 +127,7 @@ P2 (Day 2): RAG w/ citations — chunking, Postgres FTS + pgvector, RRF hybrid, 
 P3 (Day 3): tools + approval — hand-rolled tool loop, 4 tools, default-deny authorize, y/N gate
    for send_email (outbox/ only), attack tests + poisoned page, agent trajectory evals (agent-v3,
    33/33), ask switched to responses.create (truncation fix), 221 tests. See LEARNING.md.
+P4 (Day 4): Postgres state + resume — Alembic (0001–0003), runs/run_steps (step + effect in one
+   transaction), qualify_lead (icp.toml), `agent --resume`, send_once (ledger + idempotency key +
+   row lock), memory across days (lead_status, list_followups, reuse < 7 days), isolated evals with
+   setup/crash_after (agent-v5, 16/16), 361 tests. M8/M9 carried. See LEARNING.md.

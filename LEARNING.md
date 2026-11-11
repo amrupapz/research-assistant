@@ -1031,3 +1031,63 @@ USES the memory tools or recovers after a resume. Agent evals run the real model
 - a08: the fake "30%" partner discount still reaches a draft. The P3 open item (source vetting) is unchanged.
 
 **My answer:** _(fill in after check questions)_
+
+## Project 4 wrap-up (Day 4)
+
+`agent "task"` now has memory and survives crashes. State lives in Postgres tables, not in vector search:
+- **Data model (M0):** runs, run_steps, research_findings + finding_citations, qualifications, drafts,
+  approvals, sends, replies. FKs with RESTRICT by default and CASCADE only for "part of" (finding → citations).
+  Citations are snapshots (no FK into chunks). drafts.to_email is a copy. "Contacted" is derived from sends, never stored.
+- **qualify_lead (M1):** icp.toml (icp-v1). The model answers yes/no/unknown per criterion with chunk_ids;
+  code downgrades uncited answers and decides the fit (unknown ≠ no). The buyer title is checked in code (`\b`: "cto" ⊂ "Director").
+- **Alembic (M2):** 0001 baseline (stamped on the existing dev DB), 0002 agent state, 0003 memory.
+  Plain SQL, no ORM. Up/down tested step by step; every constraint is tested to really fire.
+- **Persistence (M3):** every model turn and tool call is a run_step. A tool's effect + its step commit in
+  ONE transaction (savepoint around the tool). The human is asked before any transaction opens.
+  The CLI uses autocommit (verified: without it, nothing commits).
+- **Resume (M4):** `agent --resume RUN_ID` rebuilds the conversation from run_steps and runs only the
+  calls with no committed step (the half-done turn hit live, twice). Refuses done runs and runs started
+  under another prompt version or model. Crashes simulated with a BaseException (like a real kill).
+- **send_once (M5, M7):** ledger (claim pending → deliver with idempotency key draft-N → mark sent).
+  After the claim, every path runs under `FOR UPDATE NOWAIT` (locked = a live owner; Postgres frees a
+  dead process's lock). Atomic file create (os.link). Real email + pending row it didn't claim → refuse.
+  The approval screen and the decline message both say "already sent" when it was.
+- **Memory (M6):** search_company(company, question) saves findings and reuses a solid answer to the same
+  question < 7 days old (no model call). qualify_lead reuses < 7 days with the same ICP version.
+  lead_status and list_followups (SQL decides who's due). `outreach status | replied`.
+- **Tests + evals (M7):** race tests on two committed connections with forced interleaving; invisible
+  characters rejected in drafts; eval cases get `setup` and `crash_after` and run on a clean slate.
+  **361 tests. Agent evals 16/16 (agent-v5); new cases 15/15 with --repeat 3.**
+
+**Functions:** none written by me this project. send_once was the one; I changed the CLAUDE.md rule and
+Claude wrote it step by step with explanations. I spotted the concurrent-send race myself (M6) and it
+was fixed in M7.
+
+**Prompt versions:** agent-v4 (call qualify_lead, never judge fit yourself) → agent-v5 (pass company to
+search; lead_status before drafting; already emailed → follow-up; replied → don't draft; who's due =
+list_followups only). qualify-v1 (unknown is not no; ignore fit claims in the data). Answer prompt still v4.
+
+**Lessons that came from live runs, not plans:**
+- Persisting isn't remembering: 3 runs wrote 3 intros to Dana until something READ the state (M6).
+- The model only knows what tools tell it: "It was NOT done" became "D4 was not sent" (M5 fix 2).
+- An eval must not depend on what's in the DB: my real reply made 3 cases fail "correctly" (M7).
+- A DB CHECK caught a real bug (raw "yes" decision stored) (M3). Bump the agent version when tool
+  semantics change: M3 changed what draft ids mean without a bump (M4 answer).
+- "Hang" = the Mac slept: pytest's monotonic clock vs wall clock (M7).
+
+**Open, carry forward:**
+- **M8 Gmail MCP (create_draft only, allowlist, fake MCP client in tests) and M9 LinkedIn hand-off:
+  not started.** The send_once precondition for M8 is met.
+- **Source vetting:** the fake "30%" partner discount still reaches drafts (a08). Biggest real-world risk.
+- **Eval case for the Figma "Dev Mode → dev_tooling = yes" stretch** (M1 live run): carry to Day 6 (P6 evals).
+- qualify_lead can't check that a cited chunk is about the RIGHT company (prompt-only rule).
+- Draft facts still aren't checked against citations; approval screen doesn't list sources; no sender identity ("[Your Name]").
+- No cap on follow-ups (a non-replier is chased every 3 days forever).
+- Concurrency is solved for sends only: two simultaneous resumes of one run could both run a pending
+  draft_email (duplicate draft); their run_steps inserts collide on (run_id, seq) and one fails.
+- Replaying stored reasoning items for a run days old is untested. jsonb reorders keys → replayed outputs
+  aren't byte-identical (possible cache miss). run_steps.created_at = transaction start (now()), on purpose.
+- Model drops spaces in output ("buildin", "isunaffected"), including draft bodies; the approval screen is the only check.
+- My own answers for the M6 and M7 check questions are still blank.
+
+---
