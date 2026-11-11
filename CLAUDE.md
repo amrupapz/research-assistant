@@ -7,7 +7,8 @@ D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval �
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
 CURRENT STAGE: Day 5 — Project 5 (LangGraph workflow). P1–P4 done — see LEARNING.md wrap-ups.
-Carried from Day 4: M8 (Gmail MCP) and M9 (LinkedIn hand-off), not started.
+Carried from Day 4: M9 (LinkedIn hand-off), not started. M8 (Gmail MCP) dropped: Google's Gmail
+MCP server looks gated to Workspace preview accounts; MCP experience comes from the Day 7 server.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
 
@@ -26,7 +27,8 @@ automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud de
 Python 3.12, uv, ruff, pytest, openai (Responses API), pydantic, pydantic-settings.
 Model name comes from MODEL in .env (currently gpt-6-luna).
 P2 adds: Postgres 17 + pgvector (Homebrew, local), psycopg. Embedding model from EMBEDDING_MODEL in .env.
-Later: alembic, langgraph, langfuse, fastapi, docker.
+P4 added: alembic (plain-SQL migrations; SQLAlchemy only for its connection).
+Later: langgraph (+ langgraph-checkpoint-postgres), langfuse, fastapi, docker.
 Never print or commit the API key.
 
 ## Layout
@@ -113,6 +115,29 @@ M9 LinkedIn hand-off: draft_linkedin_message tool → stored message + profile U
    "ready_to_send_manually"; `agent mark-sent <id>` records that I sent it myself. Never automate
    LinkedIn sending.
 
+## Day 5 milestones (Project 5)
+
+Goal: the same sales flow as a durable LangGraph workflow: research → qualify → (branch) →
+draft → wait for approval → send. Checkpoints, pause/resume, retries. Compare with my P4 loop.
+
+M0 What LangGraph adds over my hand-built loop + run_steps. What stays in MY tables
+   (drafts, sends, approvals: business facts) vs the checkpointer (where the workflow is).
+   Ask before adding langgraph + langgraph-checkpoint-postgres (new dependencies).
+M1 StateGraph: nodes call my existing tools (validate → authorize still apply).
+   Branch on fit: poor → stop; possible → one more research pass; strong → draft.
+   ✍️ I write route_after_qualify(state) → next node.
+M2 Postgres checkpointer, thread_id = run_id. Kill mid-run → resume from the checkpoint.
+   Its tables come from checkpointer.setup(), not Alembic: decide how they sit next to my
+   migrations. It needs an autocommit connection with dict rows.
+M3 Human approval with interrupt(): the workflow pauses; `agent approve <id> y|n` resumes it
+   later (even the next day). The decision is still written to MY approvals table (send_once
+   checks it there). On resume the node re-runs from its start, so nothing with a side effect
+   goes before interrupt() in that node.
+M4 Retries/timeouts per node; failure branch. The send node calls send_once, because a resumed
+   node RE-RUNS from its start, so side effects must be safe to repeat.
+M5 Loop vs graph on the same tasks: when each fits; tests with a fake model; reuse agent_cases.
+Temporal: read about it only (when you'd need it instead).
+
 ## Day 7 stretch (with P7/P8)
 
 MCP server: expose search_company, get_lead, qualify_lead via the official Python MCP SDK
@@ -130,4 +155,4 @@ P3 (Day 3): tools + approval — hand-rolled tool loop, 4 tools, default-deny au
 P4 (Day 4): Postgres state + resume — Alembic (0001–0003), runs/run_steps (step + effect in one
    transaction), qualify_lead (icp.toml), `agent --resume`, send_once (ledger + idempotency key +
    row lock), memory across days (lead_status, list_followups, reuse < 7 days), isolated evals with
-   setup/crash_after (agent-v5, 16/16), 361 tests. M8/M9 carried. See LEARNING.md.
+   setup/crash_after (agent-v5, 16/16), 361 tests. M8 dropped, M9 carried. See LEARNING.md.

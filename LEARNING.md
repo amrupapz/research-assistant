@@ -1076,8 +1076,11 @@ list_followups only). qualify-v1 (unknown is not no; ignore fit claims in the da
 - "Hang" = the Mac slept: pytest's monotonic clock vs wall clock (M7).
 
 **Open, carry forward:**
-- **M8 Gmail MCP (create_draft only, allowlist, fake MCP client in tests) and M9 LinkedIn hand-off:
-  not started.** The send_once precondition for M8 is met.
+- **M9 LinkedIn hand-off: not started.**
+- **M8 Gmail MCP: dropped (decided after Day 4).** Google's Gmail MCP server appears gated to the
+  Workspace Developer Preview (personal @gmail.com likely not eligible; per secondary sources). It has
+  no send tool anyway (drafts + labels only). If real email is wanted later: the Gmail API directly with
+  the gmail.compose scope (drafts only, I press Send) is the best fallback. MCP experience → Day 7 server.
 - **Source vetting:** the fake "30%" partner discount still reaches drafts (a08). Biggest real-world risk.
 - **Eval case for the Figma "Dev Mode → dev_tooling = yes" stretch** (M1 live run): carry to Day 6 (P6 evals).
 - qualify_lead can't check that a cited chunk is about the RIGHT company (prompt-only rule).
@@ -1091,3 +1094,57 @@ list_followups only). qualify-v1 (unknown is not no; ignore fit claims in the da
 - My own answers for the M6 and M7 check questions are still blank.
 
 ---
+
+# Day 5 — Project 5: LangGraph workflow
+
+## D5 M0 — what LangGraph adds (before any code)
+
+**Concept:** my P4 agent is a LOOP where the model decides the next step every turn. LangGraph
+writes the PROCESS as a graph in code (research → qualify → branch → draft → approve → send); the
+model still thinks inside nodes but can't skip qualify or wander. A checkpointer saves the graph's
+state after every node under a thread_id, so a run can stop (crash, or waiting for my y/N) and continue
+later, even in another process the next day. Without it: approval is an `input()` that only works
+while the terminal stays open, the flow is whatever the model picks that day (3 paths for 1 task in
+D4), and retries/pauses are hand-built.
+
+| | P4 loop | P5 graph |
+|---|---|---|
+| Next step chosen by | the model, each turn | code (edges); model inside nodes |
+| Saved progress | run_steps (my log, replayed by rebuild()) | checkpointer: state snapshot per node |
+| After a crash | runs only uncommitted CALLS | RE-RUNS the interrupted NODE from its start |
+| Waiting for a human | input(): process must stay alive | interrupt(): state saved, process exits; resumed later |
+| Retries | my with_retries around model calls | RetryPolicy / timeout / error_handler per node |
+
+**Two kinds of storage, never mixed**
+- **My tables = business facts** other code queries: drafts, approvals, sends, qualifications,
+  findings, replies. send_once, lead_status, list_followups, `outreach status` keep working.
+- **The checkpointer = where the workflow is** (next node + in-flight state). Opaque, LangGraph's
+  format. Never ask it "was Dana emailed?": that's `sends`.
+- **Link:** thread_id = run_id; `runs` stays the index of every run, loop or graph.
+
+**Graph sketch (refined in M1)**
+```
+START → load_lead → research → qualify ──route_after_qualify──┬─ poor ───────────────→ END
+                       ↑                                       ├─ possible (1st pass) → research again
+                       └───────────────────────────────────────┘
+                                                               └─ strong ─────────────→ draft → approve ⏸ → send → END
+                                                                                                (interrupt)  (send_once)
+```
+State: run_id, lead_id, lead, findings, research_passes, qualification, draft_id, approved, send_result, error.
+
+**Decisions:** keep both. `agent "task"` = free-form loop; new `agent flow L1` = the graph (M5 compares them).
+Open for me (M1): after the extra research pass, does "possible" draft or stop? That's route_after_qualify.
+
+**Dependencies added:** langgraph 1.2.20, langgraph-checkpoint-postgres 3.2.0 (pulls langchain-core,
+langsmith, psycopg-pool, ...). LangSmith only traces if LANGSMITH_* env vars are set; they aren't.
+Verified in the installed version: add_node(..., retry_policy=, timeout=, error_handler=);
+RetryPolicy(initial_interval, backoff_factor, max_interval, max_attempts, jitter, retry_on);
+PostgresSaver.from_conn_string + setup().
+
+**Gotchas to expect**
+- A resumed node re-runs from its START: anything with a side effect before interrupt() (or before
+  a crash) happens twice unless it's idempotent (send_once is; draft insert is NOT → M3/M4).
+- Checkpointer tables come from setup(), not Alembic: decide in M2 how they sit next to my migrations.
+- The checkpointer wants an autocommit connection (my M3 lesson again).
+
+**My answer:** _(fill in after check questions)_
