@@ -7,9 +7,9 @@ D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval �
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
 CURRENT STAGE: Day 6 — Project 6 (evals + Langfuse). P1–P5 done — see LEARNING.md wrap-ups.
-Day 6 milestones: not written yet (plan first). Carried: M9 (LinkedIn hand-off), not started;
-`agent approve` should show the draft before deciding; Figma Dev Mode eval case (see P5 wrap-up "Open"). M8 (Gmail MCP) dropped: Google's Gmail
-MCP server looks gated to Workspace preview accounts; MCP experience comes from the Day 7 server.
+Carried: `agent approve` should show the draft before deciding (see P5 wrap-up "Open").
+M8 (Gmail MCP) dropped: Google's Gmail MCP server looks gated to Workspace preview accounts;
+MCP experience comes from the Day 7 server. M9 and the rest: "After the week" under Day 6.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
 automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
 

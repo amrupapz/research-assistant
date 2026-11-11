@@ -6,6 +6,7 @@
   uv run python evals/run.py --stage agent --repeat 3   # agent trajectories, ~4-6 model calls per run
   uv run python evals/run.py --stage flow               # the same cases through the LangGraph flow (D5 M5)
   uv run python evals/run.py --compare                  # latest agent vs flow result per case, side by side
+  uv run python evals/run.py --all                      # every stage in order → one summary table (D6 M0)
 
 Each case appends one JSON line to runs/evals.jsonl (tagged with stage + PROMPT_VERSION).
 """
@@ -89,7 +90,8 @@ def memo_embed():
     return _embed
 
 
-def run_retrieval(conn) -> None:
+def run_retrieval(conn) -> tuple[int, int]:
+    """Returns (hits, cases) for hybrid@5: the mode and k the app actually uses."""
     emb = memo_embed()
     modes = {
         "keyword": lambda q, k: keyword_search(conn, q, k),
@@ -128,11 +130,12 @@ def run_retrieval(conn) -> None:
     print(
         "\n✅ = all gold files and facts in top-k; otherwise f=file_recall x=fact_recall"
     )
+    return hits[("hybrid", 5)], len(cases)
 
 
 def run_answers(
     conn, k: int = 5, only: list[str] | None = None, repeat: int = 1
-) -> None:
+) -> tuple[int, int]:
     cases = [c for c in load_cases(CASES) if not only or c.id in only] * repeat
     passed = 0
     for case in cases:
@@ -165,6 +168,7 @@ def run_answers(
             }
         )
     print(f"\n{passed}/{len(cases)} passed (prompt {PROMPT_VERSION})")
+    return passed, len(cases)
 
 
 AGENT_TABLES = "runs, run_steps, drafts, approvals, sends, qualifications, research_findings, finding_citations, replies"
@@ -284,7 +288,7 @@ def run_agent_case(conn, case) -> dict:
     }
 
 
-def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> None:
+def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
     cases = [c for c in load_agent_cases(AGENT_CASES) if not only or c.id in only]
     tally: dict[str, list[bool]] = defaultdict(list)
     seen: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -327,6 +331,7 @@ def run_agent_evals(conn, only: list[str] | None = None, repeat: int = 1) -> Non
         print(f"{case.id:<6}{sum(runs):>4}/{len(runs):<3}   {obs}")
     total = [ok for runs in tally.values() for ok in runs]
     print(f"\n{sum(total)}/{len(total)} runs passed (prompt {AGENT_PROMPT_VERSION})")
+    return sum(total), len(total)
 
 
 @contextmanager
@@ -384,7 +389,7 @@ def run_flow_case(conn, case) -> dict:
     return {"outcome": outcome, "error": error, "drafts": drafts, "sent": sent, "usage": usage}
 
 
-def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> None:
+def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> tuple[int, int]:
     cases = [c for c in load_agent_cases(AGENT_CASES) if c.flow and (not only or c.id in only)]
     tally: dict[str, list[bool]] = defaultdict(list)
     for _ in range(repeat):
@@ -415,6 +420,47 @@ def run_flow_evals(conn, only: list[str] | None = None, repeat: int = 1) -> None
     skipped = [c.id for c in load_agent_cases(AGENT_CASES) if not c.flow]
     total = [ok for runs in tally.values() for ok in runs]
     print(f"\n{sum(total)}/{len(total)} runs passed ({flow.FLOW_VERSION}); not expressible as a flow: {', '.join(skipped)}")
+    return sum(total), len(total)
+
+
+def stages(conn, only: list[str] | None = None, repeat: int = 1) -> dict:
+    """Every stage, in order: cheap and deterministic first, so a broken retrieval shows up before
+    you pay for ~170 agent/flow calls. Each returns (passed, total)."""
+    return {
+        "retrieval": lambda: run_retrieval(conn),  # hybrid@5; --only/--repeat don't apply
+        "answers": lambda: run_answers(conn, only=only, repeat=repeat),
+        "agent": lambda: run_agent_evals(conn, only=only, repeat=repeat),
+        "flow": lambda: run_flow_evals(conn, only=only, repeat=repeat),
+    }
+
+
+def run_all(stage_fns: dict, meter=measured) -> list[dict]:
+    """Run each stage under the meter; one row per stage. A stage that crashes is reported and
+    the rest still run (one bad stage shouldn't hide the others)."""
+    rows = []
+    for name, fn in stage_fns.items():
+        print(f"\n=== {name} ===", flush=True)
+        with meter() as usage:
+            try:
+                passed, total = fn()
+                error = None
+            except Exception as e:  # noqa: BLE001 -- report it in the table, keep going
+                passed, total, error = 0, 0, f"{type(e).__name__}: {e}"
+        rows.append({"stage": name, "passed": passed, "total": total, "error": error, **usage})
+    return rows
+
+
+def summary_table(rows: list[dict]) -> str:
+    lines = [f"{'stage':<11}{'passed':>10}{'rate':>7}{'calls':>7}{'tokens':>9}{'seconds':>9}"]
+    for r in rows:
+        rate = f"{r['passed'] / r['total']:.0%}" if r["total"] else "-"
+        tokens = r.get("input_tokens", 0) + r.get("output_tokens", 0)
+        lines.append(
+            f"{r['stage']:<11}{f'{r["passed"]}/{r["total"]}':>10}{rate:>7}"
+            f"{r.get('model_calls', 0):>7}{tokens:>9}{r.get('seconds', 0):>9}"
+            + (f"   ERROR {r['error'][:60]}" if r["error"] else "")
+        )
+    return "\n".join(lines)
 
 
 def compare() -> None:
@@ -442,6 +488,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", choices=["retrieval", "answers", "agent", "flow"])
     parser.add_argument("--compare", action="store_true", help="agent vs flow, from runs/evals.jsonl")
+    parser.add_argument("--all", action="store_true", help="every stage in order, then one summary table")
     parser.add_argument(
         "--only", nargs="*", help="case ids to run, e.g. --only q07 q07b"
     )
@@ -451,8 +498,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.compare:
         return compare()
+    if args.all:
+        with connect() as conn:
+            rows = run_all(stages(conn, only=args.only, repeat=args.repeat))
+        print("\n" + summary_table(rows))
+        _write({"stage": "all", "rows": rows})
+        return
     if not args.stage:
-        parser.error("give --stage or --compare")
+        parser.error("give --stage, --all or --compare")
     with connect() as conn:
         if args.stage == "retrieval":
             run_retrieval(conn)

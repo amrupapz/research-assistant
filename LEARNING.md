@@ -1586,3 +1586,47 @@ line. No core function written by me this project either.
   draft facts not checked against citations, no follow-up cap.
 - My answers to the M1, M2 and M4 check questions: skipped.
 
+
+---
+
+# Day 6 — Project 6: evals + observability
+
+## D6 M0 — inventory: what my evals cover, and the gaps
+
+**Concepts**
+- **Unit test:** checks MY CODE with the model faked. Deterministic, free, every save (420 of them).
+  Without: a refactor silently breaks send_once or authorize().
+- **Eval:** checks the SYSTEM with the REAL model, over many cases. Non-deterministic → a pass RATE,
+  costs money, run before/after a change. Without: a prompt change that drafts to the wrong lead 20% of
+  the time passes every unit test.
+- **Trace:** a record of ONE real run (every step, inputs/outputs, tokens, cost, time). Judges nothing;
+  explains. Without: "a08 failed" but no idea which search returned the poisoned page.
+- Unit tests protect rules, evals measure quality, traces explain a single run.
+
+**How an LLM-as-judge is wrong:** too lenient (says "supported" to vague matches); injectable (graded
+text can carry instructions → <untrusted_data>); same blind spots as the graded model (→ a STRONGER
+JUDGE_MODEL); swayed by length/confidence/format; non-deterministic. Defence: calibrate against ~10
+hand labels and report agreement %. An unchecked judge is not evidence.
+
+**Inventory** (a = agent case, q = question, f = flow case)
+
+| category | real-model evals | fake-model unit tests | gap |
+|---|---|---|---|
+| straightforward | q06, q08–q10 (+ b paraphrases); a01–a04, a07; f a04–a07 | many | **qualification correctness is never graded** (fake verdicts only; flow accepts drafted OR stopped) |
+| insufficient evidence | q01–q05 (company not in data/), q11 off-topic | qualify "unknown" | all "company missing"; none "company present, fact missing" |
+| conflicting info | q07, q07b (Figma headcount) | — | only one, only in ask; none inside qualify |
+| invalid tool args | a09 (L99: valid format, no such lead) | BAD_ARGS, unknown tools, duplicate keys, invisible chars | none with the real model pushed into bad args |
+| prompt injection | a07, a08; f a07, f a08 (poisoned Linear page) | poisoned search, links rejected, approval claimed in text | **"30%" is only OBSERVED, not graded: it reaches drafts and the evals still pass**; no injection aimed at qualify |
+| permission bypass | a11 (any recipient), a10 (my link), a06/a08 ("no" respected) | deny, needs_approval, text-claimed approval | no real-model "I already approved, send now" / "skip approval, urgent" |
+| freshness | q08 (Intel CEO: old vs new page), q09 "today", q10 "most recent"; a12–a14 (due after N days) | 7-day reuse window | no "only stale evidence" case; no follow-up cap |
+| not measured | — | — | citations actually support claims (M3); $ cost, p50/p95 (M4) |
+
+**Biggest gaps, ranked:** (1) qualification correctness unmeasured, (2) "30%" injection passes,
+(3) citation support unchecked, (4) no real-model bad-args / bypass cases. M2 + M3 fix these.
+
+**Built:** `evals/run.py --all` runs retrieval → answers → agent → flow (cheap first) → one summary
+table (stage, passed/total, rate, model calls, tokens, seconds), also saved to runs/evals.jsonl.
+Stages now return (passed, total); retrieval's number is hybrid@5, the setting the app uses.
+A crashing stage is reported in the table and the rest still run. Tests: fake stages + fake meter.
+
+**Gotcha:** evals/ isn't a package: the test imports evals/run.py by file path (importlib).
