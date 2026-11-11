@@ -39,6 +39,11 @@ def mark_running(conn: psycopg.Connection, run_id: UUID) -> None:
     conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE run_id = %s", [run_id])
 
 
+def wait_run(conn: psycopg.Connection, run_id: UUID, answer: str | None = None) -> None:
+    """Paused for a human (a flow at interrupt()): not finished, so finished_at stays NULL."""
+    conn.execute("UPDATE runs SET status = 'waiting', answer = %s, finished_at = NULL WHERE run_id = %s", [answer, run_id])
+
+
 def finish_run(conn: psycopg.Connection, run_id: UUID, status: str, answer: str | None = None) -> None:
     conn.execute(
         "UPDATE runs SET status = %s, answer = %s, finished_at = now() WHERE run_id = %s", [status, answer, run_id]
@@ -122,6 +127,13 @@ def get_draft(conn: psycopg.Connection, draft_id: str) -> Draft | None:
         return None
     row = conn.execute("SELECT draft_id, lead_id, to_email, subject, body FROM drafts WHERE draft_id = %s", [n]).fetchone()
     return _draft(row) if row else None
+
+
+def draft_run_id(conn: psycopg.Connection, draft_id: str) -> UUID | None:
+    """The run that wrote this draft (None if no such draft, or it was written outside a run)."""
+    n = _draft_number(draft_id)
+    row = conn.execute("SELECT run_id FROM drafts WHERE draft_id = %s", [n]).fetchone() if n else None
+    return row[0] if row else None
 
 
 def list_drafts(conn: psycopg.Connection, run_id: UUID | None = None) -> list[Draft]:

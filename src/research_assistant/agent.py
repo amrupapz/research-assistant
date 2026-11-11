@@ -415,6 +415,11 @@ def cli_approve(call: ToolCall, ctx: ToolContext, input_fn: Callable[[str], str]
 def main() -> None:
     from research_assistant.db import connect
 
+    if sys.argv[1:2] == ["approve"]:  # `agent approve D20 y|n` resumes a paused workflow (D5 M3)
+        from research_assistant.flow import approve_main
+
+        return approve_main(sys.argv[2:])
+
     parser = argparse.ArgumentParser(prog="agent", description="Sales research agent with tools.")
     parser.add_argument("task", nargs="?", help='e.g. "Look up lead L2 and draft them a short intro email."')
     parser.add_argument("--resume", metavar="RUN_ID", help="continue a crashed run after its last committed step")

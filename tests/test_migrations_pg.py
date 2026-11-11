@@ -38,6 +38,10 @@ def at_head_afterwards(test_db_url):
 def test_up_and_down_step_by_step(at_head_afterwards):
     url, cfg = at_head_afterwards, alembic_config(at_head_afterwards, TEST_DIMS)
     assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
+    assert _revision(url) == "0004"
+
+    command.downgrade(cfg, "-1")  # 0004 only changes a CHECK: same tables
+    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY
     assert _revision(url) == "0003"
 
     command.downgrade(cfg, "-1")
@@ -59,7 +63,7 @@ def test_up_and_down_step_by_step(at_head_afterwards):
 def test_upgrade_is_a_no_op_at_head(at_head_afterwards):
     migrate(at_head_afterwards, dims=TEST_DIMS)
     migrate(at_head_afterwards, dims=TEST_DIMS)
-    assert _revision(at_head_afterwards) == "0003"
+    assert _revision(at_head_afterwards) == "0004"
 
 
 def test_baseline_uses_the_configured_dims(at_head_afterwards):
@@ -216,3 +220,21 @@ def test_tool_call_step_needs_call_id_and_tool(db):
         "INSERT INTO run_steps (run_id, seq, turn, kind, payload) VALUES (%s, 1, 1, 'model_turn', '[]')",
         [run_id],
     )
+
+
+def test_0004_allows_waiting_and_its_downgrade_turns_waiting_into_failed(at_head_afterwards):
+    url, cfg = at_head_afterwards, alembic_config(at_head_afterwards, TEST_DIMS)
+    with connect(url) as conn:
+        run_id = conn.execute(
+            "INSERT INTO runs (task, model, agent_prompt_version, status) "
+            "VALUES ('flow L1', 'm', 'flow-v2', 'waiting') RETURNING run_id"
+        ).fetchone()[0]
+    try:
+        command.downgrade(cfg, "0003")
+        with connect(url) as conn:
+            assert conn.execute("SELECT status FROM runs WHERE run_id = %s", [run_id]).fetchone()[0] == "failed"
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute("UPDATE runs SET status = 'waiting' WHERE run_id = %s", [run_id])
+    finally:
+        with connect(url) as conn:
+            conn.execute("DELETE FROM runs WHERE run_id = %s", [run_id])

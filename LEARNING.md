@@ -1394,3 +1394,34 @@ LangGraph does the bookkeeping (where am I, what's the state) instead of me repl
   A `kill -9` runs no handler at all, which is why resume only refuses "done" runs, not "running" ones.
 - Tests: checkpoints really commit to the test DB (own autocommit connection), so the fixture deletes
   each test's thread afterwards; the business tables are still rolled back.
+
+## D5 M3 — human approval with interrupt()
+
+**Concept:** `interrupt(payload)` inside a node stops the graph; the checkpointer saves the spot and
+invoke() returns, so the process can exit. Later (even the next day, a new process)
+`invoke(Command(resume=value), config)` continues the same thread: the paused node RE-RUNS FROM ITS
+START, and this time interrupt() returns `value` instead of pausing. Rule: nothing with a side effect
+before interrupt() in that node.
+
+**What was built**
+- Graph: draft → approve ⏸ → send | END (declined). A rejected draft skips approve.
+- approve: builds the payload (draft_id, to, warnings) → interrupt() → THEN record_approval in MY
+  approvals table (a business fact; send_once checks it there). Only a literal True means yes.
+- send: validate → authorize (must be needs_approval; deny → FlowError) → execute("send_email") →
+  send_once. NOT inside a transaction: send_once commits its own claim/send steps (D4 M5).
+- Migration 0004: runs.status may be 'waiting' (paused, not done). Downgrade turns waiting → failed.
+- `uv run agent approve D20 y|n` → approve_flow: draft → its run_id → checks the run is waiting AT
+  approve FOR THIS draft → Command(resume=True|False). `flow --resume` refuses waiting runs.
+- FLOW_VERSION flow-v2 (flow-v1 runs have no approve node: they can't be approved this way).
+- No checkpointer passed (tests) → InMemorySaver: interrupt() needs SOME checkpointer.
+- Tests: pauses with no approval/send; y → approval + send + .eml; n → declined; approve twice refused;
+  crash right AFTER the send, before the checkpoint → resume re-runs send → "already sent", 1 file;
+  a new saver on a new connection still finds the pause ("approve tomorrow"); deny still blocks.
+
+**Gotchas**
+- How do I know it paused? invoke() just returns. `graph.get_state(config).next` is non-empty →
+  stopped at an interrupt → runs.status = 'waiting', not 'done'.
+- If approve crashes after record_approval but before its checkpoint, it re-runs and records the
+  decision again: two identical rows, harmless (send_once reads the latest).
+- The ledger (send_once) is what makes the re-run send node safe, not LangGraph: LangGraph
+  re-runs the node; it can't know the email already left.

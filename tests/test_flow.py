@@ -15,6 +15,7 @@ from research_assistant.agent import cli_approve
 from research_assistant.flow import (
     MAX_RESEARCH_PASSES,
     FlowError,
+    approve_flow,
     call_tool,
     resume_flow,
     route_after_qualify,
@@ -192,7 +193,7 @@ def test_strong_fit_drafts_after_one_pass(ctx, settings, fake):
         final["warnings"] == [] and final["outcome"] == "drafted D1 (awaiting approval)"
     )
     run = state.get_run(ctx.conn, ctx.run_id)
-    assert (run["status"], run["agent_prompt_version"]) == ("done", "flow-v1")
+    assert (run["status"], run["agent_prompt_version"]) == ("waiting", "flow-v2")  # paused at approve
 
 
 def test_possible_twice_gets_one_extra_deeper_pass_then_a_flagged_draft(
@@ -351,20 +352,23 @@ def test_crash_in_qualify_then_resume_skips_finished_nodes(ctx, settings, fake, 
     assert fake["judged"] == 1  # qualify ran (again, from its start)
     assert final["outcome"] == "drafted D1 (awaiting approval)"
     assert [d.draft_id for d in _drafts(ctx)] == ["D1"]
-    assert state.get_run(ctx.conn, run_id)["status"] == "done"
+    assert state.get_run(ctx.conn, run_id)["status"] == "waiting"  # ...and now paused at approve
 
 
-def test_resume_refuses_a_finished_run(ctx, settings, fake, saver):
+def test_resume_refuses_a_waiting_run_then_a_finished_one(ctx, settings, fake, saver):
     fake["verdicts"].append(STRONG)
     run_flow("L1", ctx, settings, checkpointer=saver)
     saver.threads.append(str(ctx.run_id))
+    with pytest.raises(FlowError, match="waiting for approval"):  # --resume can't approve for you
+        resume_flow(ctx.run_id, ctx, saver)
+    approve_flow("D1", False, ctx, saver)
     with pytest.raises(FlowError, match="already finished"):
         resume_flow(ctx.run_id, ctx, saver)
 
 
 def test_resume_refuses_a_run_that_is_not_a_flow_run(ctx, saver):
     run_id = state.start_run(ctx.conn, "agent task", "m", "agent-v5")
-    with pytest.raises(FlowError, match="not a flow run"):
+    with pytest.raises(FlowError, match="not a flow-v2 run"):
         resume_flow(run_id, ctx, saver)
 
 
@@ -391,3 +395,108 @@ def test_ctrl_c_marks_the_run_failed_and_it_can_be_resumed(ctx, settings, fake, 
     saver.threads.append(str(ctx.run_id))
     assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
     assert resume_flow(ctx.run_id, ctx, saver)["outcome"] == "drafted D1 (awaiting approval)"
+
+
+
+# --- D5 M3: human approval with interrupt() ------------------------------------------------
+
+
+def _sends(ctx):
+    return ctx.conn.execute("SELECT draft_id, status FROM sends").fetchall()
+
+
+def _approvals(ctx):
+    return ctx.conn.execute("SELECT draft_id, decision FROM approvals ORDER BY approval_id").fetchall()
+
+
+def _pause_at_approve(ctx, settings, fake, saver):
+    fake["verdicts"].append(STRONG)
+    final = run_flow("L1", ctx, settings, checkpointer=saver)
+    saver.threads.append(str(ctx.run_id))
+    return final
+
+
+def test_the_flow_pauses_at_approve_without_deciding_or_sending(ctx, settings, fake, saver):
+    final = _pause_at_approve(ctx, settings, fake, saver)
+    snap = flow.build_graph(ctx, saver).get_state({"configurable": {"thread_id": str(ctx.run_id)}})
+    assert snap.next == ("approve",)
+    assert snap.interrupts[0].value["draft_id"] == "D1"  # what the human is asked about
+    assert "approved" not in final
+    assert _approvals(ctx) == [] and _sends(ctx) == []
+    assert not (ctx.outbox_dir / "D1.eml").exists()
+
+
+def test_yes_records_the_approval_and_sends_once(ctx, settings, fake, saver):
+    _pause_at_approve(ctx, settings, fake, saver)
+    final = approve_flow("D1", True, ctx, saver)
+    assert final["outcome"] == "sent (written to outbox): D1 to dana.kim@example.com"
+    assert _approvals(ctx) == [(1, "approved")]
+    assert _sends(ctx) == [(1, "sent")]
+    assert (ctx.outbox_dir / "D1.eml").exists()
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "done"
+
+
+def test_no_records_the_decline_and_sends_nothing(ctx, settings, fake, saver):
+    _pause_at_approve(ctx, settings, fake, saver)
+    final = approve_flow("D1", False, ctx, saver)
+    assert final["outcome"] == "declined: D1 not sent"
+    assert _approvals(ctx) == [(1, "declined")]
+    assert _sends(ctx) == [] and not (ctx.outbox_dir / "D1.eml").exists()
+
+
+def test_approving_twice_is_refused(ctx, settings, fake, saver):
+    _pause_at_approve(ctx, settings, fake, saver)
+    approve_flow("D1", True, ctx, saver)
+    with pytest.raises(FlowError, match="not waiting for approval"):
+        approve_flow("D1", True, ctx, saver)
+    assert _sends(ctx) == [(1, "sent")]
+
+
+def test_approve_refuses_an_unknown_draft_or_one_outside_a_flow(ctx, saver):
+    with pytest.raises(FlowError, match="no draft D99"):
+        approve_flow("D99", True, ctx, saver)
+    d = state.insert_draft(ctx.conn, tools.fetch_lead(ctx.conn, "L1"), "Hi", "Hello", None)
+    with pytest.raises(FlowError, match=f"no draft {d.draft_id}"):
+        approve_flow(d.draft_id, True, ctx, saver)
+
+
+def test_a_crash_in_send_then_resume_sends_exactly_once(ctx, settings, fake, saver, monkeypatch):
+    """The send node RE-RUNS on resume. Crash AFTER the email went out, BEFORE the checkpoint:
+    the re-run must find it in the ledger, not send again."""
+    _pause_at_approve(ctx, settings, fake, saver)
+    real, crashed = flow.execute, []
+
+    def execute(name, args, c):
+        out = real(name, args, c)
+        if name == "send_email" and not crashed:
+            crashed.append(1)
+            raise KeyboardInterrupt  # dies right after the send, before LangGraph saves the step
+        return out
+
+    monkeypatch.setattr(flow, "execute", execute)
+    with pytest.raises(KeyboardInterrupt):
+        approve_flow("D1", True, ctx, saver)
+    assert state.get_run(ctx.conn, ctx.run_id)["status"] == "failed"
+    final = resume_flow(ctx.run_id, ctx, saver)  # send node runs again from its start
+    assert final["outcome"] == "already sent: D1 to dana.kim@example.com"
+    assert _sends(ctx) == [(1, "sent")]
+    assert len(list(ctx.outbox_dir.glob("*.eml"))) == 1
+    assert _approvals(ctx) == [(1, "approved")]  # approve did NOT re-run: its checkpoint was saved
+
+
+def test_the_pause_survives_a_new_process(ctx, settings, fake, saver, test_db_url):
+    """'Approve tomorrow': a brand-new saver on a brand-new connection still finds the pause."""
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    _pause_at_approve(ctx, settings, fake, saver)
+    with flow.checkpointer_conn(test_db_url) as conn:
+        final = approve_flow("D1", False, ctx, PostgresSaver(conn))
+    assert final["outcome"] == "declined: D1 not sent"
+
+
+def test_send_refuses_if_authorize_denies(ctx, settings, fake, saver, monkeypatch):
+    _pause_at_approve(ctx, settings, fake, saver)
+    monkeypatch.setattr(flow, "authorize", lambda call: "deny")
+    with pytest.raises(FlowError, match="decision=deny"):
+        approve_flow("D1", True, ctx, saver)
+    assert _sends(ctx) == []
