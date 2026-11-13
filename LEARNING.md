@@ -2147,3 +2147,11 @@ test (spawned process: 3 tools listed, get_lead L1, send_email refused).
 - `stdio_server()` points fd 1 at stderr while serving: my log lines (`[tool]`, `[run]`) can't
   corrupt the protocol on stdout.
 - The local Homebrew DB was still at 0006: model tools need 0007 (`usage`, tenant limits).
+
+**Live test in Claude Code (2026-11-13):** "get lead L1, then qualify it" → get_lead + qualify_lead
+through MCP, strong fit with cited reasons, metered (usage: mcp:qualify_lead 2,415 tokens).
+"Now send Dana an email" → MCP: no such tool. Then the session used ITS OWN Bash to run
+`flow L1` → stopped at load_lead (L1 replied on Day 4: the P4 memory rule), no model call, no draft;
+it asked before resetting the reply. **Lesson:** MCP bounds what a client does THROUGH MCP, not what
+an agent with a shell in the repo can do. The layers that actually held were deeper: replied check,
+interrupt() approval, send_once. Defense in depth isn't optional when the caller is an agent.

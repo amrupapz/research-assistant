@@ -343,6 +343,13 @@ The model calling these tools is outside this codebase, so the server treats eve
   model, and their tokens are recorded, the same rule as the API.
 - Errors come back as `is_error` results the model can read. Internal details stay in the run log.
 
+MCP limits what a client can do *through MCP*. In a live test, Claude Code was asked to "send Dana
+an email": the server had no tool for it, so Claude Code ran the workflow CLI through its own shell
+instead. The approval gate still held. The run stopped on its own because the lead had already
+replied, and an unreplied lead would have paused for a human's approval. A client with a shell on
+the machine is outside this server's boundary, so in a real deployment the MCP client shouldn't
+have one.
+
 Tested through the real protocol: the SDK's client talks to the server in-process (17 tests) and
 over stdio.
 
