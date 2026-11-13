@@ -344,10 +344,22 @@ def run_flow(lead_id: str, ctx: ToolContext, settings: Settings | None = None, c
     No checkpointer → an in-memory one (tests): interrupt() needs SOME checkpointer to pause."""
     from langgraph.checkpoint.memory import InMemorySaver
 
-    settings = settings or get_settings()
     checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
+    start_flow_run(lead_id, ctx, settings)
+    return execute_flow(lead_id, ctx, checkpointer)
+
+
+def start_flow_run(lead_id: str, ctx: ToolContext, settings: Settings | None = None) -> UUID:
+    """Create the runs row (status 'running') and set ctx.run_id. Fast: the API returns this id
+    at once (D7 M1) and runs execute_flow in the background."""
+    settings = settings or get_settings()
     with ctx.conn.transaction():
         ctx.run_id = state.start_run(ctx.conn, f"flow {lead_id}", settings.model, FLOW_VERSION)
+    return ctx.run_id
+
+
+def execute_flow(lead_id: str, ctx: ToolContext, checkpointer) -> FlowState:
+    """Run the graph for the run in ctx.run_id (made by start_flow_run). Slow: model calls."""
     return _invoke(ctx, checkpointer, {"lead_id": lead_id}, "flow", {"lead_id": lead_id})
 
 
@@ -378,18 +390,52 @@ def resume_flow(run_id: UUID, ctx: ToolContext, checkpointer) -> FlowState:
 
 def approve_flow(draft_id: str, approved: bool, ctx: ToolContext, checkpointer) -> FlowState:
     """Resume the run that is waiting at approve for THIS draft, with the human's decision."""
+    claim_approval(draft_id, ctx, checkpointer)
+    return continue_approval(draft_id, approved, ctx, checkpointer)
+
+
+def claim_approval(draft_id: str, ctx: ToolContext, checkpointer) -> UUID:
+    """Check the draft's run is waiting at approve for THIS draft, then claim it: waiting → running
+    in ONE conditional UPDATE. Two approvals racing (double-click, two tabs): only one UPDATE matches
+    'waiting', the other gets FlowError. Sets ctx.run_id. Fast: the API calls it before returning."""
     run_id = state.draft_run_id(ctx.conn, draft_id)
     if run_id is None:
         raise FlowError(f"no draft {draft_id} from a workflow run")
     run = _flow_run(ctx, run_id)
     snapshot = build_graph(ctx, checkpointer).get_state(_config(run_id))
     waiting_for = (snapshot.values.get("draft") or {}).get("draft_id") if snapshot.next == ("approve",) else None
-    if run["status"] != "waiting" or waiting_for != draft_id:
+    with ctx.conn.transaction():
+        claimed = waiting_for == draft_id and state.claim_waiting(ctx.conn, run_id)
+    if not claimed:
         raise FlowError(f"draft {draft_id} is not waiting for approval (run {run_id} is {run['status']})")
     ctx.run_id = run_id
-    with ctx.conn.transaction():
-        state.mark_running(ctx.conn, run_id)
+    return run_id
+
+
+def continue_approval(draft_id: str, approved: bool, ctx: ToolContext, checkpointer) -> FlowState:
+    """Resume the claimed run (ctx.run_id) with the decision. Slow: may send. A crash between claim
+    and here leaves the run 'running' at approve: `flow --resume` pauses it at approve again."""
     return _invoke(ctx, checkpointer, Command(resume=approved), "flow-approve", {"draft_id": draft_id, "approved": approved})
+
+
+def run_view(run_id: UUID, ctx: ToolContext, checkpointer) -> dict | None:
+    """What a caller may see about a flow run (GET /runs/{id}); None if it isn't a flow run.
+    The draft is included only while the run waits for a decision: show it BEFORE approving."""
+    run = state.get_run(ctx.conn, run_id)
+    if run is None or run["agent_prompt_version"] != FLOW_VERSION:
+        return None
+    values = build_graph(ctx, checkpointer).get_state(_config(run_id)).values
+    q = values.get("qualification") or {}
+    d = values.get("draft") or {}
+    return {
+        "run_id": run_id,
+        "status": run["status"],
+        "lead_id": values.get("lead_id"),
+        "outcome": values.get("outcome"),
+        "fit": q.get("fit"),
+        "warnings": values.get("warnings", []),
+        "draft": {k: d.get(k) for k in ("draft_id", "to", "subject", "body")} if d and run["status"] == "waiting" else None,
+    }
 
 
 def main() -> None:

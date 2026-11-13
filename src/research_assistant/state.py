@@ -50,6 +50,12 @@ def mark_running(conn: psycopg.Connection, run_id: UUID) -> None:
     conn.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE run_id = %s", [run_id])
 
 
+def claim_waiting(conn: psycopg.Connection, run_id: UUID) -> bool:
+    """waiting → running only if it is STILL waiting; True if this call won (exactly one caller does)."""
+    cur = conn.execute("UPDATE runs SET status = 'running' WHERE run_id = %s AND status = 'waiting'", [run_id])
+    return cur.rowcount == 1
+
+
 def wait_run(conn: psycopg.Connection, run_id: UUID, answer: str | None = None) -> None:
     """Paused for a human (a flow at interrupt()): not finished, so finished_at stays NULL."""
     conn.execute("UPDATE runs SET status = 'waiting', answer = %s, finished_at = NULL WHERE run_id = %s", [answer, run_id])

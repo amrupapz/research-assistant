@@ -1877,3 +1877,72 @@ written by Claude at my request), validated by an A/A test; one real fix (icp-v2
 - A gate is validated by an A/A test: it must stay quiet when nothing changed.
 **Open (carried, see CLAUDE.md "After the week"):** 30% injection (source vetting), follow-up cap,
 small conflicting_info category, judge on drafts, holdout h01–h06 unreviewed, q15 flaky.
+
+# Day 7 — Project 7 + 8: API, security, Docker, CI, portfolio
+
+## D7 M0 — API surface + threat model (no code)
+
+**Concept:** A threat model lists what I protect (assets), how it can be reached (entry points =
+endpoints) and, for every pair, who is allowed and what happens when someone who isn't tries. Each
+threat gets a named defense AND a test that attempts the attack. Without it, security is bolted on
+per endpoint and the first query missing `WHERE tenant_id = …` leaks a customer's leads.
+
+**Assets:** tenant data (leads, findings, drafts, runs/run_steps); the send action (send_once,
+approver only, at most once); OpenAI/Langfuse keys; the OpenAI budget.
+
+**Endpoints:** GET /health (anyone, DB ping → 200/503, no detail) · POST /ask (member) ·
+POST /runs {lead_id} (member → 202 run_id, flow in background) · GET /runs/{id} (member; shows the
+draft when waiting = the P5 "show draft before approving" carry) · POST /drafts/{id}/approve
+(approver only; same approve_flow path as the CLI) · GET /leads/{id}/status (member).
+Codes: 401 no/bad key · 404 missing OR another tenant's (indistinguishable) · 403 own tenant,
+missing role · 413 body too big · 422 invalid · 429 rate/budget.
+
+**Attacks → defenses:** (1) read another tenant's data by guessing ids (L4, D20 are sequential) →
+tenant_id on every row, every query filters, can_access(), 404. (2) act on it (start a run on
+their lead, approve their draft) → same, checked before any work. (3) skip approval: member calls
+approve → 403; injected "send now" → authorize() default-deny + send_email always needs_approval;
+draft not waiting → approve_flow state check; double approve → send_once ledger. (4) huge requests
+→ body limit 413, Pydantic max_length 422. (5) burn budget → per-key rate limit, runs/day, daily
+token budget → 429 BEFORE any model call; max_steps. (6) secrets via errors → handler returns only
+{error, request_id}. (7) key theft → store sha256 hash, never log keys, rotation in RUNBOOK.
+Out of scope: TLS, a malicious legitimate approver, injection skewing draft CONTENT (~30%).
+
+**My decisions (took Claude's recommendations):** chunks = shared knowledge base (public pages);
+leads/runs/drafts/sends get tenant_id. Tenants + keys created by an admin CLI only, no endpoint
+(less surface). Member approving own tenant's draft → 403 (nothing leaks, so no need to hide).
+
+**Gotchas:** 404-not-403 only hides EXISTENCE across tenants; inside a tenant 403 is more honest.
+Budget checks must run before the model call or the 429 comes after the money is spent.
+
+## D7 M1 — FastAPI app (api.py)
+
+**Concept:** FastAPI maps HTTP routes to functions; Pydantic models validate every request before
+my code runs and shape every response. Long work (a flow, ~15 s p95) must not hold the request:
+POST /runs creates the runs row, returns 202 + run_id, and the graph runs in a background task;
+GET /runs/{id} polls. Without it: client timeouts, workers stuck, a refresh starts a second run.
+
+**Built:** api.py (only file importing fastapi), `uv run api` (127.0.0.1:8000, /docs).
+- Guard = plain ASGI middleware, outermost: request id (client's X-Request-ID only if it matches
+  [A-Za-z0-9_-]{1,64}, else new: a header goes into my logs, so no newlines), 16 KB body limit
+  (Content-Length → 413 before reading; chunked bodies counted as they arrive), one `kind: api` log
+  line per request with the ROUTE (/runs/{run_id}), not the raw path, so M6 can group p95 by endpoint.
+- Errors: {"error", "request_id"} only. 422 lists loc+msg but NOT the input (the default echoes it:
+  could be huge or a secret). FlowError → 409. Anything else → 500 "internal error"; traceback goes
+  to runs/ as `kind: api_error` with the same request_id.
+- extra="forbid" on request models (unknown field = 422), StrictBool for approved ("yes" ≠ True).
+- flow.py split: start_flow_run (fast) + execute_flow (slow); approve_flow = claim_approval (fast:
+  checks + ONE conditional UPDATE waiting→running) + continue_approval (slow). CLI unchanged.
+- run_view: status, fit, warnings, and the draft ONLY while waiting → P5 carry ("show the draft
+  before deciding") done for the API.
+- Background jobs open their OWN connections (the request's is closed by then). Crash → run stays
+  'running'/'failed' → `flow --resume`, same as the CLI.
+- /health: its own connect with connect_timeout=2, not the shared dependency → 503, never a crash.
+
+**Gotchas:**
+- Check-then-act race: two approves could both see 'waiting'. `UPDATE … WHERE status='waiting'` +
+  rowcount == 1 makes the claim atomic: exactly one wins, the other gets 409.
+- TestClient runs background tasks before the call returns → end-to-end tests without sleeps.
+- A body-read error inside FastAPI becomes a 400 unless it's an HTTPException → BodyTooLarge
+  subclasses HTTPException to stay a 413.
+- Found in the smoke test: the 409 for a non-flow draft names its run_id. Fine now; in M2 a draft
+  of another tenant must be a plain 404 (no ids, no states).

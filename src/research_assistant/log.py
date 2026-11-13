@@ -28,6 +28,13 @@ def log_run(record: dict, runs_dir: Path) -> Path:
             file=sys.stderr,
         )
         return path
+    if record.get("kind") == "api":
+        print(
+            f"[api] {record.get('method')} {record.get('path')} {record.get('status')} "
+            f"{record.get('latency_ms')}ms {record.get('request_id')}",
+            file=sys.stderr,
+        )
+        return path
     print(
         f"[run] {record.get('status')} {record.get('latency_ms')}ms "
         f"in={record.get('input_tokens')} out={record.get('output_tokens')} "
