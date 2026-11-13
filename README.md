@@ -318,6 +318,34 @@ usage rows: 1, runs: 1   ← the 429s cost nothing
 61 requests with one key → 60 × 200, 1 × 429  Retry-After: 59
 ```
 
+## MCP server
+
+The read-only tools are also available to any MCP client (Claude Code, Claude Desktop) over stdio:
+`search_company` (cited research), `get_lead`, and `qualify_lead`. To connect Claude Code, run this
+from the repo root:
+
+```bash
+claude mcp add research-assistant -- uv --directory "$PWD" run research-mcp --tenant default
+```
+
+The model calling these tools is outside this codebase, so the server treats every call as untrusted:
+
+- **Only 3 tools exist** for the client. `send_email` and `draft_email` aren't exposed. Calling them
+  returns "unknown tool".
+- **The same gate as the workflow:** validate (Pydantic) → `authorize()` (default-deny) → execute in
+  a transaction → traced. If `send_email` were ever exposed by mistake, `authorize()` would still
+  refuse it (`needs_approval`), and a test checks that.
+- **Schemas come from the same Pydantic models** the agent uses (strict, `additionalProperties: false`),
+  so the schema a client sees can't drift from what the server accepts.
+- **One tenant per server process** (`--tenant`). The connection only sees that tenant's leads and
+  research.
+- **The tenant's daily token budget** is checked before `search_company` and `qualify_lead` call the
+  model, and their tokens are recorded, the same rule as the API.
+- Errors come back as `is_error` results the model can read. Internal details stay in the run log.
+
+Tested through the real protocol: the SDK's client talks to the server in-process (17 tests) and
+over stdio.
+
 ## Operations
 
 - **[RUNBOOK.md](RUNBOOK.md)** covers:
@@ -344,7 +372,7 @@ calls were the timeout demo. Both are under the thresholds.
 ## CI
 
 - **[CI](.github/workflows/ci.yml)**, on every push and PR:
-  - ruff, plus 614 tests against a real pgvector Postgres (fake model, no secrets)
+  - ruff, plus 631 tests against a real pgvector Postgres (fake model, no secrets)
   - a Docker build
   - In CI an unreachable database **fails** the run instead of skipping 200 tests.
 - **[Evals](.github/workflows/evals.yml)**, started by hand:
@@ -366,15 +394,16 @@ src/research_assistant/
   auth.py         API keys (SHA-256), roles, can_access(), keys CLI (tenant plans)
   tracing.py      Langfuse (the only file importing it)
   gate.py         regression gate
+  mcp_server.py   MCP server (stdio): 3 read-only tools through the same gate (the only file importing mcp)
   alerts.py       error-rate / p95 alerts from the run logs (RUNBOOK.md says what each one means)
 migrations/       Alembic, plain SQL (0001–0007)
 evals/            labelled cases, runner, cost/latency report, gate, baseline.json
-tests/            614 tests; *_pg tests use a real test database, rolled back
+tests/            631 tests; *_pg tests use a real test database, rolled back
 data/             saved page snapshots used as the knowledge base (for testing, not live data)
 ```
 
 Stack: Python 3.12, uv, OpenAI Responses API, Pydantic, Postgres 17 + pgvector, psycopg 3, Alembic,
-LangGraph, Langfuse, FastAPI, Docker Compose, GitHub Actions.
+LangGraph, Langfuse, FastAPI, MCP Python SDK, Docker Compose, GitHub Actions.
 
 ## License
 

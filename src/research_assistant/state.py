@@ -441,5 +441,17 @@ def tokens_today(conn: psycopg.Connection) -> int:
     ).fetchone()[0]
 
 
+def daily_limit_problem(conn: psycopg.Connection, starting_run: bool) -> str | None:
+    """Why the connection's tenant may NOT make another model call today, or None if it may.
+    ONE rule for every entry point (API 429, MCP tool error). Checked at the START of a request:
+    a run that starts under budget may finish over it (at most one run)."""
+    max_runs, budget = tenant_limits(conn)
+    if starting_run and (n := runs_today(conn)) >= max_runs:
+        return f"daily run limit reached ({n} of {max_runs} runs today, UTC)"
+    if (used := tokens_today(conn)) >= budget:
+        return f"daily token budget exceeded (used {used:,} of {budget:,} tokens today, UTC)"
+    return None
+
+
 def record_usage(conn: psycopg.Connection, tokens: int, endpoint: str, run_id: UUID | None = None) -> None:
     conn.execute("INSERT INTO usage (tokens, endpoint, run_id) VALUES (%s, %s, %s)", [tokens, endpoint, run_id])

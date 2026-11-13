@@ -6,7 +6,7 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: P1–P8 done; remaining: MCP stretch (see "Day 7 stretch"). See LEARNING.md wrap-ups.
+CURRENT STAGE: P1–P8 + the MCP stretch done — the planned week is complete. See LEARNING.md wrap-ups.
 Carried: `agent approve` (CLI) should show the draft before deciding — the API already does (GET /runs/{id}).
 M8 (Gmail MCP) dropped: Google's Gmail MCP server looks gated to Workspace preview accounts;
 MCP experience comes from the Day 7 server. M9 and the rest: "After the week" under Day 6.
@@ -55,6 +55,7 @@ src/research_assistant/
   perf.py       pure cost/latency from trace trees: decompose (self-time split), percentile, summaries
   auth.py       Principal, can_access (✍️ mine), API keys (sha256), `uv run keys ...` CLI
   api.py        FastAPI (ONLY file importing fastapi): Bearer auth, rate limit, daily limits (429), tenant conn, 404/403
+  mcp_server.py MCP server (stdio, `research-mcp --tenant T`): search_company/get_lead/qualify_lead via call_tool; ONLY file importing mcp
   alerts.py     ALERT lines (5xx/429/model error rates, p95 per route, crashes, failed jobs) from run logs; RUNBOOK.md
   gate.py       regression_gate(baseline, current, tolerance) -> (ok, reasons); snapshot()
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
@@ -170,4 +171,7 @@ P7 (Day 7): API + security + ops — threat model; FastAPI (202 + background run
    `flow --resume --tenant`. 614 tests. See LEARNING.md.
 P8 (Day 7): portfolio — README (diagram, quickstart, API, trade-offs, evals vs baseline, security,
    2 Langfuse traces, known failures), scripts/demo.sh (4 recorded demos), MIT license. Repo private
-   until the old-commit email decision. See LEARNING.md.
+   public. See LEARNING.md.
+MCP stretch (Day 7): mcp 2.3.0 low-level Server, 3 read-only tools through flow.call_tool (authorize
+   inside), schemas = tool_schema(Pydantic), --tenant, shared daily budget rule, 17 protocol tests +
+   stdio smoke test, Claude Code connection. 631 tests. See LEARNING.md.

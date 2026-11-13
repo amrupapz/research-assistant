@@ -16,6 +16,7 @@ dependencies = [
     "langfuse>=5",
     "langgraph>=1.2.20",
     "langgraph-checkpoint-postgres>=3.2.0",
+    "mcp>=2.3.0",
     "openai>=3.49.0",
     "psycopg[binary]>=3.3.8",
     "pydantic>=2.14.3",
@@ -28,6 +29,7 @@ ask = "research_assistant.cli:main"
 agent = "research_assistant.agent:main"
 api = "research_assistant.api:main"
 keys = "research_assistant.auth:main"
+research-mcp = "research_assistant.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

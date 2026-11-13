@@ -2077,14 +2077,14 @@ with re-learning the system.
 | P5 | `route_after_qualify` | Claude, at my request |
 | P6 | `regression_gate` | Claude, at my request |
 | P7 | `can_access` | Claude, at my request, explained line by line |
+| stretch | `mcp_call` | Claude, at my request, explained line by line |
 
 Honest summary: one core function written by me; the other seven I asked for and should be able to
 explain line by line. Re-writing two of them from scratch (can_access, rrf_merge) is the cheapest way
 to close that gap before interviews.
 
 **Open (carried):**
-- **MCP stretch** (search_company / get_lead / qualify_lead over stdio, authorize() inside, no
-  send_email): not started — the only planned item left.
+- ~~**MCP stretch**~~ — done (see "Day 7 stretch — MCP server" below).
 - **Going public:** decide on the 56 old commits with the Berkeley email (rewrite to noreply = force
   push, only while private), then `gh repo edit --visibility public`.
 - **Known failures (in the README):** poisoned facts reach drafts (source vetting); retrieval has no
@@ -2095,3 +2095,55 @@ to close that gap before interviews.
 - My answers to the Day 7 check questions are blank (M2 "My answer: pending" etc.).
 - ~~LEARNING.md had the route_after_qualify explanation pasted 17 times~~ — fixed: 16 copies
   (Days 1–4) removed, the one under D5 M1 kept.
+
+## Day 7 stretch — MCP server
+
+**Concept:** MCP (Model Context Protocol) is a standard way for an AI client (Claude Code, Claude
+Desktop) to discover and call tools in another program: the server lists tools with JSON schemas,
+the client calls them over stdio (JSON-RPC). The model on the other side is NOT mine, so every call
+is untrusted input and the permission gate must run INSIDE the server. Without MCP every client
+needs custom glue; without the gate inside, a client could call anything registered (send_email).
+
+**Built:** `mcp` 2.3.0 (official SDK; v2 renamed FastMCP → MCPServer — read the installed source
+first instead of trusting v1 memory). mcp_server.py (only file importing mcp): low-level `Server`
+with on_list_tools / on_call_tool so the schemas are exactly `tool_schema(REGISTRY[n])`; 3 tools
+(search_company, get_lead, qualify_lead); calls run in a worker thread under a lock (blocking DB +
+model, one connection); `research-mcp --tenant T`. Shared `state.daily_limit_problem()` = one budget
+rule for API (429) and MCP (is_error). 17 tests through the SDK's in-process Client + a stdio smoke
+test (spawned process: 3 tools listed, get_lead L1, send_email refused).
+
+**How mcp_call works (Claude wrote it on request, explained line by line)**
+- `if name not in EXPOSED: return _error(...)` → first check, before ANY work: a name the server never
+  listed (send_email, "Get_Lead", "") is unknown. Exact match, like authorize().
+- `try:` → everything after this can fail; nothing escapes as an exception (a crash would be a
+  protocol error the model can't read).
+- `if name in USES_MODEL and (problem := state.daily_limit_problem(...)): return _error(problem)` →
+  only tools that spend money check the budget, and BEFORE the gate runs them. get_lead still works
+  over budget.
+- `with token_meter() as used:` → count tokens of every model/embedding call made inside (the same
+  meter the API uses).
+- `output = call_tool(ctx, name, arguments or {})` → THE gate, the same function the workflow uses:
+  validate → authorize (only "allow" runs) → execute in a transaction → traced. `or {}`: a client
+  may send no arguments at all.
+- `finally: if used[0]: state.record_usage(...)` → tokens spent are recorded even if the call then
+  failed; no row when nothing was spent.
+- `except (ToolError, FlowError) as e: return _error(str(e))` → OUR messages (bad args without
+  echoing them, not allowed, no such lead): safe to show, useful for the model to correct itself.
+- `except Exception as e: log_run(...); return _error(f"{name} failed ({type(e).__name__})...")` →
+  anything else (OpenAI down after retries, a bug): the full traceback goes to OUR log, the client
+  gets only the tool name and the exception type.
+- `data = json.loads(json.dumps(output, default=str))` → dates and UUIDs become strings, so the result
+  is valid JSON on the wire.
+- `return CallToolResult(content=[TextContent(text=...)], structured_content=data)` → text for clients
+  that read text, structured data for clients that read JSON.
+
+**Gotchas:**
+- Tool errors belong INSIDE the result (`is_error=True`) so the model can read them; protocol errors
+  are for "couldn't even route the request".
+- Two independent checks for send_email: not exposed (unknown tool) AND authorize() says
+  needs_approval inside call_tool. A test exposes it on purpose to prove the second check holds.
+- Async handlers + blocking tools → `anyio.to_thread.run_sync` + a lock (one psycopg connection,
+  transactions must not interleave).
+- `stdio_server()` points fd 1 at stderr while serving: my log lines (`[tool]`, `[run]`) can't
+  corrupt the protocol on stdout.
+- The local Homebrew DB was still at 0006: model tools need 0007 (`usage`, tenant limits).

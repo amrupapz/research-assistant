@@ -264,13 +264,9 @@ def seconds_to_utc_midnight() -> float:
 
 
 def enforce_daily_limits(conn: psycopg.Connection, starting_run: bool) -> None:
-    """The tenant's plan: runs per day (only when starting one) and the daily token budget. Checked at
-    the START of a request, so one run that starts under budget may finish over it (at most one run)."""
-    max_runs, budget = state.tenant_limits(conn)
-    if starting_run and (n := state.runs_today(conn)) >= max_runs:
-        raise too_many(f"daily run limit reached ({n} of {max_runs} runs today, UTC)", seconds_to_utc_midnight())
-    if (used := state.tokens_today(conn)) >= budget:
-        raise too_many(f"daily token budget exceeded (used {used:,} of {budget:,} tokens today, UTC)", seconds_to_utc_midnight())
+    """The tenant's plan (state.daily_limit_problem, shared with the MCP server) → 429 until UTC midnight."""
+    if problem := state.daily_limit_problem(conn, starting_run):
+        raise too_many(problem, seconds_to_utc_midnight())
 
 
 UNAUTHORIZED = HTTPException(401, "missing or invalid API key", headers={"WWW-Authenticate": "Bearer"})
