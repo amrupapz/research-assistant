@@ -10,7 +10,10 @@ continue (slow, background). Same flow.py functions as the CLI, so the same guar
 Errors never carry a stack trace or exception text: {"error", "request_id"}. The details go to the
 runs/ log under the same request_id.
 
-M1 has NO auth: bind to 127.0.0.1 only. M2 adds API keys, tenants, roles.
+Auth (D7 M2): `Authorization: Bearer <key>` on everything except /health. The key → a Principal
+(tenant + role); the request's connection is then set to that tenant, so every query only sees its
+rows. Codes: 401 no/bad/revoked key · 404 missing OR another tenant's (same body, can't tell apart)
+· 403 own tenant, role not allowed (a member approving).
 """
 
 import re
@@ -30,9 +33,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
-from research_assistant import flow, tracing
+from research_assistant import flow, state, tracing
+from research_assistant.auth import Principal, Resource, can_access, find_principal
 from research_assistant.config import Settings, get_settings
-from research_assistant.db import connect, fetch_lead
+from research_assistant.db import connect, set_tenant
 from research_assistant.flow import FlowError
 from research_assistant.llm import IncompleteResponseError, UngroundedAnswerError
 from research_assistant.log import log_run
@@ -163,10 +167,13 @@ class Guard:
                 await self.app(scope, limited_receive, send_with_id)
         finally:
             route = scope.get("route")
+            principal = scope["state"].get("principal")  # set by get_principal; None = no/bad key
             log_run(
                 {
                     "kind": "api",
                     "request_id": rid,
+                    "key_id": principal.key_id if principal else None,  # never the key itself
+                    "tenant_id": principal.tenant_id if principal else None,
                     "method": scope["method"],
                     "path": getattr(route, "path", scope["path"]),  # /runs/{run_id}, not the id: groups for p95
                     "status": status,
@@ -192,13 +199,50 @@ def get_app_settings() -> Settings:
 
 
 def get_conn(settings: Annotated[Settings, Depends(get_app_settings)]) -> Iterator[psycopg.Connection]:
-    """One autocommit connection per request (each `with conn.transaction()` commits)."""
+    """One autocommit connection per request (each `with conn.transaction()` commits).
+    NO tenant yet: tenant queries raise until get_tenant_conn sets it from the checked key."""
     try:
-        conn = connect(settings.database_url, autocommit=True)
+        conn = connect(settings.database_url, autocommit=True, tenant=None)
     except psycopg.OperationalError as e:
         raise HTTPException(503, "database unavailable") from e
     with conn:
         yield conn
+
+
+UNAUTHORIZED = HTTPException(401, "missing or invalid API key", headers={"WWW-Authenticate": "Bearer"})
+
+
+def get_principal(request: Request, conn: Annotated[psycopg.Connection, Depends(get_conn)]) -> Principal:
+    """Who is calling. Unknown, revoked and malformed keys all get the same 401."""
+    scheme, _, key = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not key or len(key) > 128:
+        raise UNAUTHORIZED
+    principal = find_principal(conn, key.strip())
+    if principal is None:
+        raise UNAUTHORIZED
+    request.state.principal = principal  # for the access log
+    return principal
+
+
+def get_tenant_conn(
+    conn: Annotated[psycopg.Connection, Depends(get_conn)], principal: Annotated[Principal, Depends(get_principal)]
+) -> psycopg.Connection:
+    """The request's connection, scoped to the caller's tenant. Endpoints only ever get THIS one."""
+    set_tenant(conn, principal.tenant_id)
+    return conn
+
+
+NOT_FOUND = HTTPException(404, "not found")  # no id, no state: nothing to learn from it
+
+
+def check(conn: psycopg.Connection, user: Principal, kind: str, key, action: str) -> None:
+    """404 if the resource is missing or another tenant's (indistinguishable); 403 if it is ours but
+    the role can't do `action`. Two layers: the tenant-filtered lookup AND can_access()."""
+    tenant_id = state.owner(conn, kind, key)
+    if tenant_id is None or not can_access(user, Resource(tenant_id), "read"):
+        raise NOT_FOUND
+    if not can_access(user, Resource(tenant_id), action):
+        raise HTTPException(403, f"your role can't {action}")
 
 
 def get_checkpointer(settings: Annotated[Settings, Depends(get_app_settings)]):
@@ -221,22 +265,22 @@ class Runner:
         self.settings = settings
 
     @contextmanager
-    def _ctx(self, run_id: UUID):
+    def _ctx(self, run_id: UUID, tenant_id: str):
         from langgraph.checkpoint.postgres import PostgresSaver
 
         url = self.settings.database_url
-        with connect(url, autocommit=True) as conn, flow.checkpointer_conn(url) as cp_conn:
+        with connect(url, autocommit=True, tenant=tenant_id) as conn, flow.checkpointer_conn(url) as cp_conn:
             yield ToolContext(conn=conn, run_id=run_id), PostgresSaver(cp_conn)
 
-    def execute_flow(self, run_id: UUID, lead_id: str) -> None:
-        self._job(run_id, lambda ctx, cp: flow.execute_flow(lead_id, ctx, cp))
+    def execute_flow(self, run_id: UUID, lead_id: str, tenant_id: str) -> None:
+        self._job(run_id, tenant_id, lambda ctx, cp: flow.execute_flow(lead_id, ctx, cp))
 
-    def continue_approval(self, run_id: UUID, draft_id: str, approved: bool) -> None:
-        self._job(run_id, lambda ctx, cp: flow.continue_approval(draft_id, approved, ctx, cp))
+    def continue_approval(self, run_id: UUID, draft_id: str, approved: bool, tenant_id: str) -> None:
+        self._job(run_id, tenant_id, lambda ctx, cp: flow.continue_approval(draft_id, approved, ctx, cp))
 
-    def _job(self, run_id: UUID, fn) -> None:
+    def _job(self, run_id: UUID, tenant_id: str, fn) -> None:
         try:
-            with self._ctx(run_id) as (ctx, cp):
+            with self._ctx(run_id, tenant_id) as (ctx, cp):
                 fn(ctx, cp)
         except Exception:  # noqa: BLE001 -- the run row already says 'failed'; nobody awaits this response
             log_run({"kind": "api_job", "run_id": run_id, "status": "error", "error": traceback.format_exc()}, self.settings.runs_dir)
@@ -246,7 +290,8 @@ def get_runner(settings: Annotated[Settings, Depends(get_app_settings)]) -> Runn
     return Runner(settings)
 
 
-Conn = Annotated[psycopg.Connection, Depends(get_conn)]
+Conn = Annotated[psycopg.Connection, Depends(get_tenant_conn)]  # always tenant-scoped
+User = Annotated[Principal, Depends(get_principal)]
 Checkpointer = Annotated[object, Depends(get_checkpointer)]
 LeadId = Annotated[str, PathParam(pattern=LEAD_ID)]
 DraftId = Annotated[str, PathParam(pattern=DRAFT_ID)]
@@ -266,7 +311,9 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
-        return error(exc.status_code, str(exc.detail), _rid(request))
+        response = error(exc.status_code, str(exc.detail), _rid(request))
+        response.headers.update(exc.headers or {})  # e.g. WWW-Authenticate on a 401
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request: Request, exc: RequestValidationError):
@@ -317,45 +364,48 @@ def create_app() -> FastAPI:
     @app.post("/runs", status_code=202)
     def start_run(
         body: StartRunRequest,
+        user: User,
         conn: Conn,
         background: BackgroundTasks,
         runner: Annotated[Runner, Depends(get_runner)],
         settings: Annotated[Settings, Depends(get_app_settings)],
     ) -> Accepted:
         """Start the workflow for a lead. Returns at once; poll GET /runs/{run_id}."""
-        if fetch_lead(conn, body.lead_id) is None:
-            raise HTTPException(404, f"no lead {body.lead_id}")  # before creating anything
+        check(conn, user, "lead", body.lead_id, "start")  # before creating anything
         run_id = flow.start_flow_run(body.lead_id, ToolContext(conn=conn), settings)
-        background.add_task(runner.execute_flow, run_id, body.lead_id)
+        background.add_task(runner.execute_flow, run_id, body.lead_id, user.tenant_id)
         return Accepted(run_id=run_id)
 
     @app.get("/runs/{run_id}")
-    def get_run(run_id: UUID, conn: Conn, checkpointer: Checkpointer) -> RunView:
+    def get_run(run_id: UUID, user: User, conn: Conn, checkpointer: Checkpointer) -> RunView:
+        check(conn, user, "run", run_id, "read")
         view = flow.run_view(run_id, ToolContext(conn=conn), checkpointer)
-        if view is None:
-            raise HTTPException(404, "no such run")
+        if view is None:  # ours, but not a workflow run (an `agent` CLI run)
+            raise NOT_FOUND
         return RunView(**view)
 
     @app.post("/drafts/{draft_id}/approve", status_code=202)
     def approve(
         draft_id: DraftId,
         body: ApproveRequest,
+        user: User,
         conn: Conn,
         checkpointer: Checkpointer,
         background: BackgroundTasks,
         runner: Annotated[Runner, Depends(get_runner)],
     ) -> Accepted:
         """Approve or decline a waiting draft. The claim (waiting → running) happens NOW, so a second
-        call gets 409; sending happens in the background (send_once). Poll GET /runs/{run_id}."""
+        call gets 409; sending happens in the background (send_once). Poll GET /runs/{run_id}.
+        Not ours / missing → 404; a member → 403 (approvers only)."""
+        check(conn, user, "draft", draft_id, "approve")
         run_id = flow.claim_approval(draft_id, ToolContext(conn=conn), checkpointer)  # FlowError → 409
-        background.add_task(runner.continue_approval, run_id, draft_id, body.approved)
+        background.add_task(runner.continue_approval, run_id, draft_id, body.approved, user.tenant_id)
         return Accepted(run_id=run_id)
 
     @app.get("/leads/{lead_id}/status")
-    def get_lead_status(lead_id: LeadId, conn: Conn) -> dict:
+    def get_lead_status(lead_id: LeadId, user: User, conn: Conn) -> dict:
         """What we remember about a lead: outreach, replies, latest qualification and research."""
-        if fetch_lead(conn, lead_id) is None:
-            raise HTTPException(404, f"no lead {lead_id}")
+        check(conn, user, "lead", lead_id, "read")
         return lead_status(LeadStatusArgs(lead_id=lead_id), ToolContext(conn=conn))
 
     return app
@@ -367,4 +417,4 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("research_assistant.api:app", host="127.0.0.1", port=8000)  # localhost only until M2
+    uvicorn.run("research_assistant.api:app", host="127.0.0.1", port=8000)  # M4 (Docker) binds 0.0.0.0 inside the container

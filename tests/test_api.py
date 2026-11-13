@@ -13,7 +13,9 @@ from fastapi.testclient import TestClient
 from test_agent import _settings
 from test_flow import ANSWER, CHUNK, STRONG, fake, saver  # noqa: F401
 
-from research_assistant import api, flow, llm, retrieval, state
+from research_assistant import api, auth, flow, llm, retrieval, state
+from research_assistant.db import seed_leads, set_tenant
+from research_assistant.schemas import Lead
 from research_assistant.tools import ToolContext
 
 
@@ -23,12 +25,12 @@ class InlineRunner:
     def __init__(self, ctx, saver):
         self.ctx, self.saver = ctx, saver
 
-    def execute_flow(self, run_id, lead_id):
+    def execute_flow(self, run_id, lead_id, tenant_id):  # the request already set ctx.conn's tenant
         self.ctx.run_id = run_id
         self.saver.threads.append(str(run_id))  # the saver fixture deletes these checkpoints
         flow.execute_flow(lead_id, self.ctx, self.saver)
 
-    def continue_approval(self, run_id, draft_id, approved):
+    def continue_approval(self, run_id, draft_id, approved, tenant_id):
         self.ctx.run_id = run_id
         flow.continue_approval(draft_id, approved, self.ctx, self.saver)
 
@@ -45,8 +47,25 @@ def ctx(state_db, tmp_path):
     return ToolContext(conn=state_db, outbox_dir=tmp_path / "outbox")
 
 
+def bearer(key: str) -> dict:
+    return {"Authorization": f"Bearer {key}"}
+
+
 @pytest.fixture
-def client(settings, ctx, saver):
+def keys(ctx):
+    """API keys (rolled back with the test). 'default' owns the seed leads L1-L4; 'acme' owns nothing yet."""
+    conn = ctx.conn
+    conn.execute("INSERT INTO tenants (tenant_id) VALUES ('acme') ON CONFLICT DO NOTHING")
+    return {
+        "approver": auth.create_key(conn, "default", "approver")[1],
+        "member": auth.create_key(conn, "default", "member")[1],
+        "acme": auth.create_key(conn, "acme", "approver")[1],  # an APPROVER, so 404s can't be role failures
+    }
+
+
+@pytest.fixture
+def client(settings, ctx, saver, keys):
+    """Calls as the 'default' tenant's approver unless a test passes other headers."""
     app = api.create_app()
     app.dependency_overrides = {
         api.get_app_settings: lambda: settings,
@@ -54,7 +73,7 @@ def client(settings, ctx, saver):
         api.get_checkpointer: lambda: saver,
         api.get_runner: lambda: InlineRunner(ctx, saver),
     }
-    with TestClient(app, raise_server_exceptions=False) as c:
+    with TestClient(app, raise_server_exceptions=False, headers=bearer(keys["approver"])) as c:
         yield c
 
 
@@ -102,7 +121,7 @@ def test_a_crash_returns_500_without_internals(client, settings, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("secret detail sk-live-123 in /Users/me/code")
 
-    monkeypatch.setattr(api, "fetch_lead", boom)
+    monkeypatch.setattr(state, "owner", boom)
     r = client.post("/runs", json={"lead_id": "L1"}, headers={"X-Request-ID": "crash-1"})
     assert (r.status_code, r.json()) == (500, {"error": "internal error", "request_id": "crash-1"})
     assert "sk-live" not in r.text and "Traceback" not in r.text
@@ -202,8 +221,8 @@ def test_approve_no_sends_nothing(client, fake, ctx):
     assert not (ctx.outbox_dir / "D1.eml").exists()
 
 
-def test_approving_a_draft_that_does_not_exist_is_409(client):
-    assert client.post("/drafts/D99/approve", json={"approved": True}).status_code == 409
+def test_approving_a_draft_that_does_not_exist_is_404(client):
+    assert client.post("/drafts/D99/approve", json={"approved": True}).status_code == 404
 
 
 def test_a_lost_race_cannot_approve(client, fake, ctx):
@@ -233,3 +252,98 @@ def test_lead_status(client):
     r = client.get("/leads/L1/status")
     assert r.status_code == 200 and r.json()["lead"]["company"] == "Figma"
     assert client.get("/leads/L999/status").status_code == 404
+
+
+# --- D7 M2: auth, roles, tenant isolation -------------------------------------------------------
+
+
+def test_health_needs_no_key(client):
+    assert client.get("/health", headers={"Authorization": ""}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["", "Bearer", "Bearer ra_wrong", "Basic dXNlcjpwYXNz", "ra_no-scheme", "Bearer " + "x" * 500],
+)
+def test_no_or_bad_key_is_401(client, header):
+    r = client.post("/ask", json={"question": "What does Figma do?"}, headers={"Authorization": header})
+    assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer"
+    assert r.json()["error"] == "missing or invalid API key"
+
+
+def test_401_comes_before_validation(client):
+    """An anonymous caller learns nothing about our schema from 422s."""
+    r = client.post("/runs", json={"lead_id": "junk"}, headers={"Authorization": ""})
+    assert r.status_code == 401
+
+
+def test_a_revoked_key_is_401(client, ctx):
+    key_id, key = auth.create_key(ctx.conn, "default", "approver")
+    assert client.get("/leads/L1/status", headers=bearer(key)).status_code == 200
+    auth.revoke_key(ctx.conn, key_id)
+    assert client.get("/leads/L1/status", headers=bearer(key)).status_code == 401
+
+
+def test_the_access_log_has_the_key_id_never_the_key(client, settings, keys):
+    client.get("/leads/L1/status")
+    line = [x for x in _log(settings) if x["kind"] == "api"][-1]
+    assert line["tenant_id"] == "default" and isinstance(line["key_id"], int)
+    assert keys["approver"] not in json.dumps(_log(settings))
+
+
+# Another tenant's resource: the SAME 404 as a missing one (no id, no state). acme is an approver,
+# so a 404 can't be a role failure.
+
+
+def _same_404(r):
+    assert r.status_code == 404
+    assert r.json() == {"error": "not found", "request_id": r.headers["x-request-id"]}
+
+
+def test_cross_tenant_read_run_is_404(client, fake, keys):
+    run_id = _start(client, fake)
+    r = client.get(f"/runs/{run_id}", headers=bearer(keys["acme"]))
+    _same_404(r)
+    assert "waiting" not in r.text and run_id not in r.text
+    _same_404(client.get(f"/runs/{uuid.uuid4()}", headers=bearer(keys["acme"])))  # indistinguishable
+
+
+def test_cross_tenant_lead_status_is_404(client, keys):
+    _same_404(client.get("/leads/L1/status", headers=bearer(keys["acme"])))
+
+
+def test_cross_tenant_start_is_404_and_creates_nothing(client, keys, ctx):
+    _same_404(client.post("/runs", json={"lead_id": "L1"}, headers=bearer(keys["acme"])))
+    assert ctx.conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+
+def test_cross_tenant_approve_is_404_and_the_run_keeps_waiting(client, fake, keys, ctx):
+    run_id = _start(client, fake)
+    _same_404(client.post("/drafts/D1/approve", json={"approved": True}, headers=bearer(keys["acme"])))
+    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting"  # as default again
+    assert ctx.conn.execute("SELECT count(*) FROM approvals").fetchone()[0] == 0
+    assert not (ctx.outbox_dir / "D1.eml").exists()
+
+
+def test_a_member_can_start_and_read_but_approving_is_403(client, fake, keys, ctx):
+    fake["verdicts"].append(STRONG)
+    member = bearer(keys["member"])
+    run_id = client.post("/runs", json={"lead_id": "L1"}, headers=member).json()["run_id"]
+    assert client.get(f"/runs/{run_id}", headers=member).json()["status"] == "waiting"
+    r = client.post("/drafts/D1/approve", json={"approved": True}, headers=member)
+    assert (r.status_code, r.json()["error"]) == (403, "your role can't approve")
+    assert client.get(f"/runs/{run_id}").json()["status"] == "waiting"
+    assert ctx.conn.execute("SELECT count(*) FROM approvals").fetchone()[0] == 0
+
+
+def test_a_tenants_own_run_is_invisible_to_the_other(client, fake, keys, ctx):
+    """acme runs the flow on ITS lead; default can't see the run, and acme's rows are acme's."""
+    set_tenant(ctx.conn, "acme")
+    seed_leads(ctx.conn, [Lead(lead_id="L9", name="Dana Kim", title="VP Engineering", company="Figma", email="d@example.com")])
+    fake["verdicts"].append(STRONG)
+    acme = bearer(keys["acme"])
+    run_id = client.post("/runs", json={"lead_id": "L9"}, headers=acme).json()["run_id"]
+    assert client.get(f"/runs/{run_id}", headers=acme).json()["status"] == "waiting"
+    _same_404(client.get(f"/runs/{run_id}"))  # default's approver
+    tenants = ctx.conn.execute("SELECT DISTINCT tenant_id FROM drafts UNION SELECT DISTINCT tenant_id FROM runs").fetchall()
+    assert tenants == [("acme",)]

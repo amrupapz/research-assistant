@@ -39,13 +39,32 @@ ON CONFLICT (chunk_id) DO UPDATE SET
 """
 
 
-def connect(url: str | None = None, autocommit: bool = False) -> psycopg.Connection:
-    """autocommit=True for the agent: each `with conn.transaction():` block is then a real commit."""
+DEFAULT_TENANT = "default"  # the CLI + evals tenant (0006 put every pre-tenant row here)
+TENANT = "current_setting('app.tenant_id')"  # in SQL: the connection's tenant (raises if unset = fail closed)
+
+
+def connect(url: str | None = None, autocommit: bool = False, tenant: str | None = DEFAULT_TENANT) -> psycopg.Connection:
+    """autocommit=True for the agent: each `with conn.transaction():` block is then a real commit.
+
+    tenant=None: no tenant yet (the API sets it after checking the key). Tenant queries then raise."""
     if url is None:
         from research_assistant.config import get_settings
 
         url = get_settings().database_url
-    return psycopg.connect(url, autocommit=autocommit)
+    conn = psycopg.connect(url, autocommit=autocommit)
+    if tenant is not None:
+        set_tenant(conn, tenant)
+        if not autocommit:
+            conn.commit()  # a later rollback must not undo the setting
+    return conn
+
+
+def set_tenant(conn: psycopg.Connection, tenant_id: str) -> None:
+    """Every tenant query on this connection now sees (and writes) only tenant_id's rows.
+
+    Session-level (is_local=false), but inside an open transaction a ROLLBACK undoes it, like any SET.
+    Safe without a pool: each request and each background job opens its own connection."""
+    conn.execute("SELECT set_config('app.tenant_id', %s, false)", [tenant_id])
 
 
 ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
@@ -93,6 +112,7 @@ def seed_leads(conn: psycopg.Connection, leads: list[Lead] = SEED_LEADS) -> None
             ON CONFLICT (lead_id) DO UPDATE SET
                 name = EXCLUDED.name, title = EXCLUDED.title,
                 company = EXCLUDED.company, email = EXCLUDED.email
+            WHERE leads.tenant_id = EXCLUDED.tenant_id  -- never overwrite ANOTHER tenant's lead
             """,
             [lead.model_dump() for lead in leads],
         )
@@ -100,7 +120,7 @@ def seed_leads(conn: psycopg.Connection, leads: list[Lead] = SEED_LEADS) -> None
 
 def fetch_lead(conn: psycopg.Connection, lead_id: str) -> Lead | None:
     row = conn.execute(
-        "SELECT lead_id, name, title, company, email FROM leads WHERE lead_id = %s", (lead_id,)
+        f"SELECT lead_id, name, title, company, email FROM leads WHERE lead_id = %s AND tenant_id = {TENANT}", (lead_id,)
     ).fetchone()
     return None if row is None else Lead(**dict(zip(Lead.model_fields, row, strict=True)))
 

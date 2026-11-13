@@ -1908,7 +1908,9 @@ token budget → 429 BEFORE any model call; max_steps. (6) secrets via errors �
 Out of scope: TLS, a malicious legitimate approver, injection skewing draft CONTENT (~30%).
 
 **My decisions (took Claude's recommendations):** chunks = shared knowledge base (public pages);
-leads/runs/drafts/sends get tenant_id. Tenants + keys created by an admin CLI only, no endpoint
+leads, runs, run_steps, drafts, approvals, sends, replies AND research_findings + qualifications get
+tenant_id (fixed in M2: a shared research cache would tell tenant B which companies tenant A is
+looking at, i.e. their pipeline). Tenants + keys created by an admin CLI only, no endpoint
 (less surface). Member approving own tenant's draft → 403 (nothing leaks, so no need to hide).
 
 **Gotchas:** 404-not-403 only hides EXISTENCE across tenants; inside a tenant 403 is more honest.
@@ -1946,3 +1948,51 @@ GET /runs/{id} polls. Without it: client timeouts, workers stuck, a refresh star
   subclasses HTTPException to stay a 413.
 - Found in the smoke test: the 409 for a non-flow draft names its run_id. Fine now; in M2 a draft
   of another tenant must be a plain 404 (no ids, no states).
+
+## D7 M2 — auth + authorization + tenant isolation
+
+**Concept:** Authentication = who is calling (API key → Principal: tenant + role). Authorization =
+may they do THIS to THAT (can_access: same tenant AND role allows the action). Tenant isolation =
+every row has a tenant_id and every query filters on the caller's tenant, so a forgotten check finds
+nothing instead of leaking. Keys are random and stored as sha256 only. Without it: anyone who can
+reach the port reads every lead, approves any draft, spends my budget, and a shared research cache
+leaks which companies each customer is researching.
+
+**Built:**
+- 0006: `tenants`, `api_keys` (key_sha256 UNIQUE, role member|approver, revoked_at); tenant_id on 9
+  tables, existing rows → 'default'. Chunks stay shared; finding_citations hang off their finding.
+- The CONNECTION carries the tenant: `db.set_tenant(conn, t)` = `set_config('app.tenant_id', t)`.
+  Every SELECT/UPDATE in state.py has `AND tenant_id = current_setting('app.tenant_id')`; INSERTs
+  get it from the column DEFAULT. ~100 call sites unchanged. CLI/evals connect as 'default'.
+- Fail closed: the API's connection starts with NO tenant → any tenant query raises (500), never
+  "all rows". Set only after the key checks out.
+- api.py: `get_principal` (Bearer → 401 for missing/bad/revoked, same message), `get_tenant_conn`
+  (endpoints only get this one), `check()` → 404 (missing or other tenant, body only
+  {"error": "not found"}) / 403 (own tenant, role). Approve of a missing draft is now 404 (was 409):
+  otherwise 404 vs 409 would tell "exists elsewhere" apart from "doesn't exist".
+- Access log gets key_id + tenant_id (never the key): M3's rate limit and M6's alerts can group by them.
+- `uv run keys add-tenant | create-key | list-keys | revoke-key` (key printed once). No admin endpoint.
+
+**Gotchas:**
+- Postgres RLS would do the filtering for me, but superusers BYPASS RLS (my local role is one), so
+  tests couldn't prove it. Explicit filters + fail-closed session setting instead.
+- `set_config(..., false)` inside an open transaction is undone by ROLLBACK, like any SET →
+  `connect()` commits right after setting it on non-autocommit connections.
+- A session setting is per CONNECTION: with a pool, a reused connection would keep the last tenant.
+  No pool here (one connection per request/job); M4+ with a pool must set it on checkout.
+- `seed_leads` upsert: ON CONFLICT DO UPDATE would have overwritten another tenant's lead with the
+  same id → `WHERE leads.tenant_id = EXCLUDED.tenant_id`. lead_id is still globally unique (known
+  limitation; fine while there's no create-lead endpoint).
+- sha256 is fine for random 256-bit keys; passwords need bcrypt/argon2 (guessable → slow hash).
+- FastAPI resolves dependencies before reporting body errors: 401 comes before 422, so an anonymous
+  caller can't map my schema.
+
+**How can_access works (Claude wrote it on request, explained line by line)**
+- `if user.tenant_id != resource.tenant_id: return False` → tenant first: another tenant's resource
+  is denied for EVERY action, even for an approver, even just "read". Exact string compare: "ACME" ≠ "acme".
+- `ROLE_ACTIONS.get(user.role, set())` → an unknown role ("admin", a typo) gets an empty set, not a
+  KeyError: denied, not a 500. Default-deny, like authorize().
+- `return action in allowed` → an unknown action ("delete") isn't in any set: False.
+- Only True when BOTH checks pass. The API calls it twice: "read" fails → 404, the real action fails → 403.
+
+**My answer:** (pending)

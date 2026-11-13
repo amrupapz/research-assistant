@@ -25,6 +25,7 @@ dependencies = [
 ask = "research_assistant.cli:main"
 agent = "research_assistant.agent:main"
 api = "research_assistant.api:main"
+keys = "research_assistant.auth:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
