@@ -1,6 +1,7 @@
 # D7 M5: evals + regression gate vs evals/baseline.json. MANUAL only (Actions tab → Evals → Run
 # workflow): real model calls cost money (~cents) and are noisy, so they don't run on every push.
 # Secrets (repo settings → Secrets → Actions): OPENAI_API_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY.
+# Start it: `gh workflow run evals.yml`, then `gh run watch`; report: `gh run download <run id>`.
 name: Evals
 
 on:
