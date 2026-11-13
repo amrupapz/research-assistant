@@ -68,6 +68,10 @@ Commands: `uv run python -m research_assistant.db` (load + embed data/),
 `uv run python evals/run.py --stage retrieval|answers|qualify|agent|flow|judge [--only ids] [--repeat N] [--judge]`,
 `--compare`, `--all` (judges answers); then `evals/report.py` and `evals/gate.py [--save-baseline]` (exit 1 = regression).
 Baseline + every gated run: `--all --repeat 3` (same --repeat, or the comparison is meaningless).
+API: `uv run api` (127.0.0.1:8000) · keys: `uv run keys add-tenant|create-key|list-keys|revoke-key`.
+Docker (M4): `docker compose up --build -d` (db on host 5433, app on 127.0.0.1:8000, migrate runs
+--schema-only), `docker compose run --rm app python -m research_assistant.db` (ingest + embed, paid),
+`docker compose exec app keys create-key --tenant default --role approver --label me`.
 
 ## Rules for every model call
 

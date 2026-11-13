@@ -1,0 +1,52 @@
+# D7 M4: app + pgvector Postgres. `docker compose up --build -d`, then load data once:
+#   docker compose run --rm app python -m research_assistant.db
+# Secrets come from .env at RUN time only (env_file + ${...} interpolation); nothing is baked in.
+
+x-app-env: &app-env
+  env_file: .env
+  environment:
+    # Wins over DATABASE_URL in .env (that one points at Homebrew Postgres on localhost).
+    DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/research_assistant
+
+services:
+  db:
+    image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: research_assistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"  # 5432 is Homebrew's; localhost only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d research_assistant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:  # one-shot: Alembic to head + checkpoint tables. No model calls, so starting costs nothing.
+    build: .
+    image: research-assistant:latest
+    <<: *app-env
+    command: ["python", "-m", "research_assistant.db", "--schema-only"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    image: research-assistant:latest
+    <<: *app-env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"  # reachable from this laptop only
+    volumes:
+      - runs:/app/runs  # run logs survive rebuilds (M6 reads them)
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  runs:

@@ -149,14 +149,36 @@ def embed_missing(conn: psycopg.Connection, embed: EmbedFn) -> int:
     return len(rows)
 
 
-def main() -> None:
-    """Load data/ into Postgres and embed new/changed chunks: `uv run python -m research_assistant.db`."""
+def setup_schema(url: str, dims: int) -> None:
+    """Alembic to head + LangGraph's checkpoint tables. No model calls: safe on every container start."""
+    from research_assistant.flow import setup_checkpointer
+
+    migrate(url, dims=dims)
+    setup_checkpointer(url)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Load data/ into Postgres and embed new/changed chunks: `uv run python -m research_assistant.db`.
+
+    --schema-only: migrations + checkpoint tables, nothing else (Docker's `migrate` service, D7 M4).
+    Ingest + embed costs money (embedding calls), so it never runs on start: you run it once."""
+    import argparse
+
     from research_assistant.config import get_settings
+
+    parser = argparse.ArgumentParser(prog="python -m research_assistant.db", description=main.__doc__, allow_abbrev=False)
+    parser.add_argument("--schema-only", action="store_true", help="migrate + checkpoint tables; no ingest, no embedding")
+    args = parser.parse_args(argv)
+
+    settings = get_settings()
+    setup_schema(settings.database_url, settings.embedding_dims)
+    print("schema at head; checkpoint tables ready")
+    if args.schema_only:
+        return
+
     from research_assistant.ingest import load_chunks
     from research_assistant.llm import embed
 
-    settings = get_settings()
-    migrate(settings.database_url, dims=settings.embedding_dims)
     chunks = load_chunks()
     with connect() as conn:  # commits on clean exit, rolls back on error
         deleted = sync_chunks(conn, chunks)
@@ -165,10 +187,6 @@ def main() -> None:
         total = conn.execute("SELECT count(*) FROM chunks").fetchone()[0]
     print(f"synced {len(chunks)} chunks, deleted {deleted} stale, embedded {embedded}; table now has {total}")
     print(f"seeded {len(SEED_LEADS)} leads")
-    from research_assistant.flow import setup_checkpointer
-
-    setup_checkpointer(settings.database_url)
-    print("checkpoint tables ready (LangGraph's own, not Alembic's)")
 
 
 if __name__ == "__main__":

@@ -1996,3 +1996,50 @@ leaks which companies each customer is researching.
 - Only True when BOTH checks pass. The API calls it twice: "read" fails → 404, the real action fails → 403.
 
 **My answer:** (pending)
+
+## D7 M4 — Docker (Dockerfile + compose)
+
+**Concept:** An image is a frozen filesystem (Python + locked deps + code + data/); a container is a
+running copy. Compose starts app + Postgres together on a private network (the app reaches the DB at
+host `db`). Secrets are NOT in the image: they arrive as environment variables when a container
+starts, so the image can be shared. Without it: "works on my Mac" (Homebrew Postgres, my .venv, the
+.env on disk), no repeatable setup for the README, and `COPY . .` can put .env into a layer forever.
+
+**Built:**
+- Dockerfile, 2 stages: uv builds .venv (deps layer cached until uv.lock changes; `--no-dev`), runtime
+  gets only .venv + src/migrations/data/icp.toml. Non-root `app` (uid 10001); code root-owned (app
+  can't edit it); only runs/ + outbox/ writable. HEALTHCHECK = python urllib one-liner on /health
+  (urlopen raises on 503 → exit 1). 444 MB.
+- Base images **pinned by digest** (multi-arch index digest; the tag is only for humans):
+  python:3.12-slim, pgvector/pgvector:pg17, ghcr.io/astral-sh/uv:0.13.7. A tag can be re-pushed; a
+  digest can't. Cost: no automatic security patches → bump the digests on purpose.
+- .dockerignore: .env (but not .env.example), secrets/, credentials/token json, runs/, outbox/, .venv,
+  .git, tests/, evals/, caches.
+- compose.yaml: `db` (pgvector, volume pgdata, host 127.0.0.1:5433, pg_isready healthcheck) →
+  `migrate` (one-shot `python -m research_assistant.db --schema-only`: Alembic + checkpoint tables,
+  NO embedding calls) → `app` (after migrate completed; 127.0.0.1:8000; volume runs). restart:
+  unless-stopped on app + db. Secrets: `env_file: .env` + `${POSTGRES_PASSWORD:?...}` interpolation.
+  `environment: DATABASE_URL=...@db:5432/...` wins over the localhost URL in .env.
+- .env.example (names only, no values) for M5 / the README.
+
+**Verified (2026-11-13):** image ENV/history/files: no .env, no sk- key. `docker compose stop db` →
+/health, /leads/L1/status and POST /runs all **503 "database unavailable"** (no run created, no
+traceback in logs). `docker compose start db` → 200 again with 0 app restarts (one connection per
+request: nothing stale to reconnect).
+
+**Gotchas:**
+- argparse accepts ABBREVIATED flags by default: `--schema` silently meant `--schema-only` (the test
+  caught it) → `allow_abbrev=False`.
+- The app must listen on 0.0.0.0 INSIDE the container (127.0.0.1 there = unreachable from the host).
+  Exposure is decided by the port mapping: `127.0.0.1:8000:8000` = this laptop only.
+- The editable install (.pth → /app/src) and the venv's python symlink only work because both stages
+  use the same base image and the same /app path; UV_PYTHON_DOWNLOADS=never keeps uv on that python.
+- `docker compose config` prints the INTERPOLATED file, password included → use `--quiet` to validate.
+- Plain Docker never restarts an UNHEALTHY container (only one that exits). The healthcheck is a signal
+  for `ps` / monitoring, not self-healing. With the DB down the app is "unhealthy" but correct (503s).
+- The container DB is a different database: the Homebrew key and data don't exist there. Load data
+  and create a key inside the container.
+- **Runs in progress when the container stops stay 'running'.** The background flow dies with the
+  process (no graceful drain); its runs row is never set to failed/waiting. Fix: find them
+  (`SELECT run_id FROM runs WHERE status = 'running'`) and `python -m research_assistant.flow --resume
+  <run_id>` (checkpoints make it safe; send_once makes a resumed send safe). → M6 RUNBOOK entry.

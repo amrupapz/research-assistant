@@ -1,0 +1,20 @@
+# Nothing secret, local or generated goes into the build context (and so never into a layer).
+.env
+.env.*
+!.env.example
+secrets/
+credentials*.json
+token*.json
+runs/
+outbox/
+.venv/
+.git/
+.claude/
+scratch/
+tests/
+evals/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+LEARNING.md
