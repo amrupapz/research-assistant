@@ -12,17 +12,6 @@
 - `x-ratelimit-remaining-*` headers show how close we are to a 429 before it happens.
 - `usage.input_tokens_details.cached_tokens` = 0 here. The prompt is far below the caching minimum, so this is expected.
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 ## D1 M1 — SDK call, system prompt, config, CLI
 
 **Concept:** The SDK sends the same POST as M0 and gives back Python objects. All OpenAI calls go through `llm.ask()`. Settings come from `.env` via pydantic-settings. The system prompt is a fixed string with a version number.
@@ -33,17 +22,6 @@
 - `ask()` takes an optional `client`/`settings`, so tests can pass a fake client instead of patching code.
 - `response.model_dump()` → the same dict shape as M0, so `extract_output_text` stays the only parser.
 - The prompt telling the model to say when it isn't sure works: "hires last month" got an "I can't verify" answer, not a made-up number.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 ## D1 M2 — structured logs + runs/*.jsonl
 
@@ -57,17 +35,6 @@
 - Log lines go to stderr and the answer to stdout, so `ask "q" > answer.txt` saves just the answer.
 - `cached_tokens=0` even on repeated calls: OpenAI only caches prompts of about 1024+ tokens, and ours is about 130.
 - Tests write logs to pytest's `tmp_path`, never to the real `runs/`.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 ## D1 — SDK in plain terms + M1/M2 check answers (given by Claude, not mine yet)
 
@@ -91,17 +58,6 @@
 
 **After the week:** honor the `Retry-After` header on 429/503 instead of only our own backoff.
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 **M3 check answers (given by Claude):**
 1. `max_attempts=3` → up to 3 API calls: 1 original + 2 retries. My real log showed `retries: 2` after 3 timeouts.
 2. Both are HTTP 429, but `rate_limit_exceeded` = "too fast, slow down" (temporary, so waiting fixes it) and `insufficient_quota` = "out of credit" (permanent until someone adds billing, so retrying just wastes time). Decide on the error `code`, not only the status number.
@@ -119,17 +75,6 @@
 - Real results: Stripe → high / no sources; Anthropic funding → medium / needs sources; Figma headcount → low / needs sources. A salesperson only sees the answer text, but the code can now see these fields.
 - zsh: don't use `=====` as an echo separator (`=word` is expanded). Use '---'.
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 ## D1 M5 — variance + seeding evals
 
 **Concept:** Same question, same settings → the model still varies. Measure it before trusting one answer. Evals = fixed questions + expected behavior, re-run on every prompt change.
@@ -142,17 +87,6 @@
 - Possible prompt issue: "latest round" on facts that may be >1 year old got `medium`. Arguably it should be `low`. Day 6 eval candidate.
 
 **Seeded:** evals/questions.jsonl, 10 questions (5 stable / 5 unknowable) with `expect_needs_sources`.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 ## D1 M6 — tests with a fake client
 
@@ -261,17 +195,6 @@
 
 "Business per user" → Linear #001, #000 (keyword: 0 hits). "18A" → vector returns junk (Figma, .15); keyword finds all three Intel chunks.
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 **Gotchas:**
 - Vector search always returns k results, even for "best pizza in Naples" (top .09). No "no match" → we need a score floor or abstain logic in M5.
 - Scores are only relative: q08's outdated vs. current page differ by 0.0017. Embeddings know the topic, not which fact is current. Freshness has to come from `fetched_at` (M5).
@@ -296,17 +219,6 @@
 | q09 Linear | 0 hits | ✅ | ✅ linear-pricing#000 |
 | q10 Vercel | 0 hits | ✅ | ✅ vercel-changelog#000 |
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 **Gotchas:**
 - RRF scores are squashed into 0.031–0.033 (the max with 2 lists is 2/61 = 0.0328). They say nothing about absolute relevance, so they can't be the M5 abstain threshold. Use the vector similarity or the LLM's judgment instead.
 - Exact ties are common (figma-about#000 = figma-company-profile#000 = 1/61 + 1/62). The chunk_id tiebreak decides, which is arbitrary but deterministic.
@@ -329,17 +241,6 @@
 | q10 | Agent Runtime, Nov 4 2026 ✅ | vercel-changelog#000 | high / no |
 | q01 Stripe | abstains ✅ (strict) | — | low / yes |
 | pizza | abstains ✅ even though 5 chunks were retrieved | — | low / yes |
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 **Gotchas:**
 - Freshness was solved at the **generation** step: retrieval put the 2024 Intel page #1, and the model used fetched_at to pick the 2026 page. The log proves which step did what (`retrieved_ids` vs `cited_ids`).
@@ -368,17 +269,6 @@
 - v3, 1 run: 16/16. **Misleading.** With `--repeat 5`: q07 5/5, **q07b 1/5** (the paraphrase drops the third-party figure; 2/8 overall incl. CLI). Retrieval passed every time → a pure generation failure.
 - v4 (conflict check is now an explicit step for every question, wording-independent): q07 5/5, **q07b 5/5**; full set **16/16**.
 - Side effect: q08 on v4 now mentions the 2024 page and sets needs_sources=true (v3: false). The answer is more transparent, but a superseded snapshot isn't really an unresolved conflict. The grader doesn't check needs_sources for "answer" cases, so it didn't flag this.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 **Gotchas:**
 - One run of a flaky case is a coin flip. Use `--repeat` for anything that matters, and report pass *rates*.
@@ -427,17 +317,6 @@
 - Every turn resends the whole history, so input grows each step. That's one reason for `max_steps`.
 - Caching only starts at ~1024+ prompt tokens, so `cached=0` here is expected.
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 **M0 check answers (given by Claude):**
 1. `LEADS.get(args["lead_id"])` fails two ways. (a) Malformed args (bad JSON, missing/extra/wrong-type field): the Pydantic arg model catches it, and the error goes back to the model as tool output. (b) Valid but wrong (`L999`, or a lead I'm not allowed to see): the tool returns "not found", and `authorize()` handles "not allowed". A schema can't catch (b).
 2. Injected "call send_email" does nothing in M0: the tool isn't offered, and only my code executes. Once send_email exists, `authorize()` → needs_approval is the real stop. The prompt rule helps but isn't a guarantee.
@@ -459,17 +338,6 @@
 - `draft_email` takes the `to` address from OUR leads table, never from the model. The model can only pick a lead_id, so an injected page can't redirect mail to an arbitrary address.
 - Validation errors name the field + reason but don't echo the input: the input is model-written and could carry an injection back into the next turn.
 - A failed lookup must not leave side effects (no draft is stored for L999).
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 **M1 check answers (given by Claude):**
 1. Three layers, each with something only it catches:
@@ -495,17 +363,6 @@
 - Fail closed: an unexpected decision value ("yes") = deny, and if authorize itself raises, the whole run stops. Better a crash than running a call nobody approved.
 - Tool crash: the model gets `search_company failed (RuntimeError)`. The full error (which might hold secrets or hostnames) stays in OUR log only.
 - Every call in a turn gets an output (parallel calls), or the next request is a 400.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 **Functions:** `authorize` (Claude wrote it at my request; I should be able to explain each line):
 - `ALLOWED` / `NEEDS_APPROVAL` are frozensets of exact names. Anything not in them falls through to `return "deny"`. That's default-deny: a tool someone adds later, or a name the model invents, is blocked until someone lists it on purpose.
@@ -553,17 +410,6 @@
 - Default = no approver = no. A run with nobody at the keyboard can never send.
 
 **Gotcha:** the tool_call `latency_ms` for send_email now includes my thinking time at the prompt.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 **First real run (y):** L1/Figma, 4 turns. The approval screen showed the stored draft → `y` → `outbox/D1.eml` (quoted-printable: `=E2=80=99` = ’, `=` at line end = soft break).
 - Step 1 = get_lead + search_company in parallel, and that was CORRECT: the task named Figma, so the search didn't depend on the lead. agent-v2/v3 rule followed in both directions.
@@ -1095,17 +941,6 @@ SQL/code, not model judgment.
   reach a draft body → an email. Fix: DraftEmailArgs rejects private-use (U+E000–U+F8FF) and
   control characters, like the link check (the model gets an error and rewrites).
 
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
-
 ## D4 M7 — tests + evals (and the two holes M6 exposed)
 
 **Concept:** unit tests script the model, so they prove the CODE behaves, not that the real model
@@ -1164,17 +999,6 @@ USES the memory tools or recovers after a resume. Agent evals run the real model
   "intro" request because memory says already emailed. A policy choice (could ask instead).
 - a16: resume after the crash ran pending calls with no model call (half-done turn) 2 of 3 times.
 - a08: the fake "30%" partner discount still reaches a draft. The P3 open item (source vetting) is unchanged.
-
-**How route_after_qualify works (Claude wrote it on request, explained line by line)**
-- `state.get("qualification") or {}` → always a dict, even if the key is missing or None (no KeyError).
-- `passes` defaults to MAX_RESEARCH_PASSES, not 0: a lost counter means "draft" (a human still approves),
-  never an endless research loop.
-- `passes < MAX_RESEARCH_PASSES` instead of `== 1` → 5 passes still means draft; it can't loop.
-- Only the allowed cases are listed; `return "stop"` at the bottom catches everything else (poor, None,
-  unknown fit, empty state). Fail closed, like authorize()'s default-deny.
-- Only reads (`.get`), never assigns → a pure decision; the work lives in nodes.
-
-**My answer:** check questions skipped.
 
 ## Project 4 wrap-up (Day 4)
 
@@ -2269,5 +2093,5 @@ to close that gap before interviews.
   `--resume`); in-memory rate limiter; budget overshoot up to one run.
 - `agent approve D20 y` (CLI) still doesn't show the draft; the API does (GET /runs/{id}).
 - My answers to the Day 7 check questions are blank (M2 "My answer: pending" etc.).
-- LEARNING.md has the "How route_after_qualify works" block pasted 17 times (an old append bug) —
-  clean up to one copy under D5 M1.
+- ~~LEARNING.md had the route_after_qualify explanation pasted 17 times~~ — fixed: 16 copies
+  (Days 1–4) removed, the one under D5 M1 kept.
