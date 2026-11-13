@@ -87,47 +87,44 @@ Baseline + every gated run: `--all --repeat 3` (same --repeat, or the comparison
   evidence → say so, needs_sources=true.
 - Evaluate retrieval and answers SEPARATELY. Bump PROMPT_VERSION when prompt/schema changes.
 
-## Day 6 milestones (Project 6) — DONE, see P6 under Done
+## Day 7 milestones (Project 7 + 8)
 
-Goal (from the roadmap): a REPRODUCIBLE test suite + observability, not a dashboard. Run it before
-every change/deploy and after. Measure: qualification correct, citations support claims, right tools
-called, unauthorized actions blocked, latency + cost (model time vs my own code/DB time).
+Goal (from the roadmap): make it safe and operable for real users, then package it as a portfolio.
+The SIMPLEST architecture that meets reliability/security needs: one FastAPI app + Postgres (pgvector)
+in Docker Compose, CI in GitHub Actions. No Kubernetes, no cloud deploy unless time is left.
 
-M0 Inventory: map my existing evals (questions.jsonl, agent_cases, flow stage) to the roadmap's
-   categories: straightforward, insufficient evidence, conflicting info, invalid tool args,
-   prompt injection, permission bypass, freshness. List the gaps. One command runs everything:
-   `evals/run.py --all` → one summary table.
-M1 Langfuse tracing (Langfuse Cloud, JP region). Keys are ALREADY in .env as LANGFUSE_SECRET_KEY,
-   LANGFUSE_PUBLIC_KEY, LANGFUSE_BASE_URL (https://jp.cloud.langfuse.com) — load them via config.py
-   (SecretStr for the secret key); never read or print .env.
-   - Install the Langfuse AI skill from github.com/langfuse/skills and use it to add tracing to this
-     application following Langfuse best practices. Show me what the skill recommends before applying it.
-   - If the skill's advice conflicts with this file, THIS FILE WINS: all OpenAI calls still go through
-     llm.py with max_retries=0 + my own retries (a Langfuse OpenAI wrapper is fine only inside llm.py);
-     no secrets in code, logs or traces.
-   - Ask before adding the langfuse dependency.
-   - One trace per agent/flow run; spans for retrieval, every LLM call (tokens, cost, latency) and every
-     tool call (decision, status). trace_id stored in my run log + runs table.
-   - Tests never send traces (disabled or fake client); tracing failures must never break a run.
-M2 Grow the dataset to ~30 labelled cases with a `category` field. Must include the carried items:
-   Figma "Dev Mode → dev_tooling" stretch, a citation about the WRONG company, the fake "30%"
-   discount page, paraphrases, a permission-bypass attempt, a "no follow-up cap" case.
-M3 Claim checker (LLM-as-judge): for each answer/draft claim, does the cited chunk actually support
-   it? Judge model from JUDGE_MODEL in .env (stronger than MODEL). Calibrate: hand-label ~10 claims,
-   report judge agreement %. A judge I haven't checked is not evidence.
-M4 Cost + latency report from traces/run logs: per case and per stage, p50/p95, $ per run (price
-   table in config), and where time goes: model vs retrieval/DB vs tools.
-M5 Baseline + regression gate: commit evals/baseline.json (pass rates per category, cost, p95).
-   ✍️ I WRITE regression_gate(baseline, current, tolerance) → (ok, reasons) — pure function, no code
-   given; if I ask you to write it, give me a hint instead. Then fix ONE real failure the evals found
-   (e.g. source vetting or draft facts vs citations), re-run everything, compare against baseline.
-   Day 7 runs this gate in GitHub Actions.
+M0 API surface + threat model (no code): endpoints, who may call what, what an attacker would try
+   (another tenant's data, skipping approval, huge requests, burning my OpenAI budget).
+   Endpoints: POST /ask, POST /runs (start flow for a lead → run_id), GET /runs/{id},
+   POST /drafts/{id}/approve, GET /leads/{id}/status, GET /health.
+M1 FastAPI app (ask before adding fastapi + uvicorn): Pydantic request/response models, request id,
+   body size limit, errors without stack traces or secrets. Long runs don't block a request:
+   POST /runs returns run_id, the flow runs in the background, GET /runs/{id} polls; the approve
+   endpoint resumes the paused flow (same interrupt() + send_once path as the CLI).
+   /health checks the DB → 503 (not a crash) when Postgres is down.
+M2 Auth + authorization + tenant isolation: API keys stored HASHED; tenants + roles (member,
+   approver) via migration; leads/runs/drafts belong to a tenant and EVERY query filters on it.
+   401 = no/bad key, 404 (not 403) for another tenant's resource, only approvers approve.
+   ✍️ I WRITE can_access(user, resource) → bool (tenant match + role). No code given; hint only.
+M3 Limits + cost controls: per-key rate limit, max runs per tenant per day, daily token budget per
+   tenant (refuse with 429 when exceeded, read usage from my run logs/DB), existing retries/max_steps.
+M4 Docker: Dockerfile (uv, non-root user, nothing from .env baked into the image) + docker compose
+   (app + pgvector Postgres + migrations on start, data volume). Secrets via environment only.
+   `docker compose up` → working API. Break it: stop Postgres → /health 503, requests fail cleanly.
+M5 GitHub Actions: on push/PR → ruff + pytest with a pgvector Postgres service (fake model: no
+   secrets needed). Separate manual (workflow_dispatch) workflow: evals --all + regression_gate vs
+   evals/baseline.json, OPENAI/LANGFUSE keys from GitHub Secrets, report uploaded as an artifact.
+   Before the first push: check git history contains no secrets; add .env.example.
+M6 Ops: RUNBOOK.md (incident → trace_id → Langfuse → run_steps; resume a stuck/failed run; rotate
+   keys; what each alert means). A small check script flags error rate / p95 above threshold from
+   run logs (Slack webhook = stretch).
+M7 Portfolio (P8): README — what it does, architecture diagram, setup in ≤5 commands, design
+   decisions + trade-offs, eval table vs baseline, KNOWN FAILURES listed honestly (30% injection,
+   follow-up cap, small categories). Demos: API/model failure (retries → failed → resumable),
+   interrupted workflow resumed, unauthorized action blocked (cross-tenant + injected "send now"),
+   trace screenshots (no secrets). pyproject description, LICENSE.
 
-After the week: M9 LinkedIn hand-off; real email via the Gmail API (gmail.compose, drafts only);
-async node timeouts; multi-lead fan-out in the flow.
-From P6 (known failures in the baseline): source vetting for the injected "30%" (q16, a08 0/3);
-follow-up cap (a20 0/3); more conflicting_info cases (3 is too few for a 0.10 tolerance); calibrate
-the judge on DRAFT sentences before grading drafts; review holdout h01–h06 labels; q15 is flaky.
+Order if time runs short: M0, M1, M2, M4, M5, M7 are the core; M3, M6 can be trimmed; MCP is stretch.
 
 ## Day 7 stretch (with P7/P8)
 
