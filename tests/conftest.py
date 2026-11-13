@@ -16,13 +16,21 @@ TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://localhost/research_a
 TEST_DIMS = 1536
 
 
+def db_unreachable(reason: str) -> None:
+    """Locally: skip (no Postgres on this laptop is fine). In CI (GitHub sets CI=true): FAIL. A skipped
+    DB suite shows green with ~200 tests never run, which is worse than red (D7 M5)."""
+    if os.environ.get("CI", "").lower() == "true":
+        pytest.fail(f"CI=true but {reason}: the DB tests must run in CI", pytrace=False)
+    pytest.skip(f"{reason}; run: createdb research_assistant_test")
+
+
 @pytest.fixture(scope="session")
 def test_db_url():
-    """The test database URL, migrated to head. Skips if Postgres isn't reachable."""
+    """The test database URL, migrated to head. Skips if Postgres isn't reachable (fails in CI)."""
     try:
         connect(TEST_DB).close()
     except psycopg.OperationalError as e:
-        pytest.skip(f"Postgres not reachable ({e.__class__.__name__}); run: createdb research_assistant_test")
+        db_unreachable(f"Postgres not reachable ({e.__class__.__name__})")
     migrate(TEST_DB, dims=TEST_DIMS)
     return TEST_DB
 

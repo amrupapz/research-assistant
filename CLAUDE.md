@@ -72,6 +72,8 @@ API: `uv run api` (127.0.0.1:8000) · keys: `uv run keys add-tenant|create-key|l
 Docker (M4): `docker compose up --build -d` (db on host 5433, app on 127.0.0.1:8000, migrate runs
 --schema-only), `docker compose run --rm app python -m research_assistant.db` (ingest + embed, paid),
 `docker compose exec app keys create-key --tenant default --role approver --label me`.
+CI (M5): .github/workflows/ci.yml (push/PR: ruff + pytest + docker build, no secrets);
+evals.yml (manual: `gh workflow run evals.yml`, gate vs evals/baseline.json, report artifact).
 
 ## Rules for every model call
 

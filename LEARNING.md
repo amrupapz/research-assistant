@@ -2043,3 +2043,39 @@ request: nothing stale to reconnect).
   process (no graceful drain); its runs row is never set to failed/waiting. Fix: find them
   (`SELECT run_id FROM runs WHERE status = 'running'`) and `python -m research_assistant.flow --resume
   <run_id>` (checkpoints make it safe; send_once makes a resumed send safe). → M6 RUNBOOK entry.
+
+## D7 M5 — GitHub Actions (CI + manual evals)
+
+**Concept:** CI is a fresh machine that checks out every push/PR, installs exactly uv.lock, and runs
+ruff + pytest; red blocks the merge. It needs NO secrets (fake model; fork PRs never get secrets).
+Evals call the real model (cost, noise), so they're a separate MANUAL workflow with GitHub Secrets
+that goes red when regression_gate says so. Without it: "passes on my Mac" is the only check, and a
+token or injection regression past the baseline slips in.
+
+**Built:**
+- `.github/workflows/ci.yml` (push + PR): job `test` = pgvector service (same digest as compose) →
+  setup-uv 0.13.7 (cached) → `uv sync --frozen` → ruff → pytest; job `docker` = `docker build .`
+  (a broken Dockerfile fails CI, nothing pushed). `permissions: contents: read`, concurrency cancels
+  superseded runs.
+- `.github/workflows/evals.yml` (workflow_dispatch only): load + embed data/ → `run.py --all
+  --repeat 3` → report.py → gate.py (exit 1 = red); runs/report.json + runs/*.jsonl uploaded
+  `if: always()`. Non-secret config (MODEL, JUDGE_MODEL, ...) written in the file so runs match the
+  baseline; secrets = OPENAI_API_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY. concurrency group
+  `evals`, no cancel: never two paid runs at once. timeout 45 min.
+- Actions pinned to commit SHAs (comment = release): checkout v7.0.1, setup-uv v10.3.3,
+  upload-artifact v7.0.2. Same reason as image digests: a tag can be moved to other code.
+- conftest: `CI=true` + unreachable DB → **fail**, not skip (test_ci_guard.py).
+- Before the first push: whole history scanned for sk-/pk-lf-/sk-lf-/ra_ keys and .env/credential
+  files → nothing. Tests pass in a fresh clone with no .env (= what CI sees).
+
+**Gotchas:**
+- A skipped DB suite is GREEN with ~200 tests never run. Worse than red → fail in CI.
+- YAML: a step name containing `: ` is a parse error → quote it (a Python yaml.safe_load caught it).
+- actionlint 1.7.12 (Docker, digest-pinned, --network none, read-only mount): both workflows clean.
+  Checks expressions, action inputs, `run:` scripts (shellcheck). Pass the files: no .git in the mount.
+- `on:` parses as the boolean True in PyYAML (YAML 1.1) — harmless for GitHub, confusing in scripts.
+- Same --repeat as the baseline, or the gate compares different distributions.
+- Langfuse region: my project is on jp.cloud.langfuse.com; config.py defaults to EU → evals.yml sets
+  LANGFUSE_BASE_URL (keys from one region are an auth error on another). Found by printing settings.
+- Unverified until the first run: report.py reads traces back from Langfuse; fresh traces may need a
+  few seconds to appear. Empty report on the first run → add a short wait/retry.

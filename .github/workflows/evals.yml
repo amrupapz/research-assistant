@@ -1,0 +1,68 @@
+# D7 M5: evals + regression gate vs evals/baseline.json. MANUAL only (Actions tab → Evals → Run
+# workflow): real model calls cost money (~cents) and are noisy, so they don't run on every push.
+# Secrets (repo settings → Secrets → Actions): OPENAI_API_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY.
+name: Evals
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals  # never two at once: double spend, and both would write the same report
+  cancel-in-progress: false
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+        env:
+          POSTGRES_PASSWORD: postgres  # throwaway CI container, not a secret
+          POSTGRES_DB: research_assistant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Not secret: written here so every run uses the same config as evals/baseline.json.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/research_assistant
+      MODEL: gpt-6-luna
+      JUDGE_MODEL: gpt-6.1-terra
+      EMBEDDING_MODEL: text-embedding-3-small
+      EMBEDDING_DIMS: "1536"
+      TRACING_ENABLED: "true"  # report.py reads cost/latency back from Langfuse traces
+      LANGFUSE_BASE_URL: https://jp.cloud.langfuse.com  # the project's region; the default (EU) = auth error
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: true
+      - run: uv sync --frozen --no-dev
+      - name: Load + embed data/ (paid embedding calls)
+        run: uv run python -m research_assistant.db
+      - name: Evals (same --repeat as the baseline, or the comparison is meaningless)
+        run: uv run python evals/run.py --all --repeat 3
+      - run: uv run python evals/report.py
+      - name: Regression gate (exit 1 = regression → red run)
+        run: uv run python evals/gate.py
+      - name: "Upload report (always: a failed gate is when you need it most)"
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: evals-${{ github.run_number }}
+          path: |
+            runs/report.json
+            runs/*.jsonl
+          if-no-files-found: warn
+          retention-days: 30
