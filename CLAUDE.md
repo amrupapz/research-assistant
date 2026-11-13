@@ -6,13 +6,13 @@ One system grown across 8 projects in 7 days:
 D1 P1 reliable model app → D2 P2 RAG w/ citations → D3 P3 tools + approval →
 D4 P4 Postgres state + resume → D5 P5 LangGraph workflow → D6 P6 evals + Langfuse →
 D7 P7/P8 FastAPI + Docker + GitHub Actions + README.
-CURRENT STAGE: Day 7 — P7/P8 (FastAPI + Docker + GitHub Actions + README). P1–P6 done — see LEARNING.md wrap-ups.
-Day 7 milestones: not written yet (plan first). CI runs `evals/gate.py` (see P6).
-Carried: `agent approve` should show the draft before deciding (see P5 wrap-up "Open").
+CURRENT STAGE: P1–P8 done; remaining: MCP stretch (see "Day 7 stretch"). See LEARNING.md wrap-ups.
+Carried: `agent approve` (CLI) should show the draft before deciding — the API already does (GET /runs/{id}).
 M8 (Gmail MCP) dropped: Google's Gmail MCP server looks gated to Workspace preview accounts;
 MCP experience comes from the Day 7 server. M9 and the rest: "After the week" under Day 6.
 Cut for now (log in LEARNING.md "after the week"): streaming, live web scraping,
-automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy, multi-tenancy.
+automated LinkedIn sending (ToS — manual hand-off instead), Temporal, cloud deploy.
+(Multi-tenancy was on this list; built anyway in D7 M2.)
 
 ## How to work with me (learning on a deadline)
 
@@ -162,3 +162,12 @@ P6 (Day 6): evals + Langfuse — tracing (one trace per run, trace_id seeded fro
    dev 16/16, 0 unsupported missed; unsupported fails answers, partial warns), cost/latency report
    (model = 99% of time), baseline + regression gate (tokens not $; A/A test PASS), icp-v2 fix
    (qualify 72 -> 100%, flow p95 24 -> 15s), 503 tests. See LEARNING.md.
+P7 (Day 7): API + security + ops — threat model; FastAPI (202 + background runs, draft shown before
+   approval, safe errors, body limit, /health 503); sha256 API keys, tenants + roles, tenant on the
+   connection (fail closed), 401/404/403 (0006); per-key rate limit + runs/day + daily token budget
+   → 429 before any model call, usage metered in llm.py (0007); Docker (non-root, digest-pinned) +
+   compose; GitHub Actions CI + manual evals (gate PASS on GitHub); RUNBOOK.md + alerts.py;
+   `flow --resume --tenant`. 614 tests. See LEARNING.md.
+P8 (Day 7): portfolio — README (diagram, quickstart, API, trade-offs, evals vs baseline, security,
+   2 Langfuse traces, known failures), scripts/demo.sh (4 recorded demos), MIT license. Repo private
+   until the old-commit email decision. See LEARNING.md.

@@ -2204,3 +2204,70 @@ with re-learning the system.
   Langfuse API (fetch_observations drops level/statusMessage): ERROR goes up from embed to flow;
   0 tokens spent on the failure; flow-resume starts at research (no load_lead = from the checkpoint);
   start + resume + approve = 3 processes, 1 trace (trace id seeded from run id).
+
+## Project 7 + 8 wrap-up (Day 7)
+
+**Built:** the agent became a service someone else could run, and a portfolio someone else can judge.
+- **P7, API + security (M0–M3):** threat model first (assets, endpoints, attack → defense → test).
+  FastAPI app (api.py only): 202 + background runs, poll GET /runs/{id} (shows the draft BEFORE
+  approval), approve resumes the same interrupt() + send_once path as the CLI; safe errors
+  `{error, request_id}`; 16 KB body limit; /health 503. Bearer API keys stored as sha256; tenants +
+  roles (0006); tenant on the CONNECTION, every query filters, fail closed; 401 / 404 (other tenant =
+  missing) / 403. Limits (0007): per-key rate limit, runs/day + daily token budget per tenant → 429 +
+  Retry-After before any model call; tokens metered in llm.py into a `usage` table.
+- **P7, run it (M4–M6):** Docker (2 stages, uv, non-root, digest-pinned, no secrets in the image) +
+  compose (pgvector on 5433, migrate --schema-only, healthcheck, restart). GitHub Actions: CI (ruff,
+  614 tests on a pgvector service, docker build; no secrets; DB tests FAIL instead of skipping) +
+  manual evals workflow (gate PASS on GitHub, report artifact). RUNBOOK.md + alerts.py (error rates,
+  p95 per route, exit 1, optional Slack); `flow --resume --tenant`.
+- **P8, portfolio (M7):** README (diagram, 5-command quickstart, API table, design trade-offs, eval
+  tables vs baseline, security table, two real Langfuse traces: success + failed-then-resumed,
+  honest known failures), scripts/demo.sh (4 demos, recorded transcript), MIT license, metadata.
+- **Numbers:** 361 → 614 tests over the week's second half; evals on GitHub: GATE PASS, 183 traced
+  cases, ~$0.13 per full eval run; flow p95 13.4 s.
+
+**Biggest lessons:**
+- **Put a security rule in ONE place and make it fail closed.** Tenant on the connection + "no tenant
+  = error" beat 100 call sites with a parameter; RLS would have been ideal but superusers bypass it,
+  so tests couldn't prove it.
+- **A green check can lie.** Skipped DB tests, a gate comparing partial traces, a run log without the
+  tenant: each looked fine and measured nothing. Make gaps FAIL.
+- **Check against reality, not memory.** Printing settings found the JP Langfuse region; a YAML parse
+  found a broken workflow; writing the runbook found that operators couldn't resume another tenant's
+  run; the secret 401 was quotes copied from .env. Each took one command to find.
+- **Limits before spending.** A 429 after the model call is a receipt. P1's "llm.py is the only OpenAI
+  caller" made metering one function on Day 7.
+- **Every portfolio claim needs evidence.** I caught an invented cause for the injection failures;
+  the README now says "not diagnosed" — honest failures with numbers read better than polish.
+- **Small samples are noise.** conflicting_info went 56% → 67% on the same code: one case = 11 points.
+
+**Core functions — who wrote them (the week):**
+
+| Project | Core function | Written by |
+|---|---|---|
+| P1 | `extract_output_text` | **me** |
+| P1 | `with_retries` | Claude, at my request, explained line by line |
+| P2 | `rrf_merge` | Claude, at my request |
+| P3 | `authorize` | Claude, at my request |
+| P4 | `send_once` | Claude, at my request (I found the concurrent-send race myself) |
+| P5 | `route_after_qualify` | Claude, at my request |
+| P6 | `regression_gate` | Claude, at my request |
+| P7 | `can_access` | Claude, at my request, explained line by line |
+
+Honest summary: one core function written by me; the other seven I asked for and should be able to
+explain line by line. Re-writing two of them from scratch (can_access, rrf_merge) is the cheapest way
+to close that gap before interviews.
+
+**Open (carried):**
+- **MCP stretch** (search_company / get_lead / qualify_lead over stdio, authorize() inside, no
+  send_email): not started — the only planned item left.
+- **Going public:** decide on the 56 old commits with the Berkeley email (rewrite to noreply = force
+  push, only while private), then `gh repo edit --visibility public`.
+- **Known failures (in the README):** poisoned facts reach drafts (source vetting); retrieval has no
+  company filter; freshness 70–77%; prompt_injection 80% (cause not diagnosed); small
+  conflicting_info category; no follow-up cap; lead ids global; no job queue (in-flight runs need
+  `--resume`); in-memory rate limiter; budget overshoot up to one run.
+- `agent approve D20 y` (CLI) still doesn't show the draft; the API does (GET /runs/{id}).
+- My answers to the Day 7 check questions are blank (M2 "My answer: pending" etc.).
+- LEARNING.md has the "How route_after_qualify works" block pasted 17 times (an old append bug) —
+  clean up to one copy under D5 M1.
