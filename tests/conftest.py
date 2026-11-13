@@ -51,7 +51,7 @@ def db(test_db_url):
         conn.close()
 
 
-AGENT_TABLES = "runs, run_steps, drafts, approvals, sends, qualifications, research_findings, finding_citations, replies"
+AGENT_TABLES = "runs, run_steps, drafts, approvals, sends, qualifications, research_findings, finding_citations, replies, usage"
 
 
 @pytest.fixture

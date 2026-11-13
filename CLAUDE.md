@@ -54,7 +54,7 @@ src/research_assistant/
   tracing.py    ONLY file importing langfuse: run_trace/observe/start_generation/eval_trace/fetch_observations
   perf.py       pure cost/latency from trace trees: decompose (self-time split), percentile, summaries
   auth.py       Principal, can_access (✍️ mine), API keys (sha256), `uv run keys ...` CLI
-  api.py        FastAPI (ONLY file importing fastapi): Bearer auth, tenant conn, 404/403 check
+  api.py        FastAPI (ONLY file importing fastapi): Bearer auth, rate limit, daily limits (429), tenant conn, 404/403
   gate.py       regression_gate(baseline, current, tolerance) -> (ok, reasons); snapshot()
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
 evals/questions.jsonl agent_cases.jsonl qualify_cases.jsonl judge_labels.jsonl (every case has a category)

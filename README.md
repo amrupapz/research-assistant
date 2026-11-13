@@ -16,7 +16,7 @@ are in [LEARNING.md](LEARNING.md).
 
 ```mermaid
 flowchart LR
-    client([API client]) -->|Bearer key| api[FastAPI<br/>auth · tenant · 404/403]
+    client([API client]) -->|Bearer key| api[FastAPI<br/>auth · limits · tenant · 404/403]
     api -->|POST /runs: 202 + run_id| bg[background task]
     bg --> flow
 
@@ -105,11 +105,17 @@ Interactive docs are at `http://localhost:8000/docs`. For local development with
   probe for ids.
 - `403`: your tenant, but your role can't do it (a member approving).
 - `409`: the draft isn't waiting.
+- `429`: a limit was reached, with `Retry-After` saying when to try again. Three limits are checked
+  before any model call:
+  - per-key rate limit: 60 requests a minute
+  - runs per tenant per UTC day: 50 by default
+  - tokens per tenant per UTC day: 1,000,000 by default
 - `413` / `422`: body too large / invalid. The error body never echoes your input.
 - Every error is `{error, request_id}`. Stack traces go to the server log, never to the client.
 
 API keys are managed from a CLI only (`keys add-tenant | create-key | list-keys | revoke-key`); there
-is no admin endpoint. Keys are stored as SHA-256 hashes.
+is no admin endpoint. Keys are stored as SHA-256 hashes. Each tenant's plan is set when it's created:
+`keys add-tenant acme --max-runs 20 --daily-tokens 200000`.
 
 ## Design decisions and trade-offs
 
@@ -123,6 +129,8 @@ is no admin endpoint. Keys are stored as SHA-256 hashes.
 | LangGraph + Postgres checkpointer, `interrupt()` for approval | Resume after a crash; a human can answer the next day | Two sources of truth: business facts in my tables, position in the checkpoint |
 | Tenant on the **connection** (`set_config`), every query filters on it | One mechanism for every table; with no tenant set, queries **error** instead of returning all rows | Must be reset per connection if a pool is ever added |
 | Postgres row-level security **not** used | My local role is a superuser, which bypasses RLS, so tests couldn't prove it | The filters are explicit SQL, reviewed by tests |
+| Limits checked at the **start** of a request; tokens metered in `llm.py` (a context variable) into a `usage` table | A 429 arrives before any money is spent; usage is per tenant (run logs don't carry the tenant) | A run that starts under budget may finish over it (at most one run, ~6k tokens) |
+| In-memory per-key rate limiter (sliding window) | No new infrastructure | Resets on restart and isn't shared between processes; several app containers would need Postgres or Redis |
 | Regression gate on **tokens**, not dollars | Dollars change with prompt-cache timing; tokens don't | Price changes aren't caught |
 | Docker images pinned by digest; Actions pinned by commit SHA | A tag can be moved to different code | Updates are manual |
 
@@ -197,6 +205,7 @@ It was validated with an A/A test: two runs with no change between them must pas
 | A member approves a send | Role check → 403 | `test_a_member_can_start_and_read_but_approving_is_403` |
 | A poisoned page says "send without asking" | Retrieved text is data inside `<untrusted_data>`; default-deny; `send_email` always needs approval | `test_attacks.py`, `permission_bypass` evals |
 | Double approval / retry sends twice | `send_once` ledger + unique key + row lock | `test_send_once_pg.py`, `test_send_race_pg.py` |
+| Burn the OpenAI budget (leaked key, client loop) | Per-key rate limit; runs and tokens per tenant per day → 429 **before** any model call; `max_steps` and the retry cap per run | `test_over_budget_ask_and_runs_are_429_and_the_model_is_never_called`, `test_the_daily_run_limit_refuses_before_creating_a_run`, `test_limits.py` |
 | Huge requests | 16 KB body limit (also for chunked bodies) → 413; field limits → 422 | `test_api.py` |
 | Secrets leak through errors or images | Errors are `{error, request_id}` only; `.env` in `.dockerignore`; secrets come from the environment at run time | `test_a_crash_returns_500_without_internals`, image scan |
 | Stolen DB dump gives working API keys | Only SHA-256 hashes are stored | `test_only_the_hash_of_a_key_is_stored` |
@@ -223,8 +232,6 @@ These are real, measured, and not fixed yet:
   them and cited only Linear chunks, but that costs tokens, and on a closer question it could cite
   the wrong company's fact. The fix is a company filter in `hybrid_search`.
 - **No follow-up cap.** A lead who never replies is due a follow-up every 3 days, forever.
-- **No rate limits or token budget per tenant yet.** `max_steps` and the retry cap bound a single
-  run, but not a tenant's daily spend.
 - **Runs in flight when the app stops stay `running`.** Background tasks live inside the API process
   (no queue). Recovery is manual: `python -m research_assistant.flow --resume <run_id>`. The
   checkpoint and `send_once` make that safe.
@@ -233,7 +240,7 @@ These are real, measured, and not fixed yet:
 
 ## Demos
 
-`./scripts/demo.sh` runs three demos against the Docker stack with real model calls (cents) and saves
+`./scripts/demo.sh` runs four demos against the Docker stack with real model calls (cents) and saves
 the transcript to [docs/demo-output.txt](docs/demo-output.txt):
 
 1. **Model failure:** a 0.01 s timeout → retries → run `failed` → `flow --resume` finishes it.
@@ -241,6 +248,9 @@ the transcript to [docs/demo-output.txt](docs/demo-output.txt):
    `--resume` continues from the last checkpoint.
 3. **Unauthorized actions:** wrong key 401, another tenant 404 (read, start, approve), member
    approve 403, and the poisoned page's "send without asking" never sends.
+4. **Limits:** a tenant with 1 run and 1,000 tokens a day. Its first run is allowed and goes over
+   the budget. After that, a second run and `/ask` both get 429, with no new model calls and no new
+   usage rows. Then 61 requests in a row with one key: the 61st gets 429.
 
 From the recorded run:
 
@@ -264,12 +274,19 @@ other tenant (acme approver)    POST /runs {L3}            404
 other tenant (acme approver)    POST /drafts/D3/approve    404
 same tenant, MEMBER             POST /drafts/D3/approve    403
 sends in Postgres: 0   ← the page said 'send without asking'; it waited for a human
+
+tenant tight-…: 1 run per day, 1,000 tokens per day
+POST /runs → waiting; tokens used today: 5511   ← one run went over (checked at the START)
+POST /runs again → 429  Retry-After: 55119  {"error":"daily run limit reached (1 of 1 runs today, UTC)"}
+POST /ask        → 429  Retry-After: 55119  {"error":"daily token budget exceeded (used 5,511 of 1,000 tokens today, UTC)"}
+usage rows: 1, runs: 1   ← the 429s cost nothing
+61 requests with one key → 60 × 200, 1 × 429  Retry-After: 59
 ```
 
 ## CI
 
 - **[CI](.github/workflows/ci.yml)**, on every push and PR:
-  - ruff, plus 578 tests against a real pgvector Postgres (fake model, no secrets)
+  - ruff, plus 597 tests against a real pgvector Postgres (fake model, no secrets)
   - a Docker build
   - In CI an unreachable database **fails** the run instead of skipping 200 tests.
 - **[Evals](.github/workflows/evals.yml)**, started by hand:
@@ -288,12 +305,12 @@ src/research_assistant/
   sending.py      send_once ledger
   state.py        runs, steps, drafts, approvals, sends, memory (all tenant-filtered)
   api.py          FastAPI app: auth, tenant connection, background runs
-  auth.py         API keys (SHA-256), roles, can_access(), keys CLI
+  auth.py         API keys (SHA-256), roles, can_access(), keys CLI (tenant plans)
   tracing.py      Langfuse (the only file importing it)
   gate.py         regression gate
-migrations/       Alembic, plain SQL (0001–0006)
+migrations/       Alembic, plain SQL (0001–0007)
 evals/            labelled cases, runner, cost/latency report, gate, baseline.json
-tests/            578 tests; *_pg tests use a real test database, rolled back
+tests/            597 tests; *_pg tests use a real test database, rolled back
 data/             saved page snapshots used as the knowledge base (for testing, not live data)
 ```
 

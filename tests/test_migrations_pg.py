@@ -15,6 +15,7 @@ BASELINE = {"chunks", "leads"}
 AGENT_STATE = {"runs", "run_steps", "research_findings", "finding_citations", "qualifications", "drafts", "approvals", "sends"}
 MEMORY = {"replies"}
 TENANTS = {"tenants", "api_keys"}
+LIMITS = {"usage"}
 
 
 def _tables(url: str) -> set[str]:
@@ -44,8 +45,14 @@ def at_head_afterwards(test_db_url):
 
 def test_up_and_down_step_by_step(at_head_afterwards):
     url, cfg = at_head_afterwards, alembic_config(at_head_afterwards, TEST_DIMS)
+    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY | TENANTS | LIMITS
+    assert _revision(url) == "0007"
+    assert {"max_runs_per_day", "daily_token_budget"} <= _columns(url, "tenants")
+
+    command.downgrade(cfg, "-1")  # 0007: usage table + the tenant limit columns go
     assert _tables(url) == BASELINE | AGENT_STATE | MEMORY | TENANTS
     assert _revision(url) == "0006"
+    assert "daily_token_budget" not in _columns(url, "tenants")
     assert "tenant_id" in _columns(url, "research_findings") and "tenant_id" not in _columns(url, "chunks")
 
     command.downgrade(cfg, "-1")  # 0006: tenants + keys go, and every tenant_id column with them
@@ -75,13 +82,13 @@ def test_up_and_down_step_by_step(at_head_afterwards):
     assert _revision(url) is None
 
     command.upgrade(cfg, "head")
-    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY | TENANTS
+    assert _tables(url) == BASELINE | AGENT_STATE | MEMORY | TENANTS | LIMITS
 
 
 def test_upgrade_is_a_no_op_at_head(at_head_afterwards):
     migrate(at_head_afterwards, dims=TEST_DIMS)
     migrate(at_head_afterwards, dims=TEST_DIMS)
-    assert _revision(at_head_afterwards) == "0006"
+    assert _revision(at_head_afterwards) == "0007"
 
 
 def test_baseline_uses_the_configured_dims(at_head_afterwards):

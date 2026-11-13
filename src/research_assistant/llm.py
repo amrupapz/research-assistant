@@ -4,7 +4,9 @@ import random
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date
 
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
@@ -47,6 +49,34 @@ RESEARCH_ANSWER_FORMAT = type_to_text_format_param(ResearchAnswer)
 ICP_JUDGMENT_FORMAT = type_to_text_format_param(IcpJudgment)
 EMAIL_DRAFT_FORMAT = type_to_text_format_param(EmailDraft)
 CLAIM_VERDICT_FORMAT = type_to_text_format_param(ClaimVerdict)
+
+
+# --- token meter (D7 M3) ---------------------------------------------------------------------
+# Every model + embedding call adds input + output tokens to the active meter, if there is one.
+# The API opens a meter per /ask request and per background flow job, then writes ONE usage row.
+# A ContextVar, not a parameter: no signature changes, and LangGraph copies the context into the
+# threads that run its nodes. The box is a mutable list, so those copies all add to the SAME total.
+
+_meter: ContextVar[list[int] | None] = ContextVar("token_meter", default=None)
+
+
+@contextmanager
+def token_meter() -> Iterator[list[int]]:
+    """`with token_meter() as box:` ... box[0] = tokens used by every call made inside."""
+    box = [0]
+    reset = _meter.set(box)
+    try:
+        yield box
+    finally:
+        _meter.reset(reset)
+
+
+def _log(record: dict, settings: Settings) -> None:
+    """Meter, then write the run-log line. Called in `finally`: failed calls that used tokens count too."""
+    box = _meter.get()
+    if box is not None:
+        box[0] += (record.get("input_tokens") or 0) + (record.get("output_tokens") or 0)
+    log_run(record, settings.runs_dir)
 
 
 def make_client(settings: Settings | None = None) -> OpenAI:
@@ -190,7 +220,7 @@ def ask(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 def judge_icp(
@@ -263,7 +293,7 @@ def judge_icp(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 def write_email(
@@ -335,7 +365,7 @@ def write_email(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 def respond(
@@ -407,7 +437,7 @@ def respond(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 class JudgeNotConfiguredError(Exception):
@@ -479,7 +509,7 @@ def judge_claim(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 def extract_function_calls(body: dict) -> list[dict]:
@@ -544,7 +574,7 @@ def embed(
     finally:
         record["latency_ms"] = round((time.perf_counter() - start) * 1000)
         tracing.end_generation(gen, record, settings)  # tokens, cost, status -> trace; trace_id -> record
-        log_run(record, settings.runs_dir)
+        _log(record, settings)
 
 
 def _usage(body: dict) -> dict:

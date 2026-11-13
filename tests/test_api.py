@@ -347,3 +347,90 @@ def test_a_tenants_own_run_is_invisible_to_the_other(client, fake, keys, ctx):
     _same_404(client.get(f"/runs/{run_id}"))  # default's approver
     tenants = ctx.conn.execute("SELECT DISTINCT tenant_id FROM drafts UNION SELECT DISTINCT tenant_id FROM runs").fetchall()
     assert tenants == [("acme",)]
+
+
+# --- D7 M3: limits → 429 + Retry-After, before any model call -----------------------------------
+
+
+def _no_model(*a, **k):
+    raise AssertionError("the model must not be called after a 429 decision")
+
+
+def _plan(ctx, tenant="default", runs=None, tokens=None):
+    ctx.conn.execute(
+        "UPDATE tenants SET max_runs_per_day = coalesce(%s, max_runs_per_day), "
+        "daily_token_budget = coalesce(%s, daily_token_budget) WHERE tenant_id = %s",
+        [runs, tokens, tenant],
+    )
+
+
+def _spent(ctx, tokens, tenant="default", days_ago=0):
+    set_tenant(ctx.conn, tenant)
+    state.record_usage(ctx.conn, tokens, "ask")
+    ctx.conn.execute(
+        "UPDATE usage SET created_at = now() - make_interval(days => %s) WHERE usage_id = (SELECT max(usage_id) FROM usage)",
+        [days_ago],
+    )
+
+
+def test_the_rate_limit_is_per_key_and_says_when_to_retry(client, settings, keys):
+    settings.rate_limit_per_minute = 3
+    assert [client.get("/leads/L1/status").status_code for _ in range(3)] == [200, 200, 200]
+    r = client.get("/leads/L1/status")
+    assert r.status_code == 429 and 0 < int(r.headers["retry-after"]) <= 60
+    assert r.json()["error"] == "rate limit: 3 requests per minute per key"
+    assert client.get("/leads/L1/status", headers=bearer(keys["member"])).status_code == 200  # another key
+    assert client.get("/leads/L1/status", headers=bearer("ra_wrong")).status_code == 401  # bad keys: 401, not counted
+
+
+def test_the_daily_run_limit_refuses_before_creating_a_run(client, fake, ctx):
+    _plan(ctx, runs=1)
+    _start(client, fake)
+    r = client.post("/runs", json={"lead_id": "L2"})
+    assert r.status_code == 429 and "1 of 1 runs today" in r.json()["error"]
+    assert 0 < int(r.headers["retry-after"]) <= 86_400  # until UTC midnight
+    assert ctx.conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+
+
+def test_over_budget_ask_and_runs_are_429_and_the_model_is_never_called(client, ctx, monkeypatch):
+    _plan(ctx, tokens=1_000)
+    _spent(ctx, 1_000)
+    monkeypatch.setattr(retrieval, "hybrid_search", _no_model)  # embedding = a paid call too
+    monkeypatch.setattr(llm, "ask", _no_model)
+    r = client.post("/ask", json={"question": "What does Figma do?"})
+    assert r.status_code == 429 and r.json()["error"] == "daily token budget exceeded (used 1,000 of 1,000 tokens today, UTC)"
+    assert client.post("/runs", json={"lead_id": "L1"}).status_code == 429
+    assert ctx.conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+
+def test_yesterdays_usage_and_other_tenants_usage_do_not_count(client, ctx, keys, monkeypatch):
+    _plan(ctx, tokens=1_000)
+    _spent(ctx, 50_000, days_ago=1)
+    _plan(ctx, tenant="acme", tokens=1_000)
+    _spent(ctx, 50_000, tenant="acme")  # acme is over; default isn't
+    monkeypatch.setattr(retrieval, "hybrid_search", lambda conn, q, k: [(CHUNK, 1.0)])
+    monkeypatch.setattr(llm, "ask", lambda q, chunks: ANSWER)
+    assert client.post("/ask", json={"question": "What does Figma do?"}).status_code == 200
+    assert client.post("/ask", json={"question": "What does Figma do?"}, headers=bearer(keys["acme"])).status_code == 429
+
+
+def test_ask_records_its_tokens_in_the_callers_tenant(client, ctx, settings, monkeypatch):
+    def metered_ask(q, chunks):
+        llm._log({"input_tokens": 2_000, "output_tokens": 150}, settings)  # what the real ask does
+        return ANSWER
+
+    monkeypatch.setattr(retrieval, "hybrid_search", lambda conn, q, k: [(CHUNK, 1.0)])
+    monkeypatch.setattr(llm, "ask", metered_ask)
+    client.post("/ask", json={"question": "What does Figma do?"})
+    assert ctx.conn.execute("SELECT tenant_id, endpoint, tokens FROM usage").fetchall() == [("default", "ask", 2_150)]
+
+
+def test_a_failed_ask_still_records_what_it_spent(client, ctx, settings, monkeypatch):
+    def truncated(q, chunks):
+        llm._log({"input_tokens": 2_000, "output_tokens": 2_000}, settings)
+        raise llm.IncompleteResponseError("max_output_tokens")
+
+    monkeypatch.setattr(retrieval, "hybrid_search", lambda conn, q, k: [(CHUNK, 1.0)])
+    monkeypatch.setattr(llm, "ask", truncated)
+    assert client.post("/ask", json={"question": "What does Figma do?"}).status_code == 502
+    assert ctx.conn.execute("SELECT tokens FROM usage").fetchall() == [(4_000,)]

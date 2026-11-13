@@ -1,6 +1,6 @@
 """API keys, tenants, roles (D7 M2). Keys are managed from this CLI only; there is no admin endpoint.
 
-    uv run keys add-tenant acme
+    uv run keys add-tenant acme [--max-runs 50] [--daily-tokens 1000000]   (D7 M3: the tenant's plan)
     uv run keys create-key --tenant acme --role approver --label "Dana laptop"   (key shown ONCE)
     uv run keys list-keys
     uv run keys revoke-key 3
@@ -79,8 +79,13 @@ def find_principal(conn: psycopg.Connection, key: str) -> Principal | None:
     return Principal(*row) if row else None
 
 
-def add_tenant(conn: psycopg.Connection, tenant_id: str) -> None:
-    conn.execute("INSERT INTO tenants (tenant_id) VALUES (%s)", [tenant_id])
+def add_tenant(conn: psycopg.Connection, tenant_id: str, max_runs: int | None = None, daily_tokens: int | None = None) -> None:
+    """None = the column default (50 runs, 1,000,000 tokens per UTC day)."""
+    conn.execute(
+        "INSERT INTO tenants (tenant_id, max_runs_per_day, daily_token_budget) "
+        "VALUES (%s, coalesce(%s, 50), coalesce(%s, 1000000))",
+        [tenant_id, max_runs, daily_tokens],
+    )
 
 
 def create_key(conn: psycopg.Connection, tenant_id: str, role: str, label: str = "") -> tuple[int, str]:
@@ -110,9 +115,12 @@ def revoke_key(conn: psycopg.Connection, key_id: int) -> bool:
 def main(argv: list[str] | None = None) -> None:
     from research_assistant.db import connect
 
-    p = argparse.ArgumentParser(prog="keys", description="Manage tenants and API keys (no HTTP endpoint for this).")
+    p = argparse.ArgumentParser(prog="keys", description="Manage tenants and API keys (no HTTP endpoint for this).", allow_abbrev=False)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("add-tenant").add_argument("tenant_id")
+    t = sub.add_parser("add-tenant")
+    t.add_argument("tenant_id")
+    t.add_argument("--max-runs", type=int, help="workflow runs per UTC day (default 50)")
+    t.add_argument("--daily-tokens", type=int, help="model + embedding tokens per UTC day (default 1,000,000)")
     c = sub.add_parser("create-key")
     c.add_argument("--tenant", required=True)
     c.add_argument("--role", required=True, choices=sorted(ROLE_ACTIONS))
@@ -124,7 +132,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         with connect(tenant=None) as conn:  # tenants + keys aren't tenant-scoped; commits on clean exit
             if args.cmd == "add-tenant":
-                add_tenant(conn, args.tenant_id)
+                add_tenant(conn, args.tenant_id, args.max_runs, args.daily_tokens)
                 print(f"tenant {args.tenant_id} added")
             elif args.cmd == "create-key":
                 key_id, key = create_key(conn, args.tenant, args.role, args.label)
@@ -140,4 +148,4 @@ def main(argv: list[str] | None = None) -> None:
     except psycopg.errors.UniqueViolation:
         raise SystemExit(f"tenant {args.tenant_id} already exists") from None
     except psycopg.errors.CheckViolation:
-        raise SystemExit("tenant ids: 1-32 chars of a-z 0-9 _ -") from None
+        raise SystemExit("tenant ids: 1-32 chars of a-z 0-9 _ -; limits must be >= 0") from None

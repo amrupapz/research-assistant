@@ -2130,3 +2130,40 @@ demo keys created unprinted and revoked.
   company filter → Figma/Intel/Anthropic chunks score ~0.031 next to Linear's 0.033 and 4 of 6 chunks
   sent to judge_icp were other companies (model ignored them) → added to README Known failures;
   the poisoned page was the #1 chunk everywhere, the fake 30% fact didn't make it this time.
+
+## D7 M3 — limits + cost controls
+
+**Concept:** a limit must be checked BEFORE the money is spent; a 429 after the model call is a
+receipt. Three limits for three threats: per-key rate limit (a client loop), runs per tenant per day
+(hundreds of 15 s workflows), daily token budget per tenant (actual OpenAI spend). All answer 429 +
+Retry-After. Without them one leaked key or buggy loop spends the whole budget in minutes.
+
+**Built:**
+- 0007: tenants.max_runs_per_day (50) + daily_token_budget (1,000,000); `usage` table (tenant from
+  the connection, like everything else). `keys add-tenant NAME --max-runs N --daily-tokens N`.
+- Meter: `llm.token_meter()` (a ContextVar holding a mutable box); every model + embedding call adds
+  input + output tokens in `_log()` (the one place all 6 call sites log, in `finally`, so failed
+  calls count). /ask and each background job (Runner._job) write ONE usage row, also in `finally`.
+- api.py: RateLimiter (sliding window per key_id, in memory, lock), applied in get_principal AFTER
+  auth (bad keys are a cheap 401, not counted). enforce_daily_limits(): runs today (POST /runs only)
+  and tokens today (POST /ask + /runs), BEFORE any embedding/model call; "today" = since UTC
+  midnight; Retry-After = until the window frees / until UTC midnight.
+- Tests: limiter with an injected clock; meter incl. calls inside LangGraph worker threads; Runner
+  writes usage on failure, not on zero; API 429s with the model patched to raise (proves "before");
+  yesterday's and another tenant's usage don't count. Demo 4 in scripts/demo.sh.
+
+**Gotchas:**
+- Why not the run logs: their model-call lines have no tenant (only a trace_id, and only with
+  tracing on), and scanning a file per request is slow and racy across containers → a DB table.
+- ContextVar + LangGraph: nodes run in worker threads with a COPY of the context. Setting a new value
+  inside a copy would be lost, but mutating the SAME list object isn't → box = [0], not an int.
+- A refused request must NOT count toward the rate limit, or a retrying client never gets back under.
+- Overshoot by design: checked at the start of a request, so one run can finish over the budget
+  (demo 4 shows it). Checking before every model call would stop a run mid-way: worse for the user.
+- In-memory limiter = per process, reset on restart. Fine for one container; say so in the README.
+- state_db TRUNCATE needed `usage` added (FK to runs).
+- Demo 4 (2026-11-13): tenant with 1 run + 1,000 tokens/day → run allowed, spent 5,511 tokens
+  (overshoot = one run, as designed) → 2nd run 429 (run limit), /ask 429 (budget), still 1 usage
+  row + 1 run (the 429s cost nothing); 61 requests → 60 × 200 + 1 × 429, Retry-After 59.
+- Demo 1 rerun: the timeout hit write_email, not embed: research + qualification were REUSED
+  (< 7 days, same tenant), so the first model call was the email; --resume made just that one call.

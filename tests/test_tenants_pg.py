@@ -122,3 +122,12 @@ def test_keys_cli_creates_and_lists_without_showing_the_key_or_hash(cli_db, caps
 def test_keys_cli_rejects_an_unknown_tenant(cli_db):
     with pytest.raises(SystemExit, match="no tenant nope"):
         auth.main(["create-key", "--tenant", "nope", "--role", "member"])
+
+
+def test_keys_cli_sets_a_tenants_plan(cli_db):
+    auth.main(["add-tenant", "tight", "--max-runs", "1", "--daily-tokens", "1000"])
+    auth.main(["add-tenant", "roomy"])
+    rows = cli_db.execute(
+        "SELECT tenant_id, max_runs_per_day, daily_token_budget FROM tenants WHERE tenant_id IN ('tight', 'roomy') ORDER BY 1"
+    ).fetchall()
+    assert rows == [("roomy", 50, 1_000_000), ("tight", 1, 1_000)]

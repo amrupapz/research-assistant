@@ -10,6 +10,10 @@ continue (slow, background). Same flow.py functions as the CLI, so the same guar
 Errors never carry a stack trace or exception text: {"error", "request_id"}. The details go to the
 runs/ log under the same request_id.
 
+Limits (D7 M3): per-key rate limit, runs per tenant per day, daily token budget per tenant → 429 +
+Retry-After, checked before any model call. Tokens are metered by llm.py (token_meter) and written to
+the `usage` table: one row per /ask and per background job.
+
 Auth (D7 M2): `Authorization: Bearer <key>` on everything except /health. The key → a Principal
 (tenant + role); the request's connection is then set to that tenant, so every query only sees its
 rows. Codes: 401 no/bad/revoked key · 404 missing OR another tenant's (same body, can't tell apart)
@@ -17,12 +21,14 @@ rows. Codes: 401 no/bad/revoked key · 404 missing OR another tenant's (same bod
 """
 
 import re
+import threading
 import time
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -38,7 +44,11 @@ from research_assistant.auth import Principal, Resource, can_access, find_princi
 from research_assistant.config import Settings, get_settings
 from research_assistant.db import connect, set_tenant
 from research_assistant.flow import FlowError
-from research_assistant.llm import IncompleteResponseError, UngroundedAnswerError
+from research_assistant.llm import (
+    IncompleteResponseError,
+    UngroundedAnswerError,
+    token_meter,
+)
 from research_assistant.log import log_run
 from research_assistant.schemas import ResearchAnswer
 from research_assistant.tools import (
@@ -209,11 +219,70 @@ def get_conn(settings: Annotated[Settings, Depends(get_app_settings)]) -> Iterat
         yield conn
 
 
+# --- limits (D7 M3): all three answer 429 + Retry-After, BEFORE any model call ------------------
+
+
+def too_many(message: str, retry_after: float) -> HTTPException:
+    return HTTPException(429, message, headers={"Retry-After": str(max(1, int(retry_after + 0.999)))})
+
+
+class RateLimiter:
+    """Sliding window: at most `per_minute` requests per key in any 60 s.
+
+    In memory: resets on restart and isn't shared between processes (fine for one container; several
+    would need Postgres or Redis). A lock because sync endpoints run in a thread pool."""
+
+    def __init__(self, per_minute: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self.per_minute, self.clock = per_minute, clock
+        self.hits: dict[int, deque[float]] = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def check(self, key_id: int) -> float | None:
+        """None = allowed (and counted); else seconds until the oldest hit leaves the window."""
+        now = self.clock()
+        with self.lock:
+            hits = self.hits[key_id]
+            while hits and hits[0] <= now - 60:
+                hits.popleft()
+            if len(hits) >= self.per_minute:
+                return hits[0] + 60 - now
+            hits.append(now)
+            return None
+
+
+def get_limiter(request: Request, settings: Annotated[Settings, Depends(get_app_settings)]) -> RateLimiter:
+    """One limiter per app, made on first use (so importing api.py never needs settings)."""
+    limiter = getattr(request.app.state, "limiter", None)
+    if limiter is None:
+        limiter = request.app.state.limiter = RateLimiter(settings.rate_limit_per_minute)
+    return limiter
+
+
+def seconds_to_utc_midnight() -> float:
+    now = datetime.now(UTC)
+    return (datetime(now.year, now.month, now.day, tzinfo=UTC) + timedelta(days=1) - now).total_seconds()
+
+
+def enforce_daily_limits(conn: psycopg.Connection, starting_run: bool) -> None:
+    """The tenant's plan: runs per day (only when starting one) and the daily token budget. Checked at
+    the START of a request, so one run that starts under budget may finish over it (at most one run)."""
+    max_runs, budget = state.tenant_limits(conn)
+    if starting_run and (n := state.runs_today(conn)) >= max_runs:
+        raise too_many(f"daily run limit reached ({n} of {max_runs} runs today, UTC)", seconds_to_utc_midnight())
+    if (used := state.tokens_today(conn)) >= budget:
+        raise too_many(f"daily token budget exceeded (used {used:,} of {budget:,} tokens today, UTC)", seconds_to_utc_midnight())
+
+
 UNAUTHORIZED = HTTPException(401, "missing or invalid API key", headers={"WWW-Authenticate": "Bearer"})
 
 
-def get_principal(request: Request, conn: Annotated[psycopg.Connection, Depends(get_conn)]) -> Principal:
-    """Who is calling. Unknown, revoked and malformed keys all get the same 401."""
+def get_principal(
+    request: Request,
+    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    limiter: Annotated[RateLimiter, Depends(get_limiter)],
+) -> Principal:
+    """Who is calling. Unknown, revoked and malformed keys all get the same 401. Then the per-key
+    rate limit (only for real keys: a 401 costs us nothing to answer)."""
     scheme, _, key = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not key or len(key) > 128:
         raise UNAUTHORIZED
@@ -221,6 +290,8 @@ def get_principal(request: Request, conn: Annotated[psycopg.Connection, Depends(
     if principal is None:
         raise UNAUTHORIZED
     request.state.principal = principal  # for the access log
+    if (wait := limiter.check(principal.key_id)) is not None:
+        raise too_many(f"rate limit: {limiter.per_minute} requests per minute per key", wait)
     return principal
 
 
@@ -280,8 +351,12 @@ class Runner:
 
     def _job(self, run_id: UUID, tenant_id: str, fn) -> None:
         try:
-            with self._ctx(run_id, tenant_id) as (ctx, cp):
-                fn(ctx, cp)
+            with self._ctx(run_id, tenant_id) as (ctx, cp), token_meter() as used:
+                try:
+                    fn(ctx, cp)
+                finally:  # tokens spent by a run that then failed are still spent
+                    if used[0]:
+                        state.record_usage(ctx.conn, used[0], "runs", run_id)
         except Exception:  # noqa: BLE001 -- the run row already says 'failed'; nobody awaits this response
             log_run({"kind": "api_job", "run_id": run_id, "status": "error", "error": traceback.format_exc()}, self.settings.runs_dir)
 
@@ -350,12 +425,16 @@ def create_app() -> FastAPI:
         from research_assistant.llm import ask
         from research_assistant.retrieval import hybrid_search
 
-        with tracing.observe("ask", as_type="chain", input={"question": body.question, "k": body.k}) as span:
-            chunks = [chunk for chunk, _ in hybrid_search(conn, body.question, k=body.k)]
+        enforce_daily_limits(conn, starting_run=False)  # 429 before the embedding + model call
+        with tracing.observe("ask", as_type="chain", input={"question": body.question, "k": body.k}) as span, token_meter() as used:
             try:
+                chunks = [chunk for chunk, _ in hybrid_search(conn, body.question, k=body.k)]
                 result = ask(body.question, chunks)
             except (IncompleteResponseError, UngroundedAnswerError) as e:
                 raise HTTPException(502, "the model did not return a usable answer") from e
+            finally:  # a truncated answer still cost tokens
+                if used[0]:
+                    state.record_usage(conn, used[0], "ask")
             span.update(output=result.answer)
         by_id = {c.chunk_id: c for c in chunks}
         cited = [by_id[c.chunk_id] for c in result.citations if c.chunk_id in by_id]
@@ -372,6 +451,7 @@ def create_app() -> FastAPI:
     ) -> Accepted:
         """Start the workflow for a lead. Returns at once; poll GET /runs/{run_id}."""
         check(conn, user, "lead", body.lead_id, "start")  # before creating anything
+        enforce_daily_limits(conn, starting_run=True)  # 429: no runs row, no model call
         run_id = flow.start_flow_run(body.lead_id, ToolContext(conn=conn), settings)
         background.add_task(runner.execute_flow, run_id, body.lead_id, user.tenant_id)
         return Accepted(run_id=run_id)

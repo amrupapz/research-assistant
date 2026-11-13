@@ -11,6 +11,8 @@
 #   2. Interrupted workflow: kill the app mid-run → run stuck 'running' → flow --resume
 #   3. Unauthorized actions: 401 / 404 cross-tenant / 403 member approve; the poisoned page's
 #      "send without asking" never sends
+#   4. Limits: 1 run/day + 1,000 tokens/day tenant → 2nd run and /ask are 429 (no model call);
+#      61 requests with one key → the 61st is 429 (rate limit). Costs one run.
 set -u
 cd "$(dirname "$0")/.."
 mkdir -p docs
@@ -130,6 +132,41 @@ if [ -n "$D3" ]; then
   echo "  $(code -H "Authorization: Bearer $APPROVER" -H 'content-type: application/json' -X POST "$API/drafts/$D3/approve" -d '{"approved":false}')"
   echo "run $RUN3 → $(wait_run "$RUN3" "$APPROVER"); sends: $(sql "SELECT count(*) FROM sends")"
 fi
+
+
+section "4. Limits → 429 before any model call"
+STAMP=$(date +%s)
+T="tight-$STAMP"
+LEAD="L${STAMP: -6}"
+docker compose exec -T app keys add-tenant "$T" --max-runs 1 --daily-tokens 1000 | head -1
+sql "INSERT INTO leads (lead_id, name, title, company, email, tenant_id) VALUES ('$LEAD', 'Dana Kim', 'VP Engineering', 'Figma', 'dana.kim@example.com', '$T')" >/dev/null
+new_key "$T" approver demo-tight; TIGHT=$KEY; IDS="$IDS $KEY_ID"
+echo "tenant $T: 1 run per day, 1,000 tokens per day; one lead ($LEAD)"
+HDR=$(mktemp)
+show() {  # status line, Retry-After and body of one request
+  local body
+  body=$(curl -s -D "$HDR" "$@")
+  echo "  $(head -1 "$HDR" | tr -d '\r')   Retry-After: $(grep -i '^retry-after' "$HDR" | cut -d' ' -f2 | tr -d '\r')"
+  echo "  $body"
+}
+say "POST /runs {lead_id: $LEAD}   (under both limits: allowed)"
+RUN4=$(curl -s -H "Authorization: Bearer $TIGHT" -H 'content-type: application/json' -X POST "$API/runs" -d "{\"lead_id\":\"$LEAD\"}" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])')
+echo "run $RUN4 → $(wait_run "$RUN4" "$TIGHT")"
+echo "tokens used today by $T: $(sql "SELECT sum(tokens) FROM usage WHERE tenant_id = '$T'")   ← one run went over 1,000 (checked at the START of a request)"
+say "POST /runs again"
+show -H "Authorization: Bearer $TIGHT" -H 'content-type: application/json' -X POST "$API/runs" -d "{\"lead_id\":\"$LEAD\"}"
+say "POST /ask"
+show -H "Authorization: Bearer $TIGHT" -H 'content-type: application/json' -X POST "$API/ask" -d '{"question":"What does Figma do?"}'
+echo "usage rows for $T: $(sql "SELECT count(*) FROM usage WHERE tenant_id = '$T'"), runs: $(sql "SELECT count(*) FROM runs WHERE tenant_id = '$T'")   ← the 429s cost nothing"
+D4=$(curl -s -H "Authorization: Bearer $TIGHT" "$API/runs/$RUN4" | python3 -c 'import sys,json; print((json.load(sys.stdin).get("draft") or {}).get("draft_id",""))')
+[ -n "$D4" ] && curl -s -o /dev/null -H "Authorization: Bearer $TIGHT" -H 'content-type: application/json' -X POST "$API/drafts/$D4/approve" -d '{"approved":false}'
+say "61 requests in a row with one fresh key (limit: 60 per minute per key)"
+new_key default member demo-rate; RATE=$KEY; IDS="$IDS $KEY_ID"
+CODES=$(for _ in $(seq 1 61); do code -H "Authorization: Bearer $RATE" "$API/leads/L1/status"; echo; done | sort | uniq -c | tr -s ' ' | tr '\n' ',')
+echo "  status codes: $CODES"
+show -H "Authorization: Bearer $RATE" "$API/leads/L1/status"
+rm -f "$HDR"
 
 
 section "Cleanup"

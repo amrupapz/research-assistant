@@ -416,3 +416,30 @@ def owner(conn: psycopg.Connection, kind: str, key: Any) -> str | None:
             return None
     row = conn.execute(f"SELECT tenant_id FROM {table} WHERE {column} = %s AND tenant_id = {TENANT}", [key]).fetchone()
     return row[0] if row else None
+
+
+# --- limits + usage (D7 M3) -----------------------------------------------------------------
+# "Today" = since UTC midnight. All filtered on the connection's tenant like everything else.
+
+TODAY = "date_trunc('day', now(), 'UTC')"
+
+
+def tenant_limits(conn: psycopg.Connection) -> tuple[int, int]:
+    """(max_runs_per_day, daily_token_budget) of the connection's tenant."""
+    return conn.execute(
+        f"SELECT max_runs_per_day, daily_token_budget FROM tenants WHERE tenant_id = {TENANT}"
+    ).fetchone()
+
+
+def runs_today(conn: psycopg.Connection) -> int:
+    return conn.execute(f"SELECT count(*) FROM runs WHERE tenant_id = {TENANT} AND started_at >= {TODAY}").fetchone()[0]
+
+
+def tokens_today(conn: psycopg.Connection) -> int:
+    return conn.execute(
+        f"SELECT coalesce(sum(tokens), 0) FROM usage WHERE tenant_id = {TENANT} AND created_at >= {TODAY}"
+    ).fetchone()[0]
+
+
+def record_usage(conn: psycopg.Connection, tokens: int, endpoint: str, run_id: UUID | None = None) -> None:
+    conn.execute("INSERT INTO usage (tokens, endpoint, run_id) VALUES (%s, %s, %s)", [tokens, endpoint, run_id])
