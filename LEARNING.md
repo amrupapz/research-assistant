@@ -2122,3 +2122,11 @@ demo keys created unprinted and revoked.
   reader pasting them gets errors (same reason as my own rule).
 - `license-files = ["LICENSE"]` in pyproject → the Docker build stage must COPY LICENSE too.
 - Changing the pyproject email doesn't hide the email in the 56 existing commits' author field.
+- Trace exhibit: read via the Langfuse API (tracing.fetch_observations) instead of a UI screenshot:
+  real, searchable, nothing secret to crop. Root observations point at the TRACE id, not an observation
+  id, so "parent not among the observation ids" = top level.
+- Langfuse export of the demo-3 trace (kept OUT of the repo: it holds the project id + public key in
+  every observation's metadata): email masked as <email> (Day 6 mask works); hybrid_search has NO
+  company filter → Figma/Intel/Anthropic chunks score ~0.031 next to Linear's 0.033 and 4 of 6 chunks
+  sent to judge_icp were other companies (model ignored them) → added to README Known failures;
+  the poisoned page was the #1 chunk everywhere, the fake 30% fact didn't make it this time.

@@ -153,7 +153,32 @@ Answers are also checked claim by claim by an LLM judge, which was calibrated ag
 | agent loop | 72 | 10.4 s | 21.8 s (24.0) | 7,337 (7,381) |
 
 Model calls are ~99% of the time in every stage, so speed work means fewer calls or fewer tokens,
-not database tuning. The whole eval run costs about $0.13 (half of it is the judge).
+not database tuning.
+
+**One run as a Langfuse trace** (demo 3: lead L3, started by a member, declined by an approver; read
+through the Langfuse API):
+
+```
+flow                       chain       +0.00s  11.25s
+  load_lead                chain       +0.01s   0.00s
+  research                 chain       +0.02s   3.04s
+    search_company         tool                 3.04s
+      hybrid_search        retriever            0.30s   (embed 0.26s)
+      ask                  generation  +0.33s   2.72s   2,204 tok  $0.00026
+  qualify                  chain       +3.06s   5.37s
+    qualify_lead           tool                 5.37s
+      hybrid_search ×3     retriever            1.02s   (one per ICP criterion)
+      judge_icp            generation  +4.09s   4.34s   2,729 tok  $0.00037
+  draft                    chain       +8.43s   2.79s
+    write_email            generation  +8.44s   2.76s     526 tok  $0.00011
+    draft_email            tool                 0.02s
+  approve                  chain      +11.23s   paused (interrupt)
+flow-approve               chain      +13.40s   0.01s   the approver's decision joins the same trace
+```
+
+The three model calls take about 87% of the 11.25 s, and the run costs about $0.0007. The trace id
+is derived from the run id, so the approval, which may come a day later from another process, lands
+in the same trace. The whole eval run costs about $0.13 (half of it is the judge).
 
 **The regression gate** (`evals/gate.py`) fails the build in these cases:
 - a category drops more than 10 points
@@ -192,6 +217,11 @@ These are real, measured, and not fixed yet:
 - **Small categories are noisy.** `conflicting_info` has 3 cases × 3 runs. The same code scored 56%
   and then 67%: one case moves the rate by 11 points, more than the gate's 10-point tolerance.
   It needs more cases.
+- **Retrieval doesn't filter by company.** In the trace above, the four searches about Linear also
+  returned Figma, Intel and Anthropic chunks, with almost the same RRF scores (0.031 vs 0.033), so
+  4 of the 6 chunks sent to the qualification judge were about other companies. The model ignored
+  them and cited only Linear chunks, but that costs tokens, and on a closer question it could cite
+  the wrong company's fact. The fix is a company filter in `hybrid_search`.
 - **No follow-up cap.** A lead who never replies is due a follow-up every 3 days, forever.
 - **No rate limits or token budget per tenant yet.** `max_steps` and the retry cap bound a single
   run, but not a tenant's daily spend.
