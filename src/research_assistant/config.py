@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     embedding_dims: int = 1536  # must match the model; checked on every embed call
     judge_model: str | None = None  # D6 M3 claim checker: JUDGE_MODEL in .env, stronger than MODEL
 
+    slack_webhook_url: SecretStr | None = None  # D7 M6: alerts.py posts ALERT lines here (optional)
     rate_limit_per_minute: int = 60  # D7 M3: requests per API key per minute (in-memory, per process)
 
     # D6 M1 tracing (Langfuse Cloud). Off unless TRACING_ENABLED=true AND both keys are set.

@@ -2167,3 +2167,36 @@ Retry-After. Without them one leaked key or buggy loop spends the whole budget i
   row + 1 run (the 429s cost nothing); 61 requests → 60 × 200 + 1 × 429, Retry-After 59.
 - Demo 1 rerun: the timeout hit write_email, not embed: research + qualification were REUSED
   (< 7 days, same tenant), so the first model call was the email; --resume made just that one call.
+
+## D7 M6 — runbook + alerts
+
+**Concept:** a runbook turns "something's wrong" into steps that work at 3 a.m. for someone who
+didn't build the system: where to look, how to go from a client's request_id to the cause, how to
+recover, how to rotate secrets. Alerts make problems visible before a customer reports them; each
+alert needs a "what it means / what to do" entry or it's noise. Without them every incident starts
+with re-learning the system.
+
+**Built:**
+- `python -m research_assistant.alerts [--minutes N] [thresholds]`: reads runs/*.jsonl (the lines
+  every request and model call already writes). ALERTs: api_error_rate (5xx > 5%), rate_limited
+  (429 > 20%), model_error_rate (not completed > 10%), api_p95 per ROUTE (> 10 s), model_p95
+  (> 20 s), unhandled_errors and failed_jobs (any). Rates need >= 20 samples. Exit 1 on alerts;
+  SLACK_WEBHOOK_URL (via config.py) → also posted; a Slack failure is printed, never hides the alert.
+- RUNBOOK.md: where things are; first five minutes; request_id → log line → trace_id → Langfuse →
+  DB rows; stuck/failed runs (find, resume with --tenant, approval crash, pending sends); rotating
+  API/OpenAI/Langfuse/Postgres credentials; alert table (meaning → action); cron line.
+- `flow --resume RUN --tenant T`: without it an operator could NOT resume another tenant's run
+  (tenant isolation made the run invisible to the CLI's 'default' connection). Found while writing
+  the runbook.
+- Checked on the container's real logs: OK (589 requests, 4 × 503 = the M4 DB-stop test, 2 incomplete
+  model calls = demo 1's timeouts). Every runbook SQL query was run against the Docker DB.
+
+**Gotchas:**
+- Flow runs don't write run_steps (only the agent loop does): a flow's record is the checkpoint +
+  drafts/approvals/sends. The runbook says which to read for which kind of run.
+- p95 must be per route: 200 fast polls of GET /runs/{id} hide a slow /ask in a global p95.
+- `SLACK_WEBHOOK_URL=` (empty, from .env.example) → SecretStr("") is falsy → off. Tested.
+- POSTGRES_PASSWORD only applies when the volume is first created; rotation = ALTER inside Postgres
+  (`\password` at the psql prompt: not in shell history) + .env + recreate app.
+- Stuck runs live in the DB, not the logs: the log-based check can't see them → runbook query.
+- In zsh, `P="docker compose exec ..."; $P -c ...` fails (no word splitting) → use a function.

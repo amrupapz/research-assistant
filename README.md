@@ -233,8 +233,9 @@ These are real, measured, and not fixed yet:
   the wrong company's fact. The fix is a company filter in `hybrid_search`.
 - **No follow-up cap.** A lead who never replies is due a follow-up every 3 days, forever.
 - **Runs in flight when the app stops stay `running`.** Background tasks live inside the API process
-  (no queue). Recovery is manual: `python -m research_assistant.flow --resume <run_id>`. The
-  checkpoint and `send_once` make that safe.
+  (no queue). Recovery is manual: `flow --resume RUN_ID --tenant TENANT`, following the
+  [runbook](RUNBOOK.md#stuck-or-failed-runs). The checkpoint and `send_once` make that safe. The
+  alert script reads logs, so it can't see a stuck run; the runbook has the query to find them.
 - **Lead ids are global**, not per tenant. That's fine while there's no create-lead endpoint.
 - The holdout set (h01–h06) isn't fully reviewed, and retrieval question q15 is flaky.
 
@@ -283,10 +284,33 @@ usage rows: 1, runs: 1   ← the 429s cost nothing
 61 requests with one key → 60 × 200, 1 × 429  Retry-After: 59
 ```
 
+## Operations
+
+- **[RUNBOOK.md](RUNBOOK.md)** covers:
+  - tracing an incident from the client's `request_id` to the log line, the Langfuse trace and the
+    database rows
+  - resuming a stuck or failed run
+  - rotating API, OpenAI, Langfuse and Postgres credentials
+  - what to do for each alert
+- **Alerts:** `python -m research_assistant.alerts` reads the run logs and prints one `ALERT` line per
+  problem: 5xx rate, p95 per route, model error rate and p95, 429 share, unhandled errors, failed
+  background jobs. It exits 1 if anything alerted, so cron can run it. With `SLACK_WEBHOOK_URL` set,
+  the alerts are also posted to Slack. Every threshold is a flag.
+
+```
+$ docker compose exec app python -m research_assistant.alerts --minutes 1440
+OK  (last 1440 min of runs/)
+  api: 589 requests, 4 5xx, 4 429
+  model: 35 calls, 2 not completed, p95 5.8s
+```
+
+That day's 5xx were the deliberate "stop the database" test (503s), and the 2 incomplete model
+calls were the timeout demo. Both are under the thresholds.
+
 ## CI
 
 - **[CI](.github/workflows/ci.yml)**, on every push and PR:
-  - ruff, plus 597 tests against a real pgvector Postgres (fake model, no secrets)
+  - ruff, plus 614 tests against a real pgvector Postgres (fake model, no secrets)
   - a Docker build
   - In CI an unreachable database **fails** the run instead of skipping 200 tests.
 - **[Evals](.github/workflows/evals.yml)**, started by hand:
@@ -308,9 +332,10 @@ src/research_assistant/
   auth.py         API keys (SHA-256), roles, can_access(), keys CLI (tenant plans)
   tracing.py      Langfuse (the only file importing it)
   gate.py         regression gate
+  alerts.py       error-rate / p95 alerts from the run logs (RUNBOOK.md says what each one means)
 migrations/       Alembic, plain SQL (0001–0007)
 evals/            labelled cases, runner, cost/latency report, gate, baseline.json
-tests/            597 tests; *_pg tests use a real test database, rolled back
+tests/            614 tests; *_pg tests use a real test database, rolled back
 data/             saved page snapshots used as the knowledge base (for testing, not live data)
 ```
 

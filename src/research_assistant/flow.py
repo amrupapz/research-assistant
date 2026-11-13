@@ -450,14 +450,17 @@ def _main() -> None:
 
     from research_assistant.db import connect
 
-    parser = argparse.ArgumentParser(prog="flow", description="Run the sales workflow for one lead.")
+    parser = argparse.ArgumentParser(prog="flow", description="Run the sales workflow for one lead.", allow_abbrev=False)
     parser.add_argument("lead_id", nargs="?", help="e.g. L1")
     parser.add_argument("--resume", metavar="RUN_ID", type=UUID, help="continue a crashed flow run")
+    parser.add_argument(
+        "--tenant", default="default", help="the tenant that owns the lead / run (D7 M6: resume an API tenant's run)"
+    )
     args = parser.parse_args()
     if (args.lead_id is None) == (args.resume is None):
         parser.error("give a lead_id OR --resume RUN_ID")
     url = get_settings().database_url
-    with connect(autocommit=True) as conn, checkpointer_conn(url) as cp_conn:
+    with connect(autocommit=True, tenant=args.tenant) as conn, checkpointer_conn(url) as cp_conn:
         ctx = ToolContext(conn=conn)
         saver = PostgresSaver(cp_conn)
         try:

@@ -55,6 +55,7 @@ src/research_assistant/
   perf.py       pure cost/latency from trace trees: decompose (self-time split), percentile, summaries
   auth.py       Principal, can_access (✍️ mine), API keys (sha256), `uv run keys ...` CLI
   api.py        FastAPI (ONLY file importing fastapi): Bearer auth, rate limit, daily limits (429), tenant conn, 404/403
+  alerts.py     ALERT lines (5xx/429/model error rates, p95 per route, crashes, failed jobs) from run logs; RUNBOOK.md
   gate.py       regression_gate(baseline, current, tolerance) -> (ok, reasons); snapshot()
 tests/                  mock the client/DB, never hit the real API (*_pg tests: local test DB, rolled back)
 evals/questions.jsonl agent_cases.jsonl qualify_cases.jsonl judge_labels.jsonl (every case has a category)
