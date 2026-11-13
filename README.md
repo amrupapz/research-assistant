@@ -161,10 +161,11 @@ Answers are also checked claim by claim by an LLM judge, which was calibrated ag
 | agent loop | 72 | 10.4 s | 21.8 s (24.0) | 7,337 (7,381) |
 
 Model calls are ~99% of the time in every stage, so speed work means fewer calls or fewer tokens,
-not database tuning.
+not database tuning. The whole eval run costs about $0.13 (half of it is the judge).
 
-**One run as a Langfuse trace** (demo 3: lead L3, started by a member, declined by an approver; read
-through the Langfuse API):
+**Two runs as Langfuse traces**, read through the Langfuse API.
+
+**A successful run** (demo 3: lead L3, started by a member, declined by an approver):
 
 ```
 flow                       chain       +0.00s  11.25s
@@ -186,7 +187,40 @@ flow-approve               chain      +13.40s   0.01s   the approver's decision 
 
 The three model calls take about 87% of the 11.25 s, and the run costs about $0.0007. The trace id
 is derived from the run id, so the approval, which may come a day later from another process, lands
-in the same trace. The whole eval run costs about $0.13 (half of it is the judge).
+in the same trace.
+
+**A failed run, resumed** (demo 1: lead L1 with a 0.01 s OpenAI timeout, then `flow --resume` with
+the normal timeout):
+
+```
+flow                       chain       +0.00s   1.89s   ERROR  APITimeoutError: Request timed out.
+  load_lead                chain       +0.01s   0.01s
+  research                 chain       +0.02s   1.87s   ERROR  APITimeoutError
+    search_company         tool                 1.86s   ERROR
+      hybrid_search        retriever            1.86s   ERROR
+        embed              embedding   +0.05s   1.81s   ERROR  3 attempts, backoff 0.45 s + 0.85 s, 0 tokens
+flow-resume                chain       +5.12s  19.42s   continues from the checkpoint: no load_lead
+  research                 chain       +5.12s   7.85s
+    search_company         tool                 7.85s
+      hybrid_search        retriever            2.00s   (embed 1.97s)
+      ask                  generation  +7.13s   5.83s   2,386 tok
+  qualify                  chain      +12.98s   5.74s
+    qualify_lead           tool                 5.74s
+      hybrid_search ×3     retriever            1.57s   (one per ICP criterion)
+      judge_icp            generation +14.56s   4.15s   2,376 tok
+  draft                    chain      +18.73s   5.80s
+    write_email            generation +18.74s   5.77s     543 tok
+    draft_email            tool                 0.01s
+  approve                  chain      +24.53s   paused (interrupt)
+flow-approve               chain      +27.98s   0.01s   declined
+```
+
+The error goes up the tree from the embedding call to the run, so the failing step is the deepest
+ERROR. The timeout is transient: `llm.py` retried it with backoff (the 3 attempts are in the run
+log) and then gave up. That made the run `failed` without spending a token. `--resume` started from
+the last checkpoint, after `load_lead`, so finished steps weren't repeated. The start, the resume
+and the approval are three processes, and all three land in one trace because the trace id comes
+from the run id.
 
 **The regression gate** (`evals/gate.py`) fails the build in these cases:
 - a category drops more than 10 points

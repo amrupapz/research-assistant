@@ -2200,3 +2200,7 @@ with re-learning the system.
   (`\password` at the psql prompt: not in shell history) + .env + recreate app.
 - Stuck runs live in the DB, not the logs: the log-based check can't see them → runbook query.
 - In zsh, `P="docker compose exec ..."; $P -c ...` fails (no word splitting) → use a function.
+- README: second trace = demo 1's FAILED run (trace dd12de95…, run 8292b8d3…), read via the raw
+  Langfuse API (fetch_observations drops level/statusMessage): ERROR goes up from embed to flow;
+  0 tokens spent on the failure; flow-resume starts at research (no load_lead = from the checkpoint);
+  start + resume + approve = 3 processes, 1 trace (trace id seeded from run id).
