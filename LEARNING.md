@@ -2079,3 +2079,24 @@ token or injection regression past the baseline slips in.
   LANGFUSE_BASE_URL (keys from one region are an auth error on another). Found by printing settings.
 - Unverified until the first run: report.py reads traces back from Langfuse; fresh traces may need a
   few seconds to appear. Empty report on the first run → add a short wait/retry.
+
+**M5 verified on GitHub (2026-11-13):**
+- CI run 1: test 45s (573 passed: the DB tests really ran) + docker build 34s, green.
+- Evals run 1: Langfuse 401 ("Failed to export spans") → report.py raised UnauthorizedError → gate
+  skipped → run RED, artifact still uploaded. Cause: I pasted the secrets WITH the quotes from .env
+  (pydantic-settings strips them, copy-paste doesn't). Fix: pipe them from config.py
+  (`... get_secret_value(), end='')" | gh secret set NAME`): no screen, no shell history, no quotes.
+  `gh secret set` overwrites; secrets can't be read back, only replaced.
+- Evals run 2: 183 traced cases, 0 incomplete, 0 export failures, **GATE: PASS** (~30 min).
+- Same code, two runs: conflicting_info 56% → 67% (5/9 vs 6/9), freshness 77% → 70%. One case in a
+  9-run category = 11 points > the 10-point tolerance: small categories can fail the gate on noise.
+- GitHub registered evals.yml (manual-only) only after a push that CHANGED the file.
+
+**Gate vs traces (answered):** category pass rates come from runs/evals.jsonl (no traces needed);
+seconds_p95 / tokens_p50 / usd_p50 come only from report.py (Langfuse). Total trace failure is LOUD
+(auth error → report.py fails; or every case incomplete → stages missing → gate FAIL). PARTIAL loss
+is SILENT: report.py drops incomplete cases from the numbers but the gate never reads
+report["incomplete"], and a None metric is skipped. **Fixed:** snapshot() keeps the incomplete case
+names; regression_gate fails on any incomplete case and on a metric the baseline has but current
+lacks; `gate.py --save-baseline` refuses an incomplete report (a baseline with holes would make
+every later comparison wrong). Re-checked on CI run 2's real report: still PASS (0 incomplete).

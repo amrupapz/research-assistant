@@ -64,6 +64,8 @@ def main() -> None:
     args = parser.parse_args()
     cur = latest_snapshot()
     if args.save_baseline:
+        if cur["incomplete"]:
+            raise SystemExit(f"refusing to save a baseline with {len(cur['incomplete'])} incomplete case(s): re-run evals/report.py")
         BASELINE.write_text(json.dumps(cur, indent=2) + "\n")
         print(f"saved {BASELINE.relative_to(ROOT)} from batch {cur['batch']} ({cur['versions']})")
         return

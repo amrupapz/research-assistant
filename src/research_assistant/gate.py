@@ -34,6 +34,10 @@ def regression_gate(baseline: dict, current: dict, tolerance: dict = DEFAULT_TOL
         - current seconds_p95 > baseline seconds_p95 * (1 + p95) -> a reason
         - current tokens_p50  > baseline tokens_p50  * (1 + cost) -> a reason
         - a baseline value of 0 (or None) has no relative limit: skip that check
+      Trace gaps (D7 M5: these used to pass SILENTLY):
+        - current["incomplete"] non-empty -> a reason (report.py dropped those cases, so p95/tokens
+          would come from fewer cases than the baseline)
+        - a metric the baseline has (non-zero) but current lacks (None) -> a reason, not a skip
       Never a reason:
         - anything that got BETTER, or is exactly AT the limit (the comparisons are strict)
         - categories or stages that exist only in current (new tests aren't regressions)
@@ -69,8 +73,18 @@ def regression_gate(baseline: dict, current: dict, tolerance: dict = DEFAULT_TOL
                 continue
             limit = base_value * (1 + tolerance[tol_key])
             cur_value = cur_metrics.get(metric)
-            if cur_value is not None and cur_value > limit:
+            if cur_value is None:
+                reasons.append(f"{stage}: {metric} missing from the current run (baseline {base_value:.5g})")
+            elif cur_value > limit:
                 reasons.append(f"{stage}: {metric} {base_value:.5g} -> {cur_value:.5g} (allowed up to {limit:.5g})")
+
+    incomplete = current.get("incomplete") or []
+    if incomplete:
+        shown = ", ".join(incomplete[:5]) + (" ..." if len(incomplete) > 5 else "")
+        reasons.append(
+            f"{len(incomplete)} case(s) incomplete in Langfuse ({shown}): speed/cost would be compared on "
+            "fewer cases; re-run evals/report.py in a few minutes"
+        )
 
     return not reasons, reasons
 
@@ -85,6 +99,7 @@ def snapshot(all_record: dict, report: dict, versions: dict) -> dict:
     return {
         "batch": all_record["batch"],
         "versions": versions,
+        "incomplete": [f"{i['stage']}/{i['case']}" for i in report.get("incomplete", [])],
         "categories": {row["category"]: row["passed"] / row["total"] for row in all_record["categories"] if row["total"]},
         "stages": {
             name: {"seconds_p95": st["seconds_p95"], "tokens_p50": st.get("tokens_p50"), "usd_p50": st["usd_p50"]}

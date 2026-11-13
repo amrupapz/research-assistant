@@ -108,6 +108,35 @@ def test_tolerance_is_a_parameter():
     assert regression_gate(BASE, current(cat_freshness=0.69))[0]  # default 0.10 allows it
 
 
+# --- trace gaps (D7 M5): these used to pass silently ---------------------------------------------
+
+
+def test_incomplete_cases_fail_the_gate():
+    ok, reasons = regression_gate(BASE, {**current(), "incomplete": ["agent/A3", "flow/F1"]})
+    assert not ok and _reasons_mention(reasons, "2 case(s) incomplete", "agent/A3")
+
+
+def test_no_incomplete_key_is_fine():
+    """baseline.json files from before this change have no "incomplete" key."""
+    assert regression_gate(BASE, {k: v for k, v in current().items() if k != "incomplete"}) == (True, [])
+
+
+def test_a_metric_missing_from_the_current_run_fails():
+    ok, reasons = regression_gate(BASE, current(agent_tokens_p50=None))
+    assert not ok and _reasons_mention(reasons, "agent", "tokens_p50", "missing")
+
+
+def test_a_metric_missing_from_the_baseline_is_still_skipped():
+    base = {**BASE, "stages": {**BASE["stages"], "agent": {**BASE["stages"]["agent"], "tokens_p50": None}}}
+    assert regression_gate(base, current(agent_tokens_p50=None)) == (True, [])
+
+
+def test_snapshot_keeps_the_incomplete_cases():
+    rec = {"batch": "b1", "categories": []}
+    rep = {"batch": "b1", "stages": {}, "incomplete": [{"stage": "flow", "case": "F2", "trace_calls": 1, "log_calls": 3}]}
+    assert snapshot(rec, rep, {})["incomplete"] == ["flow/F2"]
+
+
 # --- snapshot (mine) ------------------------------------------------------------------------------
 
 
@@ -118,6 +147,7 @@ def test_snapshot_from_an_all_record_and_its_report():
     assert snap == {
         "batch": "b1",
         "versions": {"icp": "icp-v1"},
+        "incomplete": [],
         "categories": {"freshness": 0.7},
         "stages": {"agent": {"seconds_p95": 20.8, "tokens_p50": 9500, "usd_p50": 0.00065}},
     }
