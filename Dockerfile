@@ -12,7 +12,7 @@ WORKDIR /app
 # Dependencies first: this layer is cached until uv.lock changes, so a code edit doesn't reinstall them.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY README.md ./
+COPY README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev
 

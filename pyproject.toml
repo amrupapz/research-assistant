@@ -1,10 +1,12 @@
 [project]
 name = "research-assistant"
 version = "0.1.0"
-description = "Add your description here"
+description = "Company research to sales outreach agent: grounded RAG with citations, LangGraph workflow with human approval and exactly-once send, multi-tenant FastAPI, evals with a CI regression gate."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-    { name = "Amrutha Pappu", email = "amruthap@berkeley.edu" }
+    { name = "Amrutha Pappu", email = "85633476+amrupapz@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [

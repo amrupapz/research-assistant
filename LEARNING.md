@@ -2100,3 +2100,25 @@ report["incomplete"], and a None metric is skipped. **Fixed:** snapshot() keeps 
 names; regression_gate fails on any incomplete case and on a metric the baseline has but current
 lacks; `gate.py --save-baseline` refuses an incomplete report (a baseline with holes would make
 every later comparison wrong). Re-checked on CI run 2's real report: still PASS (0 incomplete).
+
+## D7 M7 — README + portfolio (P8)
+
+**Concept:** a portfolio README is read by a stranger in ~2 minutes: what it does, how it's built, how
+to run it, how I know it works (evals vs a baseline), where it fails. Honest failures WITH numbers
+read as engineering judgement; "works great" reads as a demo. Without it the repo is 7 days of work
+nobody can evaluate.
+
+**Built:** README.md (pitch, mermaid architecture, 5-command Docker quickstart, API table + codes,
+design decisions with costs, eval tables from CI run 2 vs baseline, security table attack → defense
+→ test, known failures, demos, CI, layout). LICENSE (MIT). pyproject description + license + author
+= GitHub noreply. scripts/demo.sh: 3 demos against the Docker stack (model failure → resume; kill
+mid-run → resume; 401/404/403 + poisoned page never sends), transcript → docs/demo-output.txt,
+demo keys created unprinted and revoked.
+
+**Gotchas:**
+- I wrote a cause for the prompt_injection failures that LEARNING.md didn't support → replaced with
+  "not diagnosed yet". Every README claim must trace to a run, a test or a note.
+- No `#` comments in README command blocks: macOS zsh has interactivecomments off by default, so a
+  reader pasting them gets errors (same reason as my own rule).
+- `license-files = ["LICENSE"]` in pyproject → the Docker build stage must COPY LICENSE too.
+- Changing the pyproject email doesn't hide the email in the 56 existing commits' author field.
